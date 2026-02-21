@@ -329,7 +329,9 @@ async def retry_task(
     if job.status == JobStatus.RUNNING:
         raise HTTPException(400, "Task is still running")
     
-    # 使用原任务的参数创建新任务（保留并发数、定时上传等配置）
+    # 使用原任务的参数创建新任务
+    # task_params 已包含所有 task-specific 参数（playlist_id, upload_mode 等），
+    # 通用参数从 WebJob 字段读取
     new_job_id = job_manager.submit_job(
         video_ids=job.video_ids,
         steps=job.steps,
@@ -337,7 +339,9 @@ async def retry_task(
         force=job.force,
         concurrency=job.concurrency,
         upload_cron=job.upload_cron,
-        fail_fast=job.fail_fast
+        fail_fast=job.fail_fast,
+        task_type=job.task_type,
+        task_params=job.task_params,
     )
     
     return {

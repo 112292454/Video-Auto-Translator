@@ -274,3 +274,126 @@ class TestVideoDeduplication:
         self._insert_running_job(jm, "job1", [], ["fix-violation"])
         result = jm.get_running_video_ids()
         assert result == set()
+
+
+class TestTaskParamsPersistence:
+    """测试 task_params 统一持久化：process 特有参数存入 task_params JSON 字段"""
+
+    def test_process_params_merged_into_task_params(self):
+        """process 任务的 playlist_id/upload_batch_size/upload_mode 应合并到 task_params"""
+        import json, sqlite3, tempfile, shutil
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmpdir, "test.db")
+            log_dir = os.path.join(tmpdir, "logs")
+            jm = JobManager(db_path, log_dir)
+
+            # 直接写入 DB（不启动子进程）
+            from unittest.mock import patch
+            with patch.object(jm, '_start_job_process'):
+                job_id = jm.submit_job(
+                    video_ids=["v1"],
+                    steps=["upload"],
+                    playlist_id="PL_abc",
+                    upload_batch_size=3,
+                    upload_mode="dtime",
+                    upload_cron="0 12 * * *",
+                )
+
+            job = jm.get_job(job_id)
+            assert job is not None
+            params = job.task_params
+            assert params['playlist_id'] == 'PL_abc'
+            assert params['upload_batch_size'] == 3
+            assert params['upload_mode'] == 'dtime'
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_process_default_params_not_stored(self):
+        """默认值的参数不写入 task_params（减少噪音）"""
+        import tempfile, shutil
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmpdir, "test.db")
+            log_dir = os.path.join(tmpdir, "logs")
+            jm = JobManager(db_path, log_dir)
+
+            from unittest.mock import patch
+            with patch.object(jm, '_start_job_process'):
+                job_id = jm.submit_job(
+                    video_ids=["v1"],
+                    steps=["upload"],
+                    # playlist_id=None, upload_batch_size=1, upload_mode='cron' (all defaults)
+                )
+
+            job = jm.get_job(job_id)
+            assert job.task_params == {}
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_tools_params_stored_directly(self):
+        """tools 任务的 task_params 直接存储"""
+        import tempfile, shutil
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmpdir, "test.db")
+            log_dir = os.path.join(tmpdir, "logs")
+            jm = JobManager(db_path, log_dir)
+
+            from unittest.mock import patch
+            with patch.object(jm, '_start_job_process'):
+                job_id = jm.submit_job(
+                    video_ids=[],
+                    steps=["fix-violation"],
+                    task_type="fix-violation",
+                    task_params={"aid": 12345, "max_rounds": 5},
+                )
+
+            job = jm.get_job(job_id)
+            assert job.task_params['aid'] == 12345
+            assert job.task_params['max_rounds'] == 5
+            assert job.task_type == 'fix-violation'
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_build_process_command_reads_task_params(self):
+        """_build_process_command 从 task_params 读取 playlist_id/upload_batch_size/upload_mode"""
+        cmd = JobManager._build_process_command(
+            video_ids=["v1", "v2"],
+            steps=["upload"],
+            gpu_device="auto",
+            force=False,
+            concurrency=1,
+            upload_cron="0 12 * * *",
+            fail_fast=False,
+            task_params={
+                'playlist_id': 'PL_test',
+                'upload_batch_size': 5,
+                'upload_mode': 'dtime',
+            },
+        )
+        assert "-p" in cmd
+        idx_p = cmd.index("-p")
+        assert cmd[idx_p + 1] == "PL_test"
+        assert "--upload-batch-size" in cmd
+        idx_bs = cmd.index("--upload-batch-size")
+        assert cmd[idx_bs + 1] == "5"
+        assert "--upload-mode" in cmd
+        idx_m = cmd.index("--upload-mode")
+        assert cmd[idx_m + 1] == "dtime"
+
+    def test_build_process_command_empty_task_params(self):
+        """task_params 为空时不生成额外参数"""
+        cmd = JobManager._build_process_command(
+            video_ids=["v1"],
+            steps=["download"],
+            gpu_device="auto",
+            force=False,
+            concurrency=1,
+            upload_cron=None,
+            fail_fast=False,
+            task_params={},
+        )
+        assert "-p" not in cmd
+        assert "--upload-batch-size" not in cmd
+        assert "--upload-mode" not in cmd

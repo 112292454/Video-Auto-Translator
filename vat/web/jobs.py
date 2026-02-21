@@ -178,12 +178,17 @@ class JobManager:
         """
         提交任务并立即启动子进程执行
         
+        所有 task-specific 参数统一存储在 task_params JSON 字段中。
+        对 process 类型，playlist_id / upload_batch_size / upload_mode
+        会自动合并到 task_params；对 tools 类型，调用者直接传 task_params。
+        
         Args:
             video_ids: 视频ID列表（process 类型必填；tools 类型可为空列表）
             steps: 处理步骤列表（process 类型为步骤名；tools 类型为 [task_type]）
             task_type: 任务类型，'process' 或 TOOLS_TASK_TYPES 中的值
-            task_params: tools 任务的额外参数（JSON 可序列化的 dict）
-            其他参数: 仅对 process 类型有效
+            task_params: 任务特有参数（JSON 可序列化的 dict），会被持久化
+            playlist_id, upload_batch_size, upload_mode: process 类型的便捷参数，
+                内部自动合并到 task_params
         
         Returns:
             job_id
@@ -192,6 +197,16 @@ class JobManager:
         job_id = str(uuid.uuid4())[:8]
         now = datetime.now()
         log_file = str(self.log_dir / f"job_{job_id}.log")
+        
+        # 统一：将 process 特有参数合并到 task_params
+        merged_params = dict(task_params or {})
+        if task_type == 'process':
+            if playlist_id:
+                merged_params['playlist_id'] = playlist_id
+            if upload_batch_size != 1:
+                merged_params['upload_batch_size'] = upload_batch_size
+            if upload_mode and upload_mode != 'cron':
+                merged_params['upload_mode'] = upload_mode
         
         # 写入数据库
         with self._get_connection() as conn:
@@ -214,14 +229,13 @@ class JobManager:
                 concurrency,
                 1 if fail_fast else 0,
                 task_type,
-                json.dumps(task_params or {}),
+                json.dumps(merged_params),
             ))
         
         # 启动子进程
         self._start_job_process(
             job_id, video_ids, steps, gpu_device, force, log_file,
-            concurrency, playlist_id, upload_cron, upload_batch_size,
-            upload_mode, fail_fast, task_type, task_params
+            concurrency, upload_cron, fail_fast, task_type, merged_params
         )
         
         logger.info(f"任务已提交: {job_id}, type={task_type}, 步骤: {steps}")
@@ -236,21 +250,22 @@ class JobManager:
         force: bool,
         log_file: str,
         concurrency: int = 1,
-        playlist_id: Optional[str] = None,
         upload_cron: Optional[str] = None,
-        upload_batch_size: int = 1,
-        upload_mode: str = 'cron',
         fail_fast: bool = False,
         task_type: str = 'process',
         task_params: Optional[Dict] = None
     ):
-        """启动子进程执行任务"""
+        """启动子进程执行任务
+        
+        task-specific 参数统一从 task_params 读取，不再散落在函数签名中。
+        """
+        params = task_params or {}
         if task_type != 'process':
-            cmd = self._build_tools_command(task_type, task_params or {})
+            cmd = self._build_tools_command(task_type, params)
         else:
             cmd = self._build_process_command(
                 video_ids, steps, gpu_device, force, concurrency,
-                playlist_id, upload_cron, upload_batch_size, upload_mode, fail_fast
+                upload_cron, fail_fast, params
             )
         
         logger.info(f"启动命令: {' '.join(cmd)}")
@@ -289,13 +304,17 @@ class JobManager:
         gpu_device: str,
         force: bool,
         concurrency: int,
-        playlist_id: Optional[str],
         upload_cron: Optional[str],
-        upload_batch_size: int,
-        upload_mode: str,
-        fail_fast: bool
+        fail_fast: bool,
+        task_params: Dict,
     ) -> List[str]:
-        """构建 vat process 命令"""
+        """构建 vat process 命令
+        
+        通用参数从函数签名传入，task-specific 参数从 task_params 读取：
+        - playlist_id: playlist 上下文
+        - upload_batch_size: 每次上传批次大小
+        - upload_mode: 定时上传模式 (cron/dtime)
+        """
         cmd = ["python", "-m", "vat", "process"]
         
         for vid in video_ids:
@@ -310,8 +329,10 @@ class JobManager:
         if force:
             cmd.append("-f")
         
+        # task-specific: playlist_id
+        playlist_id = task_params.get('playlist_id')
         if playlist_id:
-            cmd.extend(["-p", playlist_id])
+            cmd.extend(["-p", str(playlist_id)])
         
         if concurrency > 1:
             cmd.extend(["-c", str(concurrency)])
@@ -319,11 +340,15 @@ class JobManager:
         if upload_cron:
             cmd.extend(["--upload-cron", upload_cron])
         
-        if upload_batch_size > 1:
+        # task-specific: upload_batch_size
+        upload_batch_size = task_params.get('upload_batch_size', 1)
+        if upload_batch_size and int(upload_batch_size) > 1:
             cmd.extend(["--upload-batch-size", str(upload_batch_size)])
         
+        # task-specific: upload_mode
+        upload_mode = task_params.get('upload_mode', 'cron')
         if upload_mode and upload_mode != 'cron':
-            cmd.extend(["--upload-mode", upload_mode])
+            cmd.extend(["--upload-mode", str(upload_mode)])
         
         if fail_fast:
             cmd.append("--fail-fast")
