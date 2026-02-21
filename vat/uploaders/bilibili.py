@@ -24,9 +24,17 @@ try:
     # 修复：给 ret 添加默认 chunk_size（10MB，与 cos 方法一致）。
     _original_upos = BiliBili.upos
     async def _patched_upos(self, file, total_size, ret, tasks=3):
+        # 补全 B站 preupload API 可能缺失的字段
+        logger.debug(f"biliup upos: preupload ret keys = {list(ret.keys())}")
         if 'chunk_size' not in ret:
             ret['chunk_size'] = 10485760  # 10MB, B站 upos 默认分块大小
             logger.debug("biliup upos: API 未返回 chunk_size，使用默认值 10MB")
+        if 'auth' not in ret:
+            # B站风控触发时 preupload 不返回 auth，让 KeyError 传播到上层做重试
+            logger.warning(
+                f"biliup upos: preupload API 未返回 auth 字段（疑似B站风控），"
+                f"返回的 keys: {list(ret.keys())}"
+            )
         return await _original_upos(self, file, total_size, ret, tasks=tasks)
     BiliBili.upos = _patched_upos
     
@@ -194,9 +202,24 @@ class BilibiliUploader(BaseUploader):
                     except Exception as e:
                         logger.warning(f"封面上传失败，继续上传视频: {e}")
                 
-                # 上传视频文件
+                # 上传视频文件（含 B站风控重试：preupload 不返回 auth 时等待后重试）
                 logger.info("上传视频文件...")
-                video_part = bili.upload_file(str(video_path), lines=self.line, tasks=self.threads)
+                max_retries = 3
+                retry_base_wait = 120  # 首次重试等待 120s，后续指数递增
+                for attempt in range(max_retries + 1):
+                    try:
+                        video_part = bili.upload_file(str(video_path), lines=self.line, tasks=self.threads)
+                        break
+                    except KeyError as ke:
+                        if attempt < max_retries:
+                            wait = retry_base_wait * (2 ** attempt)
+                            logger.warning(
+                                f"上传视频文件失败 (KeyError: {ke})，疑似B站风控。"
+                                f"等待 {wait}s 后重试 ({attempt + 1}/{max_retries})..."
+                            )
+                            time.sleep(wait)
+                        else:
+                            raise
                 video_part['title'] = 'P1'
                 data.append(video_part)
                 
