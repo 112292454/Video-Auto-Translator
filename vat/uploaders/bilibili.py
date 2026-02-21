@@ -13,13 +13,25 @@ from dataclasses import dataclass
 from .base import BaseUploader
 from vat.utils.logger import setup_logger
 
+logger = setup_logger("uploader.bilibili")
+
 try:
     from biliup.plugins.bili_webup import BiliBili, Data
     BILIUP_AVAILABLE = True
+    
+    # Monkey-patch: biliup 1.1.28 的 upos 方法直接访问 ret['chunk_size']，
+    # 但 B站 API 已不再返回该字段，导致 KeyError。
+    # 修复：给 ret 添加默认 chunk_size（10MB，与 cos 方法一致）。
+    _original_upos = BiliBili.upos
+    async def _patched_upos(self, file, total_size, ret, tasks=3):
+        if 'chunk_size' not in ret:
+            ret['chunk_size'] = 10485760  # 10MB, B站 upos 默认分块大小
+            logger.debug("biliup upos: API 未返回 chunk_size，使用默认值 10MB")
+        return await _original_upos(self, file, total_size, ret, tasks=tasks)
+    BiliBili.upos = _patched_upos
+    
 except ImportError:
     BILIUP_AVAILABLE = False
-
-logger = setup_logger("uploader.bilibili")
 
 
 @dataclass

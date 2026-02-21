@@ -1867,7 +1867,7 @@ class VideoProcessor:
                         import tempfile
                         
                         self.progress_callback("下载封面图片...")
-                        proxy_url = self.config.downloader.proxy if self.config.downloader.proxy else None
+                        proxy_url = self.config.get_stage_proxy('downloader')
                         proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
                         resp = requests.get(thumbnail_url, timeout=30, proxies=proxies)
                         resp.raise_for_status()
