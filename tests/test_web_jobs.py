@@ -397,3 +397,64 @@ class TestTaskParamsPersistence:
         assert "-p" not in cmd
         assert "--upload-batch-size" not in cmd
         assert "--upload-mode" not in cmd
+        assert "--delay-start" not in cmd
+
+    def test_delay_start_merged_into_task_params(self):
+        """delay_start > 0 时应合并到 task_params"""
+        import tempfile, shutil
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmpdir, "test.db")
+            log_dir = os.path.join(tmpdir, "logs")
+            jm = JobManager(db_path, log_dir)
+
+            from unittest.mock import patch
+            with patch.object(jm, '_start_job_process'):
+                job_id = jm.submit_job(
+                    video_ids=["v1"],
+                    steps=["upload"],
+                    delay_start=300,
+                )
+
+            job = jm.get_job(job_id)
+            assert job.task_params['delay_start'] == 300
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_delay_start_zero_not_stored(self):
+        """delay_start=0 不写入 task_params"""
+        import tempfile, shutil
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmpdir, "test.db")
+            log_dir = os.path.join(tmpdir, "logs")
+            jm = JobManager(db_path, log_dir)
+
+            from unittest.mock import patch
+            with patch.object(jm, '_start_job_process'):
+                job_id = jm.submit_job(
+                    video_ids=["v1"],
+                    steps=["upload"],
+                    delay_start=0,
+                )
+
+            job = jm.get_job(job_id)
+            assert 'delay_start' not in job.task_params
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_build_process_command_with_delay_start(self):
+        """_build_process_command 从 task_params 读取 delay_start"""
+        cmd = JobManager._build_process_command(
+            video_ids=["v1"],
+            steps=["upload"],
+            gpu_device="auto",
+            force=False,
+            concurrency=1,
+            upload_cron=None,
+            fail_fast=False,
+            task_params={'delay_start': 120},
+        )
+        assert "--delay-start" in cmd
+        idx = cmd.index("--delay-start")
+        assert cmd[idx + 1] == "120"

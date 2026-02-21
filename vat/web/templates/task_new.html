@@ -135,13 +135,8 @@
                             <!-- 每次上传数量 -->
                             <div class="flex items-center space-x-2">
                                 <span class="text-sm">每次触发上传</span>
-                                <select id="upload-batch-size" class="border rounded px-2 py-1 text-sm">
-                                    <option value="1" selected>1</option>
-                                    <option value="2">2</option>
-                                    <option value="3">3</option>
-                                    <option value="5">5</option>
-                                    <option value="10">10</option>
-                                </select>
+                                <input type="number" id="upload-batch-size" value="1" min="1" max="100" step="1"
+                                       class="border rounded px-2 py-1 text-sm w-16">
                                 <span class="text-sm">个视频</span>
                             </div>
                             <!-- 模式选择 -->
@@ -169,18 +164,9 @@
                             <div id="mode-interval" class="hidden space-y-2">
                                 <div class="flex items-center space-x-2">
                                     <span class="text-sm">每隔</span>
-                                    <select id="interval-hours" class="border rounded px-2 py-1 text-sm"
-                                            onchange="updateIntervalCron()">
-                                        <option value="1">1</option>
-                                        <option value="2">2</option>
-                                        <option value="3">3</option>
-                                        <option value="4">4</option>
-                                        <option value="6">6</option>
-                                        <option value="8">8</option>
-                                        <option value="12" selected>12</option>
-                                        <option value="24">24</option>
-                                        <option value="48">48</option>
-                                    </select>
+                                    <input type="number" id="interval-hours" value="12" min="1" max="168" step="1"
+                                           class="border rounded px-2 py-1 text-sm w-16"
+                                           oninput="updateIntervalCron()">
                                     <span class="text-sm">小时触发一次</span>
                                 </div>
                                 <p class="text-xs text-gray-500">生成的 cron: <code id="interval-cron-preview" class="bg-gray-100 px-1 rounded">-</code></p>
@@ -234,17 +220,22 @@
             <div class="mb-6">
                 <label class="block text-sm font-medium text-gray-700 mb-2">并发数量</label>
                 <div class="flex items-center space-x-3">
-                    <select name="concurrency" class="border rounded-lg px-3 py-2 w-full max-w-xs">
-                        <option value="1">1 (串行，默认)</option>
-                        <option value="2">2 个视频并行</option>
-                        <option value="3">3 个视频并行</option>
-                        <option value="4">4 个视频并行</option>
-                        <option value="5">5 个视频并行</option>
-                        <option value="10">10 并行(翻译/嵌字)</option>
-                        <option value="20">20 并行(翻译/嵌字)</option>
-                    </select>
+                    <input type="number" name="concurrency" value="1" min="1" max="50" step="1"
+                           class="border rounded-lg px-3 py-2 w-24 text-sm">
+                    <span class="text-sm text-gray-600">个视频并行</span>
                 </div>
                 <p class="text-xs text-gray-500 mt-1">⚠️ 并行处理会增加 GPU 显存占用，建议根据显存大小设置。包含 GPU 步骤(whisper/embed)时建议不超过 2。</p>
+            </div>
+            
+            <!-- 延时启动 -->
+            <div class="mb-6">
+                <label class="block text-sm font-medium text-gray-700 mb-2">延时启动</label>
+                <div class="flex items-center space-x-3">
+                    <input type="number" name="delay_start" value="0" min="0" step="1"
+                           class="border rounded-lg px-3 py-2 w-28 text-sm" placeholder="0">
+                    <span class="text-sm text-gray-600">秒</span>
+                </div>
+                <p class="text-xs text-gray-500 mt-1">任务启动前等待的时间（秒），0 = 立即启动。适用于需要错峰执行的场景。</p>
             </div>
             
             <!-- 其他选项 -->
@@ -461,19 +452,21 @@ function getFormData() {
         .map(cb => cb.value);
     const gpuDevice = form.querySelector('select[name="gpu_device"]').value;
     const force = form.querySelector('input[name="force"]').checked;
-    const concurrency = parseInt(form.querySelector('select[name="concurrency"]').value) || 1;
+    const concurrency = parseInt(form.querySelector('input[name="concurrency"]').value) || 1;
     const uploadCron = getUploadCron();
     const uploadBatchSize = uploadCron ? parseInt(document.getElementById('upload-batch-size').value) || 1 : 1;
     const uploadMode = uploadCron ? (form.querySelector('input[name="upload_mode"]:checked')?.value || 'cron') : 'cron';
     const failFast = form.querySelector('input[name="fail_fast"]').checked;
     
-    return { videoIds, steps, gpuDevice, force, concurrency, uploadCron, uploadBatchSize, uploadMode, failFast };
+    const delayStart = parseInt(form.querySelector('input[name="delay_start"]').value) || 0;
+    
+    return { videoIds, steps, gpuDevice, force, concurrency, uploadCron, uploadBatchSize, uploadMode, failFast, delayStart };
 }
 
 async function submitTask(event) {
     event.preventDefault();
     
-    const { videoIds, steps, gpuDevice, force, concurrency, uploadCron, uploadBatchSize, uploadMode, failFast } = getFormData();
+    const { videoIds, steps, gpuDevice, force, concurrency, uploadCron, uploadBatchSize, uploadMode, failFast, delayStart } = getFormData();
     
     if (videoIds.length === 0) {
         showToast('请至少选择一个视频', 'warning');
@@ -505,7 +498,8 @@ async function submitTask(event) {
                 upload_cron: uploadCron,
                 upload_batch_size: uploadBatchSize,
                 upload_mode: uploadMode,
-                fail_fast: failFast
+                fail_fast: failFast,
+                delay_start: delayStart
             })
         });
         
@@ -522,7 +516,7 @@ async function submitTask(event) {
 }
 
 function generateCLI() {
-    const { videoIds, steps, gpuDevice, force, concurrency, uploadCron, failFast } = getFormData();
+    const { videoIds, steps, gpuDevice, force, concurrency, uploadCron, failFast, delayStart } = getFormData();
     const playlistId = document.querySelector('input[name="playlist_id"]')?.value || null;
     
     let cmd = 'python -m vat process';
@@ -554,6 +548,10 @@ function generateCLI() {
     
     if (failFast) {
         cmd += ' --fail-fast';
+    }
+    
+    if (delayStart > 0) {
+        cmd += ` --delay-start ${delayStart}`;
     }
     
     document.getElementById('cli-command').textContent = cmd;

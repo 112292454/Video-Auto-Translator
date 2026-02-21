@@ -43,6 +43,7 @@ class ExecuteRequest(BaseModel):
     upload_batch_size: int = 1  # 每次 cron 触发时上传的视频数量
     upload_mode: str = 'cron'  # 定时上传模式: cron=后台进程等待, dtime=B站定时发布
     fail_fast: bool = False  # 遇到失败时停止后续处理
+    delay_start: int = 0  # 任务启动前等待的秒数（延时启动）
     
     # 可选：生成等价 CLI 命令
     generate_cli: bool = False
@@ -201,7 +202,8 @@ async def execute_task(
         upload_cron=request.upload_cron,
         upload_batch_size=request.upload_batch_size,
         upload_mode=request.upload_mode,
-        fail_fast=request.fail_fast
+        fail_fast=request.fail_fast,
+        delay_start=request.delay_start
     )
     
     # 生成等价 CLI 命令（可选）
@@ -255,6 +257,9 @@ def _generate_cli_command(request: ExecuteRequest) -> str:
     
     if request.fail_fast:
         parts.append("--fail-fast")
+    
+    if request.delay_start and request.delay_start > 0:
+        parts.append(f"--delay-start {request.delay_start}")
     
     return " ".join(parts)
 

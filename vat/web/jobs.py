@@ -172,6 +172,7 @@ class JobManager:
         upload_batch_size: int = 1,
         upload_mode: str = 'cron',
         fail_fast: bool = False,
+        delay_start: int = 0,
         task_type: str = 'process',
         task_params: Optional[Dict] = None
     ) -> str:
@@ -207,6 +208,8 @@ class JobManager:
                 merged_params['upload_batch_size'] = upload_batch_size
             if upload_mode and upload_mode != 'cron':
                 merged_params['upload_mode'] = upload_mode
+            if delay_start and delay_start > 0:
+                merged_params['delay_start'] = delay_start
         
         # 写入数据库
         with self._get_connection() as conn:
@@ -352,6 +355,11 @@ class JobManager:
         
         if fail_fast:
             cmd.append("--fail-fast")
+        
+        # task-specific: delay_start
+        delay_start = task_params.get('delay_start', 0)
+        if delay_start and int(delay_start) > 0:
+            cmd.extend(["--delay-start", str(delay_start)])
         
         return cmd
     

@@ -549,8 +549,9 @@ def parse_stages(stages_str: str) -> List[TaskStep]:
 @click.option('--upload-mode', default='cron', type=click.Choice(['cron', 'dtime']),
               help='定时上传模式: cron=后台进程等待定时上传, dtime=立即全部上传但通过B站定时发布（需 >2h）')
 @click.option('--fail-fast', is_flag=True, help='遇到视频处理失败时立即停止后续处理（多线程时不中断已运行的任务，但不再启动新任务）')
+@click.option('--delay-start', default=0, type=int, help='任务启动前等待的秒数（延时启动）')
 @click.pass_context
-def process(ctx, video_id, process_all, playlist, stages, gpu, force, dry_run, concurrency, delay, upload_cron, upload_batch_size, upload_mode, fail_fast):
+def process(ctx, video_id, process_all, playlist, stages, gpu, force, dry_run, concurrency, delay, upload_cron, upload_batch_size, upload_mode, fail_fast, delay_start):
     """
     处理视频（支持细粒度阶段控制）
     
@@ -577,6 +578,13 @@ def process(ctx, video_id, process_all, playlist, stages, gpu, force, dry_run, c
     config = get_config(ctx.obj.get('config_path'))
     logger = get_logger()
     db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
+    
+    # 延时启动
+    if delay_start and delay_start > 0:
+        import time as _time_mod
+        logger.info(f"延时启动: 等待 {delay_start} 秒...")
+        _time_mod.sleep(delay_start)
+        logger.info("延时结束，开始执行任务")
     
     # 解析阶段
     try:
