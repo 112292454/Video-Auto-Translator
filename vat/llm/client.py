@@ -193,11 +193,18 @@ def call_llm(
     client = get_or_create_client(api_key, base_url, proxy)
     # logger.trace(f"Calling LLM API: {model}, {messages}, {temperature}, {kwargs}")
 
+    # 火山引擎方舟 Coding Plan：自动关闭 thinking 模式
+    # kimi-k2.5 默认走 thinking 路径（34s/call），关闭后降至 0.7s/call
+    # 实验验证 thinking 对翻译/ASR纠错无帮助，仅增加延迟
+    effective_base_url = base_url or os.getenv("OPENAI_BASE_URL", "")
+    if "ark.cn-beijing.volces.com" in effective_base_url:
+        kwargs.setdefault("extra_body", {})
+        kwargs["extra_body"].setdefault("thinking", {"type": "disabled"})
+
     response = client.chat.completions.create(
         model=model,
         messages=messages,  # pyright: ignore[reportArgumentType]
         temperature=temperature,
-        # reasoning_effort="none",
         **kwargs,
     )
 

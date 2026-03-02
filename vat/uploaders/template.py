@@ -115,6 +115,13 @@ def build_upload_context(
             playlist_index    - 在列表中的序号
             playlist_id       - 播放列表 ID
         
+        模型信息 (从 metadata['stage_models'] 提取):
+            whisper_model     - Whisper ASR 模型名 (如 'large-v3')
+            split_model       - 断句 LLM 模型名 (如 'gpt-4o-mini')
+            optimize_model    - 优化 LLM 模型名 (如 'kimi-k2.5')
+            translate_model   - 翻译 LLM 模型名 (如 'gemini-3-flash-preview')
+            models_summary    - LLM 模型汇总 (如 'gpt-4o-mini、kimi-k2.5、gemini-3-flash-preview')
+        
         自定义变量:
             可在 config/upload.yaml 的 custom_vars 中定义
     """
@@ -180,6 +187,18 @@ def build_upload_context(
         'duration_minutes': duration_min,
         'thumbnail': metadata.get('thumbnail', '') or video_info.get('thumbnail', ''),
     }
+    
+    # 阶段模型信息（从 metadata['stage_models'] 提取，上层只展示模型名）
+    stage_models = metadata.get('stage_models', {})
+    context['whisper_model'] = stage_models.get('whisper', {}).get('model', '')
+    context['split_model'] = stage_models.get('split', {}).get('model', '')
+    context['optimize_model'] = stage_models.get('optimize', {}).get('model', '')
+    context['translate_model'] = stage_models.get('translate', {}).get('model', '')
+    # 汇总字符串：用于简介中一行展示所有模型（过滤空值）
+    model_names = [v for v in [
+        context['split_model'], context['optimize_model'], context['translate_model']
+    ] if v]
+    context['models_summary'] = '、'.join(model_names) if model_names else ''
     
     # 播放列表信息
     if playlist_info:
