@@ -522,7 +522,11 @@ class TestWatchOnceMode:
     
     @patch('vat.services.watch_service.subprocess.Popen')
     def test_force_mode_reprocesses_completed(self, mock_popen, mock_config, mock_db, tmp_db):
-        """force 模式下已完成的视频也会被重处理"""
+        """force 模式下 sync 报告为新增的已完成视频也会被重处理
+        
+        关键设计：force 只影响 sync 报告的新视频是否跳过已完成状态，
+        不会导致全量 playlist 历史视频被重处理（那是 vat process -f 的职责）。
+        """
         mock_config.storage.work_dir = str(Path(tmp_db).parent)
         
         # 插入全部已完成的 task
@@ -531,8 +535,8 @@ class TestWatchOnceMode:
         
         mock_pl_service = MagicMock()
         mock_pl_service.get_playlist.return_value = FakePlaylist(id="PL_test")
-        mock_pl_service.sync_playlist.return_value = FakeSyncResult(new_videos=[], total_videos=1)
-        mock_pl_service.get_playlist_videos.return_value = [FakeVideo(id="vid_done")]
+        # sync 报告 vid_done 为新增视频（可能是重建 playlist 关联）
+        mock_pl_service.sync_playlist.return_value = FakeSyncResult(new_videos=["vid_done"], total_videos=1)
         
         mock_db.get_video = MagicMock(return_value=FakeVideo(id="vid_done"))
         mock_process = MagicMock()
@@ -547,8 +551,29 @@ class TestWatchOnceMode:
         
         service.run()
         
-        # force=True 使已完成视频也被提交
+        # force=True 使 sync 报告的已完成视频也被提交
         mock_popen.assert_called_once()
+    
+    @patch('vat.services.watch_service.subprocess.Popen')
+    def test_no_new_videos_no_submission(self, mock_popen, mock_config, mock_db, tmp_db):
+        """sync 无新视频时，即使 playlist 有未完成视频也不提交（防止全量重处理）"""
+        mock_config.storage.work_dir = str(Path(tmp_db).parent)
+        
+        mock_pl_service = MagicMock()
+        mock_pl_service.get_playlist.return_value = FakePlaylist(id="PL_test")
+        # sync 无新增视频
+        mock_pl_service.sync_playlist.return_value = FakeSyncResult(new_videos=[], total_videos=100)
+        
+        service = WatchService(
+            config=mock_config, db=mock_db,
+            playlist_ids=["PL_test"], once=True,
+        )
+        service.playlist_service = mock_pl_service
+        
+        service.run()
+        
+        # 无新视频 → 不提交任何任务（即使 playlist 有大量未完成视频）
+        mock_popen.assert_not_called()
     
     @patch('vat.services.watch_service.subprocess.Popen')
     def test_max_new_per_round_limit(self, mock_popen, mock_config, mock_db, tmp_db):
@@ -616,10 +641,14 @@ class TestWatchOnceMode:
     
     @patch('vat.services.watch_service.subprocess.Popen')
     def test_mixed_new_and_retry_videos(self, mock_popen, mock_config, mock_db, tmp_db):
-        """新视频和重试视频混合处理"""
+        """新视频 + 本 session 提交过的失败视频在第二轮混合处理
+        
+        关键设计：retry 只重试本 session 之前提交过的视频，不扫描全量 playlist 历史。
+        首轮只处理 sync 的新视频；失败后在下一轮作为 retry 出现。
+        """
         mock_config.storage.work_dir = str(Path(tmp_db).parent)
         
-        # vid_fail 有失败的 task（重试候选）
+        # vid_fail 有失败的 task（只有在本 session 提交过才会被 retry）
         _insert_task(tmp_db, "vid_fail", "download", TaskStatus.COMPLETED.value)
         _insert_task(tmp_db, "vid_fail", "whisper", TaskStatus.FAILED.value)
         
@@ -628,9 +657,6 @@ class TestWatchOnceMode:
         mock_pl_service.sync_playlist.return_value = FakeSyncResult(
             new_videos=["vid_new"], total_videos=3
         )
-        mock_pl_service.get_playlist_videos.return_value = [
-            FakeVideo(id="vid_new"), FakeVideo(id="vid_fail")
-        ]
         
         mock_db.get_video = MagicMock(side_effect=lambda vid: FakeVideo(id=vid))
         mock_process = MagicMock()
@@ -642,6 +668,9 @@ class TestWatchOnceMode:
             playlist_ids=["PL_test"], once=True,
         )
         service.playlist_service = mock_pl_service
+        
+        # 模拟 vid_fail 在之前的轮次中被本 session 提交过
+        service._session_submitted_ids.add("vid_fail")
         
         service.run()
         
@@ -879,6 +908,9 @@ class TestFullLifecycle:
         )
         service.playlist_service = mock_pl_service
         
+        # 模拟 v_failed 在之前的轮次中被本 session 提交过
+        service._session_submitted_ids.add("v_failed")
+        
         service.run()
         
         # 验证 Popen 调用的命令包含正确的视频 ID
@@ -888,7 +920,7 @@ class TestFullLifecycle:
         
         assert "v_new1" in cmd_str, "全新视频 v_new1 应被提交"
         assert "v_new2" in cmd_str, "全新视频 v_new2 应被提交"
-        assert "v_failed" in cmd_str, "失败视频 v_failed 应被重试"
+        assert "v_failed" in cmd_str, "失败视频 v_failed 应被重试（本 session 提交过）"
         assert "v_done" not in cmd_str, "已完成视频 v_done 不应被提交"
         assert "v_running" not in cmd_str, "运行中视频 v_running 不应被提交"
         assert "v_unavail" not in cmd_str, "不可用视频 v_unavail 不应被提交"
@@ -971,6 +1003,8 @@ class TestFullLifecycle:
             playlist_ids=["PL_retry"], once=True,
         )
         service2.playlist_service = mock_pl_service2
+        # 从 service1 继承 session 提交记录，模拟同一 session 的多轮
+        service2._session_submitted_ids = service1._session_submitted_ids.copy()
         service2.run()
         
         # 验证第 2 轮提交了 v2(重试) + v3(新)，但不包含 v1(已完成)
@@ -1089,6 +1123,8 @@ class TestFullLifecycle:
             svc.playlist_service = mock_pl_service
             # 手动设置重试计数（模拟跨 session 的累计）
             svc._retry_counts = {"v_stubborn": i}
+            # v_stubborn 必须在 session 提交记录中才能被 retry
+            svc._session_submitted_ids.add("v_stubborn")
             svc.run()
             
             if i < 2:

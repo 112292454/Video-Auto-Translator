@@ -179,14 +179,16 @@ translator:
     enable_context: true                    # 是否启用前文上下文（新增）
     
     # Optimize 配置（嵌套）- 字幕优化
-    # 使用火山引擎方舟 kimi-k2.5，在同语言 optimize 阶段有良好的 ASR 纠错能力
+    # 推荐模型：kimi-k2.5，在同语言 optimize 阶段有良好的 ASR 纠错能力
     # 测试验证：能修正人名(キュウリさん→フブキさん)、自我介绍(ちらかみむむき→白上フブキ)等
+    # 注意：火山引擎标准 API (/api/v3) 需要使用推理端点 ID（如 ep-20240xxxxx），
+    #       不能直接用模型名。请在火山引擎控制台创建推理端点后填入 endpoint ID。
     optimize:
       enable: true                          # 是否启用字幕优化（修正错别字、统一术语）
       custom_prompt: "fubuki"                     # 优化自定义提示词文件名
-      model: "kimi-k2.5"                          # 优化模型（火山引擎方舟）
+      model: "kimi-k2.5"                          # 优化模型（需替换为火山引擎 endpoint ID，如 ep-20240xxxxx）
       api_key: "${VAT_VOLC_APIKEY}"               # 火山引擎 API Key
-      base_url: "https://ark.cn-beijing.volces.com/api/v3"  # 火山引擎方舟 API
+      base_url: "https://ark.cn-beijing.volces.com/api/v3"  # 火山引擎方舟标准 API
       batch_size: 100                        # 覆写批大小（大 BS 减少 API 调用次数）
       thread_num: 3                          # 覆写线程数（火山引擎建议低并发）
   
@@ -308,6 +310,6 @@ web:
 watch:
   default_interval: 60                        # 默认轮询间隔（分钟）
   default_stages: "all"                       # 默认处理阶段（all = 全流程含上传）
-  max_new_videos_per_round: 0                 # 每轮最多提交的新视频数（0=不限制）
+  max_new_videos_per_round: 20                # 每轮最多提交的新视频数（0=使用代码内安全上限50）
   default_concurrency: 1                      # 提交任务时的默认并发数
   max_retries: 3                              # 同一视频最大重试次数（跨轮次累计）

@@ -84,6 +84,14 @@ class WatchService:
         self._retry_counts: Dict[str, int] = {}
         self._max_retries = config.watch.max_retries
         self._max_new_per_round = config.watch.max_new_videos_per_round
+        
+        # 追踪本 session 已提交的视频 ID（用于限定 retry 范围）
+        # retry 只重试本 session 提交过的视频，不扫描全量 playlist 历史失败
+        self._session_submitted_ids: Set[str] = set()
+        
+        # 安全上限：当 max_new_per_round=0（不限制）时的硬上限
+        # 防止首次 sync 或异常情况一次提交数千视频
+        self._safety_cap = 50
     
     def run(self):
         """
@@ -209,28 +217,33 @@ class WatchService:
             )
             raise
         
-        # 3. 获取 playlist 中所有视频（不仅是新同步的，还包括之前失败的）
-        all_pl_videos = self.playlist_service.get_playlist_videos(playlist_id)
-        all_video_ids = [v.id for v in all_pl_videos]
+        # 3. 从新增视频中筛选可处理的（排除 unavailable、running 等）
+        processable = self._get_processable_videos(new_video_ids)
         
-        # 4. 筛选可处理的视频
-        processable = self._get_processable_videos(all_video_ids)
+        # 4. 从本 session 之前提交过的视频中查找重试候选
+        # 关键设计：只重试本 session 提交过且失败的视频，
+        # 不扫描全量 playlist 历史，避免首轮/误触时重处理数千视频
+        session_submitted_list = list(self._session_submitted_ids)
+        retry_ids = self._get_retry_candidates(session_submitted_list) if session_submitted_list else []
         
-        # 5. 检查重试候选（之前失败的视频）
-        retry_ids = self._get_retry_candidates(all_video_ids)
-        
-        # 6. 合并：新视频 + 重试视频（去重）
+        # 5. 合并：新视频 + 重试视频（去重）
+        retry_id_set = set(retry_ids)
         all_candidates = list(dict.fromkeys(processable + retry_ids))
         
-        # 7. 应用数量限制
-        if self._max_new_per_round > 0 and len(all_candidates) > self._max_new_per_round:
-            logger.info(
-                f"候选视频 {len(all_candidates)} 个超过限制 {self._max_new_per_round}，截断"
-            )
-            all_candidates = all_candidates[:self._max_new_per_round]
+        new_count = len([v for v in all_candidates if v not in retry_id_set])
+        retry_count = len(all_candidates) - new_count
         
-        new_count = len([v for v in all_candidates if v not in retry_ids])
-        retry_count = len([v for v in all_candidates if v in retry_ids])
+        # 6. 应用数量限制
+        effective_limit = self._max_new_per_round if self._max_new_per_round > 0 else self._safety_cap
+        if len(all_candidates) > effective_limit:
+            logger.warning(
+                f"候选视频 {len(all_candidates)} 个超过限制 {effective_limit}，截断。"
+                f"（新增={new_count}, 重试={retry_count}）"
+            )
+            all_candidates = all_candidates[:effective_limit]
+            # 重新计算截断后的计数
+            new_count = len([v for v in all_candidates if v not in retry_id_set])
+            retry_count = len(all_candidates) - new_count
         
         if not all_candidates:
             logger.info(f"Playlist {playlist_id}: 无需处理的视频")
@@ -247,6 +260,9 @@ class WatchService:
         
         # 8. 提交处理任务
         job_id = self._submit_process_job(all_candidates, playlist_id)
+        
+        # 记录本次提交的视频到 session 级别追踪（用于下一轮 retry 范围限定）
+        self._session_submitted_ids.update(all_candidates)
         
         # 更新重试计数
         for vid in retry_ids:
