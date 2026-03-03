@@ -27,10 +27,10 @@
                 </div>
                 <div class="flex-1 min-w-0">
                     <h1 class="text-xl font-bold text-gray-900 mb-2">{{ video.title or '未知标题' }}</h1>
-                    {% if translated_info and translated_info.title_optimized %}
+                    {% if translated_info and translated_info.title_translated %}
                     <div class="text-blue-600 mb-2">
                         <span class="text-gray-500 text-sm">翻译标题:</span>
-                        {{ translated_info.title_optimized }}
+                        {{ translated_info.title_translated }}
                     </div>
                     {% endif %}
                     <div class="flex flex-wrap gap-2 text-sm text-gray-600">
@@ -179,9 +179,15 @@
         </div>
         
         <!-- 翻译信息 -->
-        {% if translated_info %}
         <div class="bg-white rounded-lg shadow p-6">
-            <h2 class="text-lg font-semibold mb-4">翻译信息</h2>
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-lg font-semibold">翻译信息</h2>
+                <button onclick="retranslateInfo()" id="retranslate-btn"
+                        class="px-3 py-1.5 text-sm bg-yellow-500 text-white rounded hover:bg-yellow-600">
+                    {% if translated_info %}重新翻译{% else %}翻译视频信息{% endif %}
+                </button>
+            </div>
+            {% if translated_info %}
             
             {% if translated_info.title_translated %}
             <div class="mb-4">
@@ -227,8 +233,10 @@
                 {% endif %}
             </div>
             {% endif %}
+            {% else %}
+            <p class="text-gray-400 text-sm">暂无翻译信息，点击上方按钮触发翻译</p>
+            {% endif %}
         </div>
-        {% endif %}
         
         <!-- 相关文件 -->
         {% if files %}
@@ -607,6 +615,33 @@
                 showToast('请求失败: ' + e.message, 'error');
             }
             closeDeleteModal();
+        }
+        
+        async function retranslateInfo() {
+            const btn = document.getElementById('retranslate-btn');
+            const origText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '翻译中...';
+            btn.classList.add('opacity-50');
+            
+            try {
+                const response = await fetch(`/api/videos/${videoId}/retranslate-info`, {method: 'POST'});
+                if (response.ok) {
+                    showToast('翻译任务已提交，几秒后自动刷新...', 'success');
+                    setTimeout(() => location.reload(), 5000);
+                } else {
+                    const error = await response.json();
+                    showToast('翻译失败: ' + (error.detail || '未知错误'), 'error');
+                    btn.disabled = false;
+                    btn.textContent = origText;
+                    btn.classList.remove('opacity-50');
+                }
+            } catch (e) {
+                showToast('请求失败: ' + e.message, 'error');
+                btn.disabled = false;
+                btn.textContent = origText;
+                btn.classList.remove('opacity-50');
+            }
         }
         
         // ESC 关闭模态框

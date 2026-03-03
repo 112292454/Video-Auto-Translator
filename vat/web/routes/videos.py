@@ -217,6 +217,37 @@ async def delete_video(
     }
 
 
+@router.post("/{video_id}/retranslate-info")
+async def retranslate_video_info(video_id: str, db: Database = Depends(get_db)):
+    """重新翻译视频的标题/简介信息"""
+    from vat.services.playlist_service import PlaylistService
+    
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(404, "Video not found")
+    
+    metadata = video.metadata or {}
+    
+    # 构建 video_info：优先用缓存的 _video_info，否则从 metadata 组装
+    video_info = metadata.get('_video_info', {})
+    if not video_info:
+        video_info = {
+            'title': video.title or '',
+            'description': metadata.get('description', ''),
+            'tags': metadata.get('tags', []),
+            'uploader': metadata.get('uploader', ''),
+        }
+    
+    if not video_info.get('title'):
+        raise HTTPException(400, "视频缺少标题信息，无法翻译")
+    
+    # 提交异步翻译任务（force=True 强制覆盖已有翻译）
+    service = PlaylistService(db)
+    service._submit_translate_task(video_id, video_info, force=True)
+    
+    return {"status": "submitted", "video_id": video_id, "message": "翻译任务已提交，刷新页面查看结果"}
+
+
 @router.get("/{video_id}/files")
 async def get_video_files(video_id: str, db: Database = Depends(get_db)):
     """获取视频相关文件列表"""
