@@ -134,10 +134,10 @@ class VideoInfoResult:
 
 
 class LiveStreamError(RuntimeError):
-    """视频正在直播中，拒绝下载。
+    """视频正在直播中，无法下载。
     
-    直播中的视频无法保证从头完整下载（HLS 分片可能被 CDN 清除），
-    应等直播结束后作为普通 VOD 下载。
+    YouTube 直播由 _download_live_stream 内部处理（live_from_start → 等待结束 → VOD），
+    不会抛出此异常。此类保留用于非 YouTube 平台的直播场景。
     调用方应捕获此异常并将视频标记为"待重试"而非"失败"。
     """
     pass
