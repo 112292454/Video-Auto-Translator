@@ -242,6 +242,8 @@ class YouTubeDownloader(PlatformDownloader):
             'extract_flat': extract_info_only,
             'logger': YtDlpLogger(),  # 使用自定义日志记录器
             'progress_hooks': [], # 可以添加进度回调
+            # 直播视频：从开头下载而非从请求时刻录制（非直播视频忽略此选项）
+            'live_from_start': True,
         }
         
         if self.proxy:
