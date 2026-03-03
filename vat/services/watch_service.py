@@ -17,7 +17,6 @@ Watch 模式服务
 
 import json
 import os
-import subprocess
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -29,6 +28,7 @@ from ..database import Database
 from ..models import TaskStatus, DEFAULT_STAGE_SEQUENCE, TaskStep
 from ..services.playlist_service import PlaylistService
 from ..utils.logger import setup_logger
+from ..web.jobs import JobManager
 
 logger = setup_logger("watch_service")
 
@@ -92,6 +92,11 @@ class WatchService:
         # 安全上限：当 max_new_per_round=0（不限制）时的硬上限
         # 防止首次 sync 或异常情况一次提交数千视频
         self._safety_cap = 50
+        
+        # 通过 JobManager 提交 process job，复用 WebUI 的任务管理基础设施
+        # 这样 watch 提交的处理任务在 WebUI 可见、可追踪、可取消
+        log_dir = Path(config.storage.database_path).parent / "job_logs"
+        self.job_manager = JobManager(str(config.storage.database_path), str(log_dir))
     
     def run(self):
         """
@@ -397,7 +402,12 @@ class WatchService:
     
     def _submit_process_job(self, video_ids: List[str], playlist_id: str) -> Optional[str]:
         """
-        提交 vat process 子进程处理视频
+        通过 JobManager 提交 process job 处理视频
+        
+        复用 WebUI 的 JobManager 基础设施，确保：
+        - 任务在 web_jobs 表有正式记录，WebUI 可见
+        - 子进程管理、日志、状态追踪全部由 JobManager 处理
+        - watch 只负责编排，不干涉处理流程内部
         
         Returns:
             job_id 字符串（用于追踪），失败返回 None
@@ -405,51 +415,24 @@ class WatchService:
         if not video_ids:
             return None
         
-        job_id = f"watch-{self._session_id}-r{self._round_number}-{str(uuid.uuid4())[:4]}"
-        
-        # 构建 vat process 命令
-        cmd = ["python", "-m", "vat", "process"]
-        for vid in video_ids:
-            cmd.extend(["-v", vid])
-        cmd.extend(["-s", self.stages])
-        cmd.extend(["-p", playlist_id])
-        
-        if self.gpu_device != "auto":
-            cmd.extend(["-g", self.gpu_device])
-        if self.concurrency > 1:
-            cmd.extend(["-c", str(self.concurrency)])
-        if self.force:
-            cmd.append("-f")
-        if self.fail_fast:
-            cmd.append("--fail-fast")
-        
-        # 日志文件
-        log_dir = Path(self.config.storage.work_dir) / "logs" / "watch"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"{job_id}.log"
-        
-        logger.info(
-            f"提交处理任务: {job_id}, {len(video_ids)} 个视频, "
-            f"命令: {' '.join(cmd)}"
-        )
+        # stages 字符串转列表（JobManager 接口需要 List[str]）
+        steps = self.stages.split(",") if self.stages else ["all"]
         
         try:
-            env = os.environ.copy()
-            env["PYTHONUNBUFFERED"] = "1"
-            
-            log_fd = open(log_file, "w", buffering=1)
-            process = subprocess.Popen(
-                cmd,
-                stdout=log_fd,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                cwd=str(Path(__file__).parent.parent.parent),
-                env=env,
+            job_id = self.job_manager.submit_job(
+                video_ids=video_ids,
+                steps=steps,
+                gpu_device=self.gpu_device,
+                force=self.force,
+                concurrency=self.concurrency,
+                playlist_id=playlist_id,
+                fail_fast=self.fail_fast,
+                task_type='process',
             )
-            # 子进程已继承 fd，父进程关闭避免泄漏
-            log_fd.close()
-            
-            logger.info(f"任务进程已启动: {job_id}, PID={process.pid}, 日志={log_file}")
+            logger.info(
+                f"通过 JobManager 提交处理任务: {job_id}, "
+                f"{len(video_ids)} 个视频, stages={self.stages}, playlist={playlist_id}"
+            )
             return job_id
             
         except Exception as e:

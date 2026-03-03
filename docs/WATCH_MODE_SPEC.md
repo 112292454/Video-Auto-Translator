@@ -514,7 +514,7 @@ Watch 发现新视频后的任务提交方式：
 1. **资源锁使用独立 SQLite 文件**：`resource_lock.py` 使用独立的 `resource_locks.db`（与主数据库同目录），而非共用主 DB。这样即使不通过 `Database` 类的场景也能使用锁。
 2. **Watch CLI 注册为顶级命令**：`vat watch` 作为顶级命令，同时也注册为 `vat tools watch` 子命令（供 WebUI JobManager 调用）。
 3. **watch_rounds 表增加 `retry_video_ids` 列**：记录每轮中哪些视频是重试候选，方便 WebUI 展示和调试。
-4. **Watch 进程直接 spawn 子进程**：CLI 模式下 `WatchService` 直接通过 `subprocess.Popen` 启动 `vat process`，不依赖 WebUI 的 `JobManager`。WebUI 则通过 `JobManager` 提交 `watch` tools 任务。
+4. **Watch 通过 JobManager 提交 process job**：`WatchService` 通过 `JobManager.submit_job(task_type='process')` 提交处理任务，而非直接 `subprocess.Popen`。这样 watch 提交的处理任务在 `web_jobs` 表有正式记录，WebUI 可见、可追踪、可取消。Watch 只做轻量编排（sync → filter → submit），不干涉处理流程内部。WebUI 通过 `JobManager` 提交 `watch` tools 任务来启动 watch 进程本身。
 5. **视频候选范围修复**：`_get_processable_videos` 只接收 sync 报告的新增视频 ID，不再扫描全量 playlist（旧实现导致首次 watch 提交数千视频）。retry 范围限定为本 session 提交过的视频，防止历史失败被大规模重试。额外增加安全上限（代码硬上限 50 + 配置默认 20）。
 
 ### 涉及的文件

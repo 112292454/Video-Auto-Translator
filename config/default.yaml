@@ -186,9 +186,9 @@ translator:
     optimize:
       enable: true                          # 是否启用字幕优化（修正错别字、统一术语）
       custom_prompt: "fubuki"                     # 优化自定义提示词文件名
-      model: "kimi-k2.5"                          # 优化模型（需替换为火山引擎 endpoint ID，如 ep-20240xxxxx）
+      model: "kimi-k2.5"                          # 优化模型
       api_key: "${VAT_VOLC_APIKEY}"               # 火山引擎 API Key
-      base_url: "https://ark.cn-beijing.volces.com/api/v3"  # 火山引擎方舟标准 API
+      base_url: "https://ark.cn-beijing.volces.com/api/coding/v3"  # 火山引擎方舟 API
       batch_size: 100                        # 覆写批大小（大 BS 减少 API 调用次数）
       thread_num: 3                          # 覆写线程数（火山引擎建议低并发）
   
