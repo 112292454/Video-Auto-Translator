@@ -69,6 +69,9 @@
                             <button onclick="sortSeason({{ s.season_id }})" class="text-green-600 hover:text-green-800">
                                 排序
                             </button>
+                            <button onclick="syncSeasonTitles({{ s.season_id }})" class="text-purple-600 hover:text-purple-800">
+                                同步标题
+                            </button>
                             <button onclick="copySeasonId({{ s.season_id }})" class="text-gray-500 hover:text-gray-700">
                                 复制ID
                             </button>
@@ -520,6 +523,23 @@ async function sortSeason(seasonId) {
         }
     } catch (e) {
         alert('排序异常: ' + e);
+    }
+}
+
+// 同步合集标题
+async function syncSeasonTitles(seasonId) {
+    if (!confirm(`确认同步合集 ${seasonId} 的视频标题？\n（用实际视频标题替换合集中的名称）`)) return;
+    
+    try {
+        const resp = await fetch(`/bilibili/season/${seasonId}/sync-titles`, { method: 'POST' });
+        const data = await resp.json();
+        if (data.success) {
+            alert(`标题同步完成\n已更新: ${data.updated} 个\n已同步: ${data.skipped} 个`);
+        } else {
+            alert('标题同步失败: ' + data.error);
+        }
+    } catch (e) {
+        alert('标题同步异常: ' + e);
     }
 }
 

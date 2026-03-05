@@ -699,6 +699,103 @@ class BilibiliUploader(BaseUploader):
             logger.error(f"从合集移除视频异常: {e}")
             return False
     
+    def sync_season_episode_titles(self, season_id: int) -> Dict[str, Any]:
+        """
+        同步合集中的视频标题：用视频的实际标题替换合集中的 episode title
+        
+        B站合集 bug：添加视频时使用当时的标题，后续修改视频标题后，
+        合集中的 episode title 不会自动更新。本方法通过删除+重新添加
+        的方式强制更新标题。
+        
+        Args:
+            season_id: 合集ID
+            
+        Returns:
+            {'success': bool, 'updated': int, 'skipped': int, 'details': []}
+        """
+        try:
+            # 获取合集当前状态
+            season_info = self.get_season_episodes(season_id)
+            if not season_info:
+                return {'success': False, 'error': '无法获取合集信息'}
+            
+            section_id = season_info['section_id']
+            all_episodes = season_info.get('episodes', [])
+            
+            if not all_episodes:
+                return {'success': True, 'updated': 0, 'skipped': 0, 'details': []}
+            
+            # 保存原始顺序
+            original_order = [ep['aid'] for ep in all_episodes]
+            
+            # 找出需要更新的视频（title != archiveTitle）
+            need_update = []
+            for ep in all_episodes:
+                ep_title = ep.get('title', '')
+                archive_title = ep.get('archiveTitle', '')
+                if ep_title != archive_title:
+                    need_update.append({
+                        'aid': ep['aid'],
+                        'old_title': ep_title,
+                        'new_title': archive_title,
+                        'episode_id': ep['id']
+                    })
+            
+            if not need_update:
+                logger.info(f"合集 {season_id} 的所有视频标题已同步，无需更新")
+                return {
+                    'success': True,
+                    'updated': 0,
+                    'skipped': len(all_episodes),
+                    'details': []
+                }
+            
+            logger.info(f"合集 {season_id} 需要更新 {len(need_update)} 个视频标题")
+            
+            # 删除需要更新的视频
+            aids_to_remove = [item['aid'] for item in need_update]
+            if not self.remove_from_season(aids_to_remove, season_id):
+                return {'success': False, 'error': '删除视频失败'}
+            
+            # 重新添加（会使用当前的 archiveTitle）
+            # 添加延迟避免 B站 频繁操作限流（code=20111）
+            import time
+            failed = []
+            for idx, item in enumerate(need_update):
+                aid = item['aid']
+                if not self.add_to_season(aid, season_id):
+                    failed.append(aid)
+                    logger.error(f"重新添加视频 av{aid} 到合集失败")
+                # 每添加一个视频后等待2秒，避免触发限流
+                if idx < len(need_update) - 1:
+                    time.sleep(2)
+            
+            if failed:
+                return {
+                    'success': False,
+                    'error': f'部分视频添加失败: {failed}',
+                    'updated': len(need_update) - len(failed),
+                    'failed': failed
+                }
+            
+            # 恢复原始顺序
+            if not self.sort_season_episodes(season_id, original_order):
+                logger.warning(f"恢复排序失败，但标题已更新")
+            
+            logger.info(f"合集 {season_id} 标题同步完成: {len(need_update)} 个视频已更新")
+            return {
+                'success': True,
+                'updated': len(need_update),
+                'skipped': len(all_episodes) - len(need_update),
+                'details': need_update
+            }
+            
+        except Exception as e:
+            logger.error(f"同步合集标题异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'success': False, 'error': str(e)}
+    
     def sort_season_episodes(self, season_id: int, aids_in_order: List[int]) -> bool:
         """
         对合集内的视频重新排序

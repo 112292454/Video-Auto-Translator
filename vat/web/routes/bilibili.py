@@ -894,3 +894,23 @@ async def sort_season(season_id: int):
     except Exception as e:
         logger.error(f"合集排序失败: {e}")
         return JSONResponse({"success": False, "error": str(e)})
+
+
+@router.post("/season/{season_id}/sync-titles")
+async def sync_season_titles(season_id: int):
+    """同步合集中的视频标题：用实际标题替换合集中的名称"""
+    try:
+        uploader = _get_uploader()
+        result = uploader.sync_season_episode_titles(season_id)
+        if result['success']:
+            return JSONResponse({
+                "success": True,
+                "updated": result['updated'],
+                "skipped": result['skipped'],
+                "message": f"合集 {season_id} 标题同步完成：{result['updated']} 个已更新，{result['skipped']} 个已同步"
+            })
+        else:
+            return JSONResponse({"success": False, "error": result.get('error', '未知错误')})
+    except Exception as e:
+        logger.error(f"合集标题同步失败: {e}")
+        return JSONResponse({"success": False, "error": str(e)})
