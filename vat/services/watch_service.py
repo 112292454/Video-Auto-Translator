@@ -311,6 +311,9 @@ class WatchService:
             if meta.get('unavailable', False):
                 continue
             
+            # 预约/首播视频（is_upcoming）：提交任务，download 阶段会自动阻塞等待
+            # 不再在这里跳过，让 pipeline 处理
+            
             # 检查任务状态
             has_running = False
             has_failed = False

@@ -318,6 +318,61 @@ class VideoProcessor:
             self.config.translator.skip_translate = self._config_backup['skip_translate']
             self._config_backup = None
     
+    def _auto_apply_playlist_prompts(self):
+        """自动检测视频所属 playlist 并应用其 custom prompt 覆写
+        
+        规则：
+        - 如果调用方已通过 -p 显式指定了 playlist_id，则跳过自动检测
+          （CLI 层已经调用了 config.apply_playlist_prompts）
+        - 视频只属于 1 个 playlist：自动应用该 playlist 的 prompts
+        - 视频属于多个 playlist：发出警告，保持当前 config（由调用方决定）
+        - 视频不属于任何 playlist：保持当前 config
+        
+        注意：修改前保存原始 prompt 值到 _prompt_backup，process() 结束时恢复，
+        防止批量处理不同 playlist 的视频时 config 交叉污染。
+        """
+        self._prompt_backup = None
+        
+        # 调用方已显式指定 playlist_id（如 CLI 的 -p 参数），跳过自动检测
+        if self._playlist_id:
+            return
+        
+        playlist_ids = self.db.get_video_playlists(self.video_id)
+        
+        if len(playlist_ids) == 0:
+            # 视频不属于任何 playlist，使用默认 config
+            return
+        
+        if len(playlist_ids) == 1:
+            # 视频只属于 1 个 playlist，自动应用其 prompts
+            pl_id = playlist_ids[0]
+            pl = self.db.get_playlist(pl_id)
+            if pl and pl.metadata:
+                # 保存原始值，process() 结束后恢复
+                self._prompt_backup = {
+                    'optimize_custom_prompt': self.config.translator.llm.optimize.custom_prompt,
+                    'translate_custom_prompt': self.config.translator.llm.custom_prompt,
+                }
+                self.config.apply_playlist_prompts(pl.metadata)
+                self.logger.info(
+                    f"自动应用 playlist '{pl.title}' (ID: {pl_id}) 的 custom prompt 覆写"
+                )
+            return
+        
+        # 视频属于多个 playlist，警告并保持当前 config
+        self.logger.warning(
+            f"视频 {self.video_id} 属于 {len(playlist_ids)} 个 playlist: "
+            f"{playlist_ids}，无法自动确定使用哪个 playlist 的 prompt。"
+            f"请通过 -p 参数显式指定 playlist_id。"
+        )
+    
+    def _restore_playlist_prompts(self):
+        """恢复被 _auto_apply_playlist_prompts 修改的 prompt 值，防止影响后续视频"""
+        if hasattr(self, '_prompt_backup') and self._prompt_backup:
+            self.config.translator.llm.optimize.custom_prompt = self._prompt_backup['optimize_custom_prompt']
+            self.config.translator.llm.custom_prompt = self._prompt_backup['translate_custom_prompt']
+            self._prompt_backup = None
+    
     def process(self, steps: Optional[List[str]] = None) -> bool:
         """
         执行处理流程
@@ -337,6 +392,10 @@ class VideoProcessor:
         """
         # 设置当前上下文的 video_id
         set_video_id(self.video_id)
+        
+        # 自动应用 playlist 级别的 custom prompt 覆写
+        # 规则：视频只属于 1 个 playlist 时自动应用；属于多个时警告并保持当前配置
+        self._auto_apply_playlist_prompts()
         
         # 检查视频是否为不可用（如会员限定），若是则直接标记所有阶段完成并跳过
         video_metadata = self.video.metadata or {}
@@ -482,6 +541,8 @@ class VideoProcessor:
         finally:
             # 恢复被 passthrough 修改的 config（防止影响后续视频）
             self._restore_passthrough_config()
+            # 恢复被自动 playlist prompt 覆写修改的 config
+            self._restore_playlist_prompts()
         
         return all_success
     
@@ -560,9 +621,11 @@ class VideoProcessor:
                 **download_kwargs
             )
         except Exception as e:
-            # LiveStreamError 不包装为 DownloadError，让上层区分直播 vs 真正的下载失败
-            from ..downloaders.youtube import LiveStreamError
-            if isinstance(e, LiveStreamError):
+            # LiveStreamError / VideoUpcomingError 不包装为 DownloadError
+            # 这些异常由 download 方法内部处理（等待逻辑），不应该传播到这里
+            # 如果真的传播到这里，说明是实现 bug，直接抛出让问题暴露
+            from ..downloaders.youtube import LiveStreamError, VideoUpcomingError
+            if isinstance(e, (LiveStreamError, VideoUpcomingError)):
                 raise
             raise DownloadError(f"下载失败: {e}", original_error=e)
         
