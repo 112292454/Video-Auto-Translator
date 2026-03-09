@@ -1,0 +1,307 @@
+{% extends "base.html" %}
+{% block title %}数据库浏览 - VAT Manager{% endblock %}
+
+{% block content %}
+<div x-data="dbViewer()" x-init="loadTables()" class="space-y-4">
+    <!-- 页面标题 -->
+    <div class="flex items-center justify-between">
+        <h1 class="text-2xl font-bold text-gray-800">🗄️ 数据库浏览</h1>
+        <span class="text-sm text-gray-500" x-text="dbPath"></span>
+    </div>
+
+    <div class="flex gap-4">
+        <!-- 左侧：表列表 -->
+        <div class="w-64 flex-shrink-0">
+            <div class="bg-white rounded-lg shadow p-4">
+                <h2 class="text-sm font-semibold text-gray-600 mb-3">数据表</h2>
+                <div class="space-y-1">
+                    <template x-for="t in tables" :key="t.name">
+                        <button
+                            @click="selectTable(t.name)"
+                            :class="selectedTable === t.name ? 'bg-blue-50 text-blue-700 border-blue-200' : 'text-gray-700 hover:bg-gray-50 border-transparent'"
+                            class="w-full text-left px-3 py-2 rounded border text-sm flex justify-between items-center transition-colors"
+                        >
+                            <span x-text="t.name" class="truncate"></span>
+                            <span class="text-xs px-1.5 py-0.5 rounded-full bg-gray-100 text-gray-500 ml-2 flex-shrink-0" x-text="t.row_count"></span>
+                        </button>
+                    </template>
+                </div>
+            </div>
+        </div>
+
+        <!-- 右侧：表数据 -->
+        <div class="flex-1 min-w-0">
+            <!-- 未选择表 -->
+            <div x-show="!selectedTable" class="bg-white rounded-lg shadow p-8 text-center text-gray-400">
+                选择左侧的表查看数据
+            </div>
+
+            <!-- 表数据视图 -->
+            <div x-show="selectedTable" class="space-y-3">
+                <!-- Schema 折叠面板 -->
+                <div class="bg-white rounded-lg shadow">
+                    <button @click="showSchema = !showSchema" class="w-full px-4 py-2 text-left text-sm flex items-center justify-between hover:bg-gray-50">
+                        <span class="font-medium text-gray-700">
+                            📋 表结构 <span class="text-gray-400" x-text="'(' + (currentColumns.length || 0) + ' 列)'"></span>
+                        </span>
+                        <span x-text="showSchema ? '▲' : '▼'" class="text-gray-400 text-xs"></span>
+                    </button>
+                    <div x-show="showSchema" x-transition class="px-4 pb-3 border-t">
+                        <table class="w-full text-sm mt-2">
+                            <thead><tr class="text-gray-500 text-xs">
+                                <th class="text-left py-1">列名</th><th class="text-left py-1">类型</th>
+                                <th class="text-left py-1">主键</th><th class="text-left py-1">非空</th><th class="text-left py-1">默认值</th>
+                            </tr></thead>
+                            <tbody>
+                                <template x-for="col in currentSchema" :key="col.name">
+                                    <tr class="border-t border-gray-100">
+                                        <td class="py-1 font-mono text-xs" x-text="col.name" :class="col.pk ? 'text-blue-600 font-semibold' : ''"></td>
+                                        <td class="py-1 text-gray-500 text-xs" x-text="col.type || 'TEXT'"></td>
+                                        <td class="py-1" x-text="col.pk ? '✓' : ''"></td>
+                                        <td class="py-1" x-text="col.notnull ? '✓' : ''"></td>
+                                        <td class="py-1 text-gray-400 text-xs" x-text="col.default || ''"></td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- 搜索和分页控制 -->
+                <div class="bg-white rounded-lg shadow px-4 py-3 flex items-center gap-3 flex-wrap">
+                    <div class="flex-1 min-w-[200px]">
+                        <input type="text" x-model="searchText" @keydown.enter="doSearch()"
+                            placeholder="搜索（回车执行）..."
+                            class="w-full px-3 py-1.5 border rounded text-sm focus:outline-none focus:ring-1 focus:ring-blue-400">
+                    </div>
+                    <button @click="doSearch()" class="px-3 py-1.5 bg-blue-500 text-white text-sm rounded hover:bg-blue-600">搜索</button>
+                    <button x-show="activeSearch" @click="clearSearch()" class="px-3 py-1.5 bg-gray-200 text-gray-600 text-sm rounded hover:bg-gray-300">清除</button>
+                    <div class="text-sm text-gray-500">
+                        共 <span x-text="totalRows" class="font-medium"></span> 行
+                        <span x-show="activeSearch" class="text-blue-500">(搜索结果)</span>
+                    </div>
+                    <!-- 分页 -->
+                    <div class="flex items-center gap-1 ml-auto">
+                        <button @click="goPage(currentPage-1)" :disabled="currentPage <= 1"
+                            class="px-2 py-1 text-sm border rounded disabled:opacity-30 hover:bg-gray-50">◀</button>
+                        <span class="text-sm text-gray-500 px-2" x-text="currentPage + '/' + totalPages"></span>
+                        <button @click="goPage(currentPage+1)" :disabled="currentPage >= totalPages"
+                            class="px-2 py-1 text-sm border rounded disabled:opacity-30 hover:bg-gray-50">▶</button>
+                        <select x-model="pageSize" @change="loadTableData()" class="text-sm border rounded px-1 py-1 ml-2">
+                            <option value="25">25</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                            <option value="200">200</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- 数据表格 -->
+                <div class="bg-white rounded-lg shadow overflow-hidden">
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead class="bg-gray-50 border-b">
+                                <tr>
+                                    <th class="px-3 py-2 text-left text-xs text-gray-500 w-8">#</th>
+                                    <template x-for="col in displayColumns" :key="col">
+                                        <th @click="toggleSort(col)" class="px-3 py-2 text-left text-xs text-gray-500 cursor-pointer hover:bg-gray-100 whitespace-nowrap select-none"
+                                            :class="{ 'text-blue-600': sortBy === col }">
+                                            <span x-text="col"></span>
+                                            <span x-show="sortBy === col" x-text="sortDir === 'asc' ? '▲' : '▼'" class="text-[10px] ml-0.5"></span>
+                                        </th>
+                                    </template>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <template x-for="(row, idx) in rows" :key="idx">
+                                    <tr class="border-t border-gray-100 hover:bg-blue-50/30 cursor-pointer" @click="showRowDetail(row)">
+                                        <td class="px-3 py-1.5 text-xs text-gray-400" x-text="(currentPage-1)*pageSize + idx + 1"></td>
+                                        <template x-for="col in displayColumns" :key="col">
+                                            <td class="px-3 py-1.5 max-w-xs truncate" :title="formatCellTitle(row[col])">
+                                                <span x-html="formatCell(row[col], col)"></span>
+                                            </td>
+                                        </template>
+                                    </tr>
+                                </template>
+                                <tr x-show="rows.length === 0">
+                                    <td :colspan="displayColumns.length + 1" class="px-4 py-8 text-center text-gray-400">
+                                        <span x-text="loading ? '加载中...' : '无数据'"></span>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 行详情弹窗 -->
+    <template x-if="detailRow">
+        <div x-transition.opacity class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
+             @click.self="detailRow = null" @keydown.escape.window="detailRow = null">
+            <div class="bg-white rounded-lg shadow-xl max-w-4xl w-full max-h-[85vh] flex flex-col" @click.stop>
+                <div class="px-5 py-3 border-b flex items-center justify-between flex-shrink-0">
+                    <h3 class="font-semibold text-gray-800">
+                        行详情 — <span x-text="selectedTable" class="text-blue-600"></span>
+                    </h3>
+                    <button @click="detailRow = null" class="text-gray-400 hover:text-gray-600 text-xl">&times;</button>
+                </div>
+                <div class="overflow-y-auto p-5 flex-1">
+                    <table class="w-full text-sm">
+                        <template x-for="col in displayColumns" :key="col">
+                            <tr class="border-b border-gray-100">
+                                <td class="py-2 pr-4 text-gray-500 font-mono text-xs whitespace-nowrap align-top w-40" x-text="col"></td>
+                                <td class="py-2">
+                                    <template x-if="isJsonField(detailRow[col])">
+                                        <pre class="bg-gray-50 rounded p-3 text-xs overflow-x-auto max-h-96 whitespace-pre-wrap break-all font-mono"
+                                             x-text="formatJson(detailRow[col])"></pre>
+                                    </template>
+                                    <template x-if="!isJsonField(detailRow[col])">
+                                        <span class="break-all" x-text="String(detailRow[col] ?? '')"></span>
+                                    </template>
+                                </td>
+                            </tr>
+                        </template>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </template>
+</div>
+
+<script>
+function dbViewer() {
+    return {
+        tables: [],
+        selectedTable: null,
+        currentSchema: [],
+        currentColumns: [],
+        displayColumns: [],
+        rows: [],
+        totalRows: 0,
+        currentPage: 1,
+        totalPages: 1,
+        pageSize: 50,
+        searchText: '',
+        activeSearch: '',
+        sortBy: null,
+        sortDir: 'asc',
+        showSchema: false,
+        detailRow: null,
+        loading: false,
+        dbPath: '',
+
+        async loadTables() {
+            const resp = await fetch('/api/database/tables');
+            const data = await resp.json();
+            this.tables = data.tables;
+        },
+
+        async selectTable(name) {
+            this.selectedTable = name;
+            this.currentPage = 1;
+            this.searchText = '';
+            this.activeSearch = '';
+            this.sortBy = null;
+            this.sortDir = 'asc';
+            this.showSchema = false;
+            
+            const t = this.tables.find(t => t.name === name);
+            if (t) {
+                this.currentSchema = t.columns;
+                this.currentColumns = t.columns.map(c => c.name);
+                this.displayColumns = [...this.currentColumns];
+            }
+            await this.loadTableData();
+        },
+
+        async loadTableData() {
+            if (!this.selectedTable) return;
+            this.loading = true;
+            
+            let url = `/api/database/tables/${encodeURIComponent(this.selectedTable)}?page=${this.currentPage}&page_size=${this.pageSize}`;
+            if (this.activeSearch) url += `&search=${encodeURIComponent(this.activeSearch)}`;
+            if (this.sortBy) url += `&sort_by=${encodeURIComponent(this.sortBy)}&sort_dir=${this.sortDir}`;
+            
+            const resp = await fetch(url);
+            const data = await resp.json();
+            this.rows = data.rows;
+            this.totalRows = data.total;
+            this.totalPages = data.total_pages || 1;
+            this.loading = false;
+        },
+
+        doSearch() {
+            this.activeSearch = this.searchText;
+            this.currentPage = 1;
+            this.loadTableData();
+        },
+
+        clearSearch() {
+            this.searchText = '';
+            this.activeSearch = '';
+            this.currentPage = 1;
+            this.loadTableData();
+        },
+
+        goPage(p) {
+            if (p < 1 || p > this.totalPages) return;
+            this.currentPage = p;
+            this.loadTableData();
+        },
+
+        toggleSort(col) {
+            if (this.sortBy === col) {
+                this.sortDir = this.sortDir === 'asc' ? 'desc' : 'asc';
+            } else {
+                this.sortBy = col;
+                this.sortDir = 'asc';
+            }
+            this.loadTableData();
+        },
+
+        showRowDetail(row) {
+            this.detailRow = row;
+        },
+
+        isJsonField(value) {
+            return value !== null && typeof value === 'object';
+        },
+
+        formatJson(value) {
+            if (value === null || value === undefined) return '';
+            try {
+                return JSON.stringify(value, null, 2);
+            } catch {
+                return String(value);
+            }
+        },
+
+        formatCell(value, col) {
+            if (value === null || value === undefined) return '<span class="text-gray-300 italic">null</span>';
+            if (typeof value === 'object') {
+                const s = JSON.stringify(value);
+                if (s.length > 80) return `<span class="text-purple-600 text-xs">{JSON…${s.length}字符}</span>`;
+                return `<span class="text-purple-600 text-xs">${this.escapeHtml(s.substring(0, 80))}</span>`;
+            }
+            const s = String(value);
+            if (s.length > 100) return this.escapeHtml(s.substring(0, 100)) + '…';
+            return this.escapeHtml(s);
+        },
+
+        formatCellTitle(value) {
+            if (value === null || value === undefined) return 'null';
+            if (typeof value === 'object') return JSON.stringify(value, null, 2);
+            return String(value);
+        },
+
+        escapeHtml(s) {
+            const div = document.createElement('div');
+            div.textContent = s;
+            return div.innerHTML;
+        }
+    }
+}
+</script>
+{% endblock %}

@@ -21,7 +21,7 @@ from vat.web.deps import get_db
 from vat.web.jobs import JobStatus
 
 # 导入路由
-from vat.web.routes import videos_router, playlists_router, tasks_router, files_router, prompts_router, bilibili_router, watch_router
+from vat.web.routes import videos_router, playlists_router, tasks_router, files_router, prompts_router, bilibili_router, watch_router, database_router
 
 app = FastAPI(title="VAT Manager", description="视频处理任务管理界面")
 
@@ -68,6 +68,7 @@ app.include_router(files_router)
 app.include_router(prompts_router)
 app.include_router(bilibili_router)
 app.include_router(watch_router)
+app.include_router(database_router)
 
 # 模板目录
 templates_dir = Path(__file__).parent / "templates"
@@ -888,6 +889,14 @@ def run_server(host: str | None = None, port: int | None = None):
     host = host or config.web.host
     port = port or config.web.port
     uvicorn.run(app, host=host, port=port)
+
+
+# ==================== 数据库浏览页面路由 ====================
+
+@app.get("/database", response_class=HTMLResponse)
+async def database_page(request: Request):
+    """数据库可视化浏览页"""
+    return templates.TemplateResponse("database.html", {"request": request})
 
 
 if __name__ == "__main__":
