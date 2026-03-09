@@ -599,6 +599,8 @@ class VideoProcessor:
         6. 下载封面（需要 thumbnail URL）
         7. 更新 DB
         """
+        # 刷新 self.video，避免用初始化时的 stale 快照覆盖其他步骤写入的 metadata
+        self.video = self.db.get_video(self.video_id)
         self._progress_with_tracker(f"开始处理视频: {self.video.source_url}")
         
         # === Step 1: 委托下载器执行 ===
@@ -845,12 +847,17 @@ class VideoProcessor:
         Whisper 语音识别阶段
         输出：original_raw.srt（原始 ASR 输出）
         
+        注意：开头刷新 self.video 以获取最新 metadata，避免 stale 覆盖。
+        
         流程：
         1. 检查是否有人工字幕，有则跳过ASR
         2. 提取音频
         3. 如需人声分离，执行分离（输出 xxx_vocals.wav）
         4. 使用音频（或分离后的人声）进行 Whisper 识别
         """
+        # 刷新 self.video，避免用初始化时的 stale 快照覆盖其他步骤写入的 metadata
+        self.video = self.db.get_video(self.video_id)
+        
         video_file = self._find_video_file()
         assert video_file and video_file.exists(), f"视频文件不存在: {video_file}"
         
@@ -1126,6 +1133,9 @@ class VideoProcessor:
         输入：original_raw.srt
         输出：original.srt（语义完整的原文字幕）
         """
+        # 刷新 self.video，确保读取 scene 等字段时用的是最新数据
+        self.video = self.db.get_video(self.video_id)
+        
         # 无人声视频跳过断句
         if self._is_no_speech():
             self.progress_callback("无人声视频，跳过断句")
@@ -1848,6 +1858,10 @@ class VideoProcessor:
         使用模板系统渲染标题/描述，支持通过 config/upload.yaml 自定义
         需要配置B站cookie文件
         """
+        # 刷新 self.video，避免用初始化时的 stale 快照覆盖其他步骤写入的 metadata
+        # （upload 是最后一步，如果用 stale 快照写回 DB 会覆盖所有中间步骤的数据：
+        #  stage_models、translated 等）
+        self.video = self.db.get_video(self.video_id)
         
         # 查找最终视频文件
         final_video = self.output_dir / "final.mp4"
