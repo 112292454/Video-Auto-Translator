@@ -1,7 +1,7 @@
 # VAT Web UI 使用手册
 
-> **版本**: v1.4  
-> **更新日期**: 2026-03-02  
+> **版本**: v1.5  
+> **更新日期**: 2026-03-10  
 > **状态**: 已实现
 
 ---
@@ -67,6 +67,9 @@ uvicorn vat.web.app:app --host 0.0.0.0 --port 8080
 | 📂 Playlist | Playlist 管理，添加和同步 YouTube 播放列表 |
 | ⚙️ 任务 | 任务管理，查看任务历史和运行状态 |
 | 📝 Prompts | Custom Prompt 管理 |
+| 👁️ Watch | Watch 自动监控管理，启动/停止/查看监控会话 |
+| 📺 B站 | B站账号、合集管理、审核退回修复、上传配置 |
+| 🗄️ DB | 数据库只读浏览器，查看表结构和数据 |
 
 ---
 
@@ -83,9 +86,12 @@ vat/web/
 │   ├── playlists.py    # Playlist API
 │   ├── tasks.py        # 任务执行 API
 │   ├── files.py        # 文件浏览 API
-│   └── prompts.py      # Prompt 管理 API
+│   ├── prompts.py      # Prompt 管理 API
+│   ├── bilibili.py     # B站管理 API（账号/合集/退回修复/上传配置）
+│   ├── watch.py        # Watch 自动监控 API
+│   └── database.py     # 数据库浏览 API（只读）
 └── templates/          # Jinja2 模板
-    ├── base.html           # 基础布局
+    ├── base.html           # 基础布局（导航栏）
     ├── index.html          # 视频列表
     ├── video_detail.html   # 视频详情
     ├── playlists.html      # Playlist 列表
@@ -93,7 +99,10 @@ vat/web/
     ├── tasks.html          # 任务列表
     ├── task_new.html       # 新建任务
     ├── task_detail.html    # 任务详情
-    └── prompts.html        # Prompt 管理
+    ├── prompts.html        # Prompt 管理
+    ├── bilibili.html       # B站管理
+    ├── watch.html          # Watch 管理
+    └── database.html       # 数据库浏览
 ```
 
 ### 3.2 任务执行机制
@@ -401,6 +410,36 @@ vat/web/
 - **后台等待上传**（cron 模式）：进程等待到 cron 触发时间后上传，需保持进程运行
 - **B站定时发布**（dtime 模式）：立即全部上传，通过 B站 API 指定各视频的定时发布时间，无需保持进程运行（发布时间需 >2 小时）
 
+### 4.11 Watch 管理页 (`/watch`)
+
+独立的 Watch 自动监控管理页面，用于统一管理所有 watch 会话。
+
+**会话列表**：
+- 显示所有 watch sessions（运行中/已停止/异常）
+- 每个 session 显示：监控的 Playlist 列表、状态指示灯、运行时长、累计统计（发现新视频数、提交任务数）
+- **新建 Watch**：选择 Playlist + 配置参数（间隔、阶段、GPU、并发数）→ 启动
+- **停止**：发送 SIGTERM 停止运行中的 watch 进程
+
+**会话详情**（`/watch/{session_id}`）：
+- Session 配置参数、启动时间
+- 实时状态：上次/下次检查时间、累计统计
+- 轮次历史：每轮的检查时间、发现视频数、提交的任务链接、错误信息
+- 关联的 Job 列表
+
+**Playlist 快捷入口**：在 Playlist 详情页提供「开始监控」按钮，可快捷创建该 Playlist 的 watch session。如果该 Playlist 已在被监控，则显示 watch 状态摘要和跳转链接。
+
+### 4.12 数据库浏览页 (`/database`)
+
+内置的 SQLite 数据库只读浏览器，用于开发调试和数据检查。
+
+**功能**：
+- 左侧显示所有数据表及行数
+- 选择表后查看表结构（列名、类型、主键、非空、默认值）
+- 分页浏览表数据（可配置每页 25/50/100/200 行）
+- 全文搜索（跨所有列的 LIKE 匹配）
+- 点击列头排序（升序/降序切换）
+- 点击行查看详情弹窗（JSON 字段自动格式化展开）
+
 ---
 
 ## 五、API 参考
@@ -501,6 +540,26 @@ vat/web/
 | GET | `/bilibili/season-sync/{playlist_id}/status` | 查询合集同步任务状态 |
 | GET | `/bilibili/config` | 获取上传配置 |
 | PUT | `/bilibili/config` | 更新上传配置 |
+| POST | `/bilibili/season/{id}/sync-titles` | 同步合集标题（用实际视频标题替换合集中的名称） |
+
+### 5.7 Watch API
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/watch/start` | 启动 watch session（通过 JobManager 提交） |
+| GET | `/api/watch/sessions` | 列出所有 watch sessions |
+| GET | `/api/watch/sessions/{session_id}` | 获取 session 详情 |
+| POST | `/api/watch/sessions/{session_id}/stop` | 停止运行中的 session（发送 SIGTERM） |
+| DELETE | `/api/watch/sessions/{session_id}` | 删除已停止的 session 记录 |
+| GET | `/api/watch/sessions/{session_id}/rounds` | 获取轮次历史 |
+
+### 5.8 数据库浏览 API
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/database/tables` | 列出所有表及其行数和列信息 |
+| GET | `/api/database/tables/{table_name}` | 分页查询表数据（支持搜索、排序、筛选） |
+| GET | `/api/database/tables/{table_name}/row` | 获取单行数据详情（所有字段展开） |
 
 ---
 
@@ -540,7 +599,18 @@ vat/web/
 4. 在模态框中修改内容
 5. 点击"保存"（原文件自动备份为 `.bak`）
 
-### 6.5 使用 Custom Prompt
+### 6.5 设置自动监控（Watch 模式）
+
+1. 访问 `/watch`，点击「新建 Watch」
+2. 选择要监控的 Playlist
+3. 配置参数（轮询间隔、处理阶段、GPU、并发数）
+4. 点击「启动」
+5. Watch 进程开始持续运行，自动发现新视频并提交全流程处理任务
+6. 在 Watch 详情页查看每轮检查的状态、提交的任务
+
+也可以在 Playlist 详情页点击「开始监控」快捷入口来启动。
+
+### 6.6 使用 Custom Prompt
 
 1. 访问 `/prompts`
 2. 点击"+ 新建 Prompt"

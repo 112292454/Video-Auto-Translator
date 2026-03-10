@@ -42,6 +42,8 @@ VAT is designed for **server-side batch video translation**, not as a single-vid
 - **Stage-level tracking**: each processing stage independently tracked, supports resumption and selective re-run
 - **Concurrent scheduling**: multi-GPU task scheduling, parallel video processing
 - **Crash recovery**: auto-detects orphaned tasks after process crashes, resumes on restart
+- **Watch mode**: auto-monitors YouTube Playlists, discovers new videos and submits full-pipeline processing tasks automatically (see [Watch Mode Spec](docs/WATCH_MODE_SPEC.md))
+- **Cross-process resource locks**: when multiple VAT processes run concurrently, YouTube download and Bilibili upload rates are automatically coordinated to prevent throttling
 
 ---
 
@@ -111,7 +113,9 @@ Based on [yt-dlp](https://github.com/yt-dlp/yt-dlp):
 - Auto-downloads manual subtitles (can skip ASR when detected)
 - **Playlist incremental sync**: time-ordered video management, subsequent syncs only fetch new videos
 - LLM automatic scene detection (gaming, chatting, singing, educational, etc.)
-- LLM automatic video info translation (title, description, tags)
+- LLM automatic video info translation (title, description, tags), with post-translation name normalization (e.g., regional variants → standard Mandarin)
+- **Live stream handling**: three-stage strategy (attempt `live_from_start` → wait for stream end → VOD download), transparent to the upper pipeline
+- **Upcoming videos**: supports submitting tasks for unpublished videos; the download stage automatically polls until the video is published
 
 ### Bilibili Upload
 
@@ -120,8 +124,10 @@ Based on [biliup](https://github.com/biliup/biliup):
 - Template system: title/description support variable substitution (channel name, translated title, etc.)
 - Auto-fetches covers, generates tags
 - LLM-recommended Bilibili categories
-- Supports adding to collections (⚠️ Known issue: video upload works, but adding to collections is sometimes unstable)
-- Scheduled upload: cron expression support for timed uploads, one video per trigger (CLI `--upload-cron` / WebUI visual config)
+- Supports adding to collections (auto-adds to Bilibili SEASON after upload), with season title sync (replaces default names with actual video titles)
+- Scheduled upload: cron expression for timed uploads, configurable batch size (`--upload-batch-size`), two modes:
+  - **cron mode** (default): background process waits for cron trigger
+  - **dtime mode**: uploads immediately, uses Bilibili scheduled-publish API (>2h required, no background process needed)
 
 ### Scheduling & Concurrency
 
@@ -277,6 +283,33 @@ vat playlist sync "https://www.youtube.com/playlist?list=PLAYLIST_ID"
 vat status
 ```
 
+### Watch Mode (Auto-Monitor)
+
+Watch mode is VAT's **fully automated operation mode**: continuously monitors specified YouTube Playlists, and upon discovering new videos, automatically completes the entire pipeline — download → ASR → split → optimize → translate → embed → upload → add to collection — with zero manual intervention. Ideal for time-sensitive scenarios (e.g., auto-translating VTuber streams shortly after they end).
+
+```bash
+# Continuously monitor a Playlist (default: check every 60 minutes)
+vat watch -p PLAYLIST_ID
+
+# Monitor multiple Playlists with custom interval
+vat watch -p PL_FUBUKI -p PL_MARINE --interval 30
+
+# Single check then exit (can be combined with system cron)
+vat watch -p PLAYLIST_ID --once
+
+# Specify GPU and concurrency
+vat watch -p PLAYLIST_ID --gpu cuda:0 --concurrency 2
+```
+
+**How it works**:
+- Watch process only **discovers new videos and submits tasks**; actual processing is handled by JobManager subprocesses (reusing `vat process` infrastructure)
+- Built-in **cross-process resource locks**: automatically coordinates YouTube download and Bilibili upload rates across multiple concurrent VAT processes
+- Each round auto-filters already-processed, in-progress, and unavailable videos to prevent duplicate submissions
+- Failed videos are automatically retried in subsequent rounds (max 3 retries per video)
+- Can be started/stopped/monitored via the WebUI Watch management page
+
+See [Watch Mode Spec](docs/WATCH_MODE_SPEC.md) for detailed design.
+
 ### Command Quick Reference
 
 | Command | Description |
@@ -292,13 +325,28 @@ vat status
 | `vat upload sync -p PLAYLIST_ID` | Season sync (add + sort) |
 | `vat upload update-info -p PLAYLIST_ID` | Batch update Bilibili video title/desc |
 | `vat upload sync-db -s SEASON -p PLAYLIST` | Sync Bilibili season info back to DB |
-| `vat process -v ID -s upload --upload-cron "0 12,18 * * *"` | Scheduled upload (daily 12/18) |
+| `vat process -v ID -s upload --upload-cron "0 12,18 * * *"` | Scheduled upload (daily 12/18, default 1 per trigger) |
+| `vat process -p PL -s upload --upload-cron "0 12 * * *" --upload-batch-size 3` | Scheduled upload, 3 per trigger |
+| `vat process -p PL -s upload --upload-cron "0 12 * * *" --upload-mode dtime` | Bilibili scheduled-publish mode |
 | `vat playlist sync URL` | Sync playlist |
 | `vat playlist refresh ID` | Refresh video info (fill missing covers, duration, etc.) |
 | `vat status` | View processing status |
 | `vat clean -v ID` | Clean intermediate files |
 | `vat clean -v ID --records` | Clean files + delete records |
 | `vat bilibili login` | Bilibili login for cookies |
+| `vat bilibili rejected` | List rejected submissions with violation details |
+| `vat bilibili fix --aid AID` | Fix a rejected submission (cumulative mask, prefer local files) |
+| `vat tools fix-violation --aid AID` | Auto-loop fix: mask → upload → wait review → check → retry |
+| `vat tools sync-playlist --playlist ID` | Sync YouTube Playlist (incremental) |
+| `vat tools retranslate-playlist --playlist ID` | Re-translate Playlist video title/desc |
+| `vat tools season-sync --playlist ID` | Season sync (add + sort) |
+| `vat tools update-info --playlist ID` | Batch update uploaded video title/desc |
+| `vat tools sync-db --season S --playlist ID` | Sync Bilibili season info back to DB |
+| `vat watch -p PLAYLIST_ID` | Auto-monitor Playlist and process new videos (persistent) |
+| `vat watch -p PL1 -p PL2 -i 30` | Monitor multiple Playlists, 30-min interval |
+| `vat watch -p PLAYLIST_ID --once` | Single check then exit (can combine with system cron) |
+
+> `vat tools` subcommands share functionality with other CLI commands but output standardized progress markers (`[N%]`/`[SUCCESS]`/`[FAILED]`) for WebUI JobManager subprocess scheduling and monitoring.
 
 ### Output Files
 
@@ -367,6 +415,22 @@ When creating tasks, you can select videos, execution stages, GPU device, and co
   <img src="docs/assets/webui_task_new.png" alt="New Task" width="90%">
 </p>
 
+### Watch Management
+
+A dedicated Watch management page for managing all auto-monitor sessions. Start/stop Watch tasks directly from the WebUI, view real-time status including videos found, tasks submitted, and errors per round. Playlist detail pages also provide a quick "Start Monitoring" shortcut.
+
+<p align="center">
+  <img src="docs/assets/webui_watch.png" alt="Watch Management" width="90%">
+</p>
+
+### Database Browser
+
+Built-in read-only SQLite database browser (`/database`) for viewing all table schemas and data, with pagination, search, sorting, and JSON field expansion. Useful for development debugging and data inspection.
+
+<p align="center">
+  <img src="docs/assets/webui_database.png" alt="Database Browser" width="90%">
+</p>
+
 See [WebUI Manual](docs/webui_manual.md) for detailed instructions.
 
 ---
@@ -375,18 +439,19 @@ See [WebUI Manual](docs/webui_manual.md) for detailed instructions.
 
 ```
 vat/
-├── asr/                  # Speech recognition module
-│   ├── whisper_asr.py    #   faster-whisper wrapper
+├── asr/                  # Speech recognition module (Whisper + LLM segmentation)
+│   ├── whisper_wrapper.py #  faster-whisper wrapper
 │   ├── chunked_asr.py    #   Chunked concurrent ASR
 │   ├── split.py          #   LLM smart segmentation
-│   ├── asr_post.py       #   Post-processing (hallucination/repetition)
+│   ├── postprocessing.py #   Post-processing (hallucination/repetition)
 │   └── vocal_separation/ #   Vocal separation
 ├── translator/           # Translation module
 │   └── llm_translator.py #   LLM reflective translation engine
 ├── llm/                  # LLM infrastructure
-│   ├── client.py         #   Unified LLM client
+│   ├── client.py         #   Unified LLM client (multi-endpoint, cache, retry)
 │   ├── scene_identifier.py # Scene detection
-│   └── prompts/          #   Prompt management (built-in + custom)
+│   ├── video_info_translator.py # Video info translation (title/desc/tags + category)
+│   └── prompts/          #   Prompt management (Markdown files + template vars)
 ├── embedder/             # Subtitle embedding module
 │   └── ffmpeg_wrapper.py #   FFmpeg wrapper (soft/hard subs + GPU accel)
 ├── downloaders/          # Downloaders (multi-source)
@@ -394,18 +459,20 @@ vat/
 │   ├── youtube.py        #   YouTube downloader (yt-dlp)
 │   ├── local.py          #   Local file importer (symlink + ffprobe)
 │   └── direct_url.py     #   HTTP/HTTPS direct link downloader
-├── uploaders/            # Uploaders (Bilibili biliup)
+├── uploaders/            # Uploaders (Bilibili biliup + templates + season mgmt)
 ├── pipeline/             # Pipeline orchestration
 │   ├── executor.py       #   VideoProcessor (stage scheduling)
 │   ├── scheduler.py      #   Multi-GPU scheduler
 │   └── progress.py       #   Progress tracking
-├── web/                  # Web management UI
-│   ├── app.py            #   FastAPI app + page routes
-│   ├── jobs.py           #   Job manager (subprocess scheduling)
-│   ├── routes/           #   API routes
+├── web/                  # Web management UI (FastAPI + Jinja2)
+│   ├── app.py            #   App entry + page routes
+│   ├── jobs.py           #   Job manager (subprocess scheduling + SQLite persistence)
+│   ├── routes/           #   API routes (videos/playlists/tasks/bilibili/prompts/watch/database)
 │   └── templates/        #   Jinja2 + TailwindCSS templates
 ├── cli/                  # CLI commands (click)
-├── services/             # Business logic (Playlist service, etc.)
+├── services/             # Business logic (Playlist sync/Watch service/metadata mgmt)
+├── subtitle_utils/       # Subtitle utilities (text alignment, format definitions)
+├── utils/                # Common utilities (GPU mgmt, logging, cache, validation, cross-process resource locks)
 ├── database.py           # SQLite data layer (WAL mode)
 ├── config.py             # Configuration management (YAML + env vars)
 └── models.py             # Data model definitions
@@ -447,7 +514,7 @@ See [ASR Parameters Guide](docs/asr_parameters_guide.md) for details.
 
 ### GPU Allocation
 
-See [GPU Allocation Spec](docs/gpu_allocation_spec.md) for multi-GPU task distribution strategies.
+See [GPU Allocation Spec](docs/archive/gpu_allocation_spec.md) for multi-GPU task distribution strategies.
 
 ---
 
@@ -455,15 +522,17 @@ See [GPU Allocation Spec](docs/gpu_allocation_spec.md) for multi-GPU task distri
 
 | Document | Content |
 |----------|---------|
-| [ASR Parameters Guide](docs/asr_parameters_guide.md) | Whisper parameter details and tuning |
-| [ASR Evaluation Report](docs/ASR_EVALUATION_REPORT.md) | Parameter evaluation across 350 VTuber videos |
+| [ASR Evaluation Report](docs/ASR_EVALUATION_REPORT.md) | Whisper parameter evaluation across 350 VTuber videos |
+| [Translation & ASR Evaluation](docs/TRANSLATION_AND_ASR_EVALUATION.md) | Domestic/overseas LLM translation comparison, ASR enhancement experiments |
 | [Prompt Optimization Guide](docs/prompt_optimization_guide.md) | Translation/optimization prompt writing |
-| [GPU Allocation Spec](docs/gpu_allocation_spec.md) | Multi-GPU scheduling strategy |
+| [GPU Allocation Spec](docs/archive/gpu_allocation_spec.md) | Multi-GPU scheduling strategy |
 | [WebUI Manual](docs/webui_manual.md) | Web UI operation guide |
 | [YouTube Subtitles](docs/youtube_manual_subtitles.md) | YouTube manual subtitle detection and usage |
 | [Subtitle Style Guide](docs/subtitle_style_guide.md) | ASS subtitle style template guide |
-| [Multi-Source Download Design](docs/design_multi_source_download.md) | Local file/direct link/YouTube multi-source download architecture |
+| [Multi-Source Download Design](docs/archive/design_multi_source_download.md) | Local file/direct link/YouTube multi-source download architecture |
 | [Known Issues](docs/known_issues.md) | Known limitations and LLM cost reference |
+| [Watch Mode Spec](docs/WATCH_MODE_SPEC.md) | Watch mode design and implementation |
+| [ASR Enhancement Experiment](docs/ASR_ENHANCEMENT_EXPERIMENT.md) | Empty chunk retry, chunk parameter tuning experiments |
 
 ---
 
