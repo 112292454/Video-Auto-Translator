@@ -45,7 +45,9 @@ def start(config: str, persist_file: str):
     queue = init_global_queue(
         gpu_devices=cfg.concurrency.gpu_devices,
         max_concurrent_per_gpu=cfg.concurrency.max_concurrent_per_gpu,
-        persist_file=Path(persist_file).expanduser()
+        persist_file=Path(persist_file).expanduser(),
+        database_path=Path(cfg.storage.database_path).expanduser(),
+        output_base_dir=Path(cfg.storage.output_dir).expanduser(),
     )
     
     # 运行服务
