@@ -25,9 +25,10 @@
 ## 2. 当前上下文
 
 - 日期：`2026-03-13`
-- 当前分支：`master`
-- 当前工作区不是干净状态，存在多组已跟踪改动和未跟踪新文件。
-- 当前 HEAD：`6f9c5bc docs: 更新全部文档 — 新增 Watch 模式/数据库浏览/直播处理等功能说明`
+- 当前分支：`refactor/test-first-hardening`
+- 当前工作区已清理并切入新的开发分支。
+- 当前基线提交：`cfc60ce chore: bump fastapi minimum version`
+- 当前正处于测试优先修复阶段，工作区包含未提交的无争议修复与补测。
 - 当前仓库应用代码与测试代码总量约 `33894` 行。
 - 目录体量最大的区域：`vat/web`、`vat/asr`、`vat/llm`、`tests`。
 
@@ -782,10 +783,27 @@ Run: `pytest tests -q`
 
 ### 10.1 当前状态
 
-- `当前处理子块`: `Workspace Cleanup`
-- `本轮新增测试`: 无
-- `本轮修复的问题`: 无，当前只在整理工作区与补强主计划文档
-- `下一步`: 确认 Group C 是否可先提交，确认 Group A/B/E 的拆分边界，然后决定是否实际执行清理
+- `当前处理子块`: `Chunk 8: Runtime Contract Hardening`
+- `本轮新增测试`:
+  - `tests/test_async_embedder.py`
+  - `tests/test_cli_process.py`
+  - `tests/test_pipeline.py` 中新增配置隔离与早退恢复契约测试
+  - `tests/test_web_jobs.py` 中新增 process job 结果判定与 cancel contract 测试
+  - `tests/test_database_api.py`
+- `本轮修复的问题`:
+  - 已完成工作区清理，按 task 提交现有改动，并在 `refactor/test-first-hardening` 分支开始正式修复。
+  - 修复 `VideoProcessor` 直接持有共享 `config` 的问题；现在在初始化时深拷贝配置，每个 processor 都拥有独立配置副本，避免 `passthrough` 和自动 playlist prompt 覆写跨视频串扰。
+  - 修复 `VideoProcessor.process()` 早退路径的 prompt 泄漏问题；自动 playlist prompt 应用已经纳入同一 `try/finally`，`unavailable` 和 “无待执行步骤” 两类早退也会正确恢复配置。
+  - 修复 `AsyncEmbedderQueue._process_task()` 对 `FFmpegWrapper.embed_subtitle_hard()` 的参数错位；现在通过关键字参数传递 `gpu_device`，不再把 `gpu_id` 错塞进 `progress_callback` 槽位。
+  - 修复 `vat.embedder.async_embedder` 仍依赖旧版数据库接口的问题；异步嵌字队列现已改为使用当前 `Database` / `TaskStep` / `TaskStatus` 回写 `embed` 任务状态，并在 `embed_service` 初始化时显式传入数据库路径与输出根目录。
+  - 修复 `cli process` 对缓存全局配置对象的命令级污染；命令入口现在先复制调用级配置，再应用 playlist prompt，上层 `CONFIG` 缓存不会被单次命令改脏。
+  - 修复 `translate --backend` 的陈旧 CLI 契约；命令现在只接受 `local/online`，并正确映射到 `translator.backend_type`，不再写入不存在的 `default_backend` 字段，同时同样具备调用级配置隔离。
+  - 收紧 `JobManager._determine_job_result()`：进程结束后若某视频缺少任务记录或步骤未完成，不再被乐观判成成功；存在部分完成时返回 `partial_completed`。
+  - 修复 `JobManager.cancel_job()` 仅向父 PID 发信号且过早标记取消的问题；现在会向整个进程组发送 `SIGTERM`，必要时升级到 `SIGKILL`，只有确认进程组退出后才标记 `cancelled`。
+  - 修复 `vat/web/routes/database.py` 的 FastAPI 弃用项；`Query(..., regex=...)` 已迁移为 `pattern=`，并补了 API 参数校验测试。
+  - 已完成本轮回归：
+    - `pytest tests/test_pipeline.py tests/test_async_embedder.py tests/test_cli_process.py tests/test_web_jobs.py tests/test_watch_api.py tests/test_scheduled_upload.py tests/test_models.py tests/test_database_api.py -q`
+- `下一步`: 继续处理剩余更深层、但仍尽量无争议的保守性缺口，优先是 `web/jobs.update_job_status()` 的误判边界，以及更后面的阶段语义漂移收口
 
 ## 11. 进入下一阶段的门槛
 
@@ -816,10 +834,12 @@ Run: `pytest tests -q`
 
 ## 12. 当前建议的立即执行项
 
-- [ ] 先做工作区分组确认，不提交、不重构。
-- [ ] 然后校验并修订当前文档中的阶段契约表、状态机不变量表、Web/Job 契约表。
-- [ ] 然后先补核心状态机测试和 Web Job 生命周期测试。
-- [ ] 在这些测试稳定之前，不进入任何架构重构。
+- [x] 先做工作区分组确认，不提交、不重构。
+- [x] 整理并提交当前工作区，确保重要脚本和文档进入 git。
+- [x] 切换到新的开发分支开始正式实现。
+- [x] 先补最小 runtime 契约测试，修复 async embedder 参数错位与批量 process 配置复用。
+- [ ] 继续补核心状态机测试和 Web Job 生命周期测试。
+- [ ] 在 `web/jobs.py` 与上传/同步链路进入重构前，先补早崩、取消、远端副作用恢复等约束测试。
 
 ## 13. 备注
 
