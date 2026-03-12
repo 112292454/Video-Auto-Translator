@@ -9,12 +9,13 @@ import shutil
 import inspect
 import tempfile
 import logging
+import copy
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from vat.database import Database
 from vat.models import (
-    Video, Task, TaskStep, TaskStatus, SourceType,
+    Video, Task, TaskStep, TaskStatus, SourceType, Playlist,
     DEFAULT_STAGE_SEQUENCE,
 )
 
@@ -237,6 +238,57 @@ def _make_vp(tmp_path, force=False, video_metadata=None):
     return vp, database
 
 
+def _make_real_vp(
+    tmp_path,
+    video_id="test_vid",
+    *,
+    config=None,
+    playlist_metadata=None,
+    playlist_id=None,
+    video_metadata=None,
+):
+    """构造真实初始化的 VideoProcessor，用于验证 config 隔离契约。"""
+    from vat.pipeline.executor import VideoProcessor
+    from vat.config import load_config
+
+    db_path = str(tmp_path / "real.db")
+    database = Database(db_path)
+
+    video = Video(
+        id=video_id,
+        source_type=SourceType.YOUTUBE,
+        source_url=f"https://youtube.com/watch?v={video_id}",
+        title=f"Video {video_id}",
+        output_dir=str(tmp_path / video_id),
+        metadata=video_metadata or {},
+    )
+    database.add_video(video)
+    for step in DEFAULT_STAGE_SEQUENCE:
+        database.add_task(Task(video_id=video_id, step=step, status=TaskStatus.PENDING))
+
+    if playlist_id:
+        database.add_playlist(
+            Playlist(
+                id=playlist_id,
+                title=f"Playlist {playlist_id}",
+                source_url=f"https://youtube.com/playlist?list={playlist_id}",
+                metadata=playlist_metadata or {},
+            )
+        )
+        database.add_video_to_playlist(video_id, playlist_id, playlist_index=1)
+
+    if config is None:
+        config = load_config()
+    config.storage.database_path = db_path
+    config.storage.output_dir = str(tmp_path / "outputs")
+    config.storage.cache_dir = str(tmp_path / "cache")
+
+    processor = VideoProcessor(video_id=video_id, config=config, playlist_id=playlist_id)
+    processor.progress_callback = lambda _msg: None
+    processor._default_progress_callback = processor.progress_callback
+    return processor, database, config
+
+
 class TestProcessOrchestration:
     """VideoProcessor.process() 调度逻辑（mock _run_* 验证编排行为）"""
 
@@ -436,6 +488,76 @@ class TestPassthroughConfigBackupRestore:
         vp.process(steps=['whisper', 'embed'])
 
         assert vp.config.asr.split.enable == original_split_enable
+
+
+class TestConfigIsolationContracts:
+    """VideoProcessor 不应污染调用方共享配置。"""
+
+    def test_video_processor_copies_config_on_init(self, tmp_path):
+        from vat.config import load_config
+
+        shared_config = load_config()
+        original_skip_translate = shared_config.translator.skip_translate
+        original_split_enable = shared_config.asr.split.enable
+
+        processor, _, _ = _make_real_vp(tmp_path, config=shared_config)
+        processor._set_passthrough_config({"split", "translate"})
+
+        assert shared_config.translator.skip_translate == original_skip_translate
+        assert shared_config.asr.split.enable == original_split_enable
+
+    def test_playlist_prompts_restored_on_unavailable_early_return(self, tmp_path):
+        from vat.config import load_config
+
+        shared_config = load_config()
+        original_translate_prompt = copy.deepcopy(shared_config.translator.llm.custom_prompt)
+        original_optimize_prompt = copy.deepcopy(shared_config.translator.llm.optimize.custom_prompt)
+
+        processor, database, _ = _make_real_vp(
+            tmp_path,
+            config=shared_config,
+            playlist_id="PL_PROMPT",
+            playlist_metadata={
+                "custom_prompt_translate": "fubuki",
+                "custom_prompt_optimize": "fubuki",
+            },
+            video_metadata={"unavailable": True},
+        )
+
+        result = processor.process(steps=["download"])
+
+        assert result is True
+        assert shared_config.translator.llm.custom_prompt == original_translate_prompt
+        assert shared_config.translator.llm.optimize.custom_prompt == original_optimize_prompt
+        for step in DEFAULT_STAGE_SEQUENCE:
+            task = database.get_task("test_vid", step)
+            assert task.status == TaskStatus.COMPLETED
+
+    def test_playlist_prompts_restored_when_no_steps_to_run(self, tmp_path):
+        from vat.config import load_config
+
+        shared_config = load_config()
+        original_translate_prompt = copy.deepcopy(shared_config.translator.llm.custom_prompt)
+        original_optimize_prompt = copy.deepcopy(shared_config.translator.llm.optimize.custom_prompt)
+
+        processor, database, _ = _make_real_vp(
+            tmp_path,
+            config=shared_config,
+            playlist_id="PL_DONE",
+            playlist_metadata={
+                "custom_prompt_translate": "fubuki",
+                "custom_prompt_optimize": "fubuki",
+            },
+        )
+
+        for step in DEFAULT_STAGE_SEQUENCE:
+            database.update_task_status("test_vid", step, TaskStatus.COMPLETED)
+
+        result = processor.process(steps=None)
+
+        assert result is True
+        assert shared_config.translator.llm.custom_prompt == original_translate_prompt
+        assert shared_config.translator.llm.optimize.custom_prompt == original_optimize_prompt
 
 
 class TestExecuteStepDispatch:

@@ -1,6 +1,7 @@
 """
 单视频处理执行器
 """
+import copy
 import os
 import re
 import json
@@ -61,7 +62,8 @@ class VideoProcessor:
             upload_dtime: B站定时发布时间戳（10位Unix时间戳，0=立即发布，需>当前时间+2小时）
         """
         self.video_id = video_id
-        self.config = config
+        # 每个 processor 持有独立配置副本，避免批量/并发处理时相互污染。
+        self.config = copy.deepcopy(config)
         self.gpu_id = gpu_id
         self.force = force
         self.progress_callback = progress_callback or self._default_progress_callback
@@ -403,63 +405,62 @@ class VideoProcessor:
         # 设置当前上下文的 video_id
         set_video_id(self.video_id)
         
-        # 自动应用 playlist 级别的 custom prompt 覆写
-        # 规则：视频只属于 1 个 playlist 时自动应用；属于多个时警告并保持当前配置
-        self._auto_apply_playlist_prompts()
-        
-        # 检查视频是否为不可用（如会员限定），若是则直接标记所有阶段完成并跳过
-        video_metadata = self.video.metadata or {}
-        if video_metadata.get('unavailable', False):
-            self.progress_callback(f"视频不可用（会员限定等），跳过处理，标记所有阶段为完成")
-            for step in DEFAULT_STAGE_SEQUENCE:
-                if not self.db.is_step_completed(self.video_id, step):
-                    self.db.update_task_status(self.video_id, step, TaskStatus.COMPLETED)
-            return True
-        
-        # 重新处理时清空之前的 processing_notes（避免累积旧警告）
-        self.db.clear_processing_notes(self.video_id)
-        
-        # 初始化直通阶段集合
-        self._passthrough_stages = set()
-        self._config_backup = None
-        # 确定要执行的步骤
-        if steps is None:
-            steps = [step.value for step in self.db.get_pending_steps(self.video_id)]
-        else:
-            steps = [s if isinstance(s, str) else s.value for s in steps]
-        
-        # 展开阶段组名（如 'asr' → ['whisper', 'split'], 'translate' → ['optimize', 'translate']）
-        expanded = []
-        for s in steps:
-            try:
-                group = expand_stage_group(s)
-                expanded.extend([step.value for step in group])
-            except ValueError:
-                expanded.append(s)  # 未知名称保留，后续 TaskStep() 会报错
-        # 去重保序
-        seen = set()
-        steps = []
-        for s in expanded:
-            if s not in seen:
-                seen.add(s)
-                steps.append(s)
-        
-        if not steps:
-            self.progress_callback("所有步骤已完成")
-            return True
-        
-        # 填充不连续阶段之间的直通阶段
-        original_steps = steps.copy()
-        steps = self._resolve_stage_gaps(steps)
-        
-        self.progress_callback(f"待执行步骤: {', '.join(steps)}")
-        
-        # 初始化进度追踪器
-        self._progress_tracker = ProgressTracker(stages=steps)
-        
-        # 执行每个步骤（try/finally 确保 config 恢复，即使发生未预期的异常）
         all_success = True
         try:
+            # 自动应用 playlist 级别的 custom prompt 覆写
+            # 规则：视频只属于 1 个 playlist 时自动应用；属于多个时警告并保持当前配置
+            self._auto_apply_playlist_prompts()
+
+            # 检查视频是否为不可用（如会员限定），若是则直接标记所有阶段完成并跳过
+            video_metadata = self.video.metadata or {}
+            if video_metadata.get('unavailable', False):
+                self.progress_callback("视频不可用（会员限定等），跳过处理，标记所有阶段为完成")
+                for step in DEFAULT_STAGE_SEQUENCE:
+                    if not self.db.is_step_completed(self.video_id, step):
+                        self.db.update_task_status(self.video_id, step, TaskStatus.COMPLETED)
+                return True
+
+            # 重新处理时清空之前的 processing_notes（避免累积旧警告）
+            self.db.clear_processing_notes(self.video_id)
+
+            # 初始化直通阶段集合
+            self._passthrough_stages = set()
+            self._config_backup = None
+            # 确定要执行的步骤
+            if steps is None:
+                steps = [step.value for step in self.db.get_pending_steps(self.video_id)]
+            else:
+                steps = [s if isinstance(s, str) else s.value for s in steps]
+
+            # 展开阶段组名（如 'asr' → ['whisper', 'split'], 'translate' → ['optimize', 'translate']）
+            expanded = []
+            for s in steps:
+                try:
+                    group = expand_stage_group(s)
+                    expanded.extend([step.value for step in group])
+                except ValueError:
+                    expanded.append(s)  # 未知名称保留，后续 TaskStep() 会报错
+            # 去重保序
+            seen = set()
+            steps = []
+            for s in expanded:
+                if s not in seen:
+                    seen.add(s)
+                    steps.append(s)
+
+            if not steps:
+                self.progress_callback("所有步骤已完成")
+                return True
+
+            # 填充不连续阶段之间的直通阶段
+            steps = self._resolve_stage_gaps(steps)
+
+            self.progress_callback(f"待执行步骤: {', '.join(steps)}")
+
+            # 初始化进度追踪器
+            self._progress_tracker = ProgressTracker(stages=steps)
+
+            # 执行每个步骤（try/finally 确保 config 恢复，即使发生未预期的异常）
             for step_name in steps:
                 try:
                     step = TaskStep(step_name)
