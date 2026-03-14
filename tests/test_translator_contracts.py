@@ -181,3 +181,25 @@ class TestSafeTranslateChunkContracts:
         result = translator._safe_translate_chunk(chunk)
 
         assert result is expected
+
+
+class TestBuildInputWithContextContracts:
+    def test_returns_plain_json_when_context_disabled(self, translator):
+        subtitle_dict = {"1": "おはよう", "2": "こんにちは"}
+
+        result = translator._build_input_with_context(subtitle_dict)
+
+        assert result == '{"1": "おはよう", "2": "こんにちは"}'
+
+    def test_includes_previous_batch_context_when_enabled(self, translator):
+        subtitle_dict = {"3": "こんばんは"}
+        translator.enable_context = True
+        translator._previous_batch_result = {"1": "早上好", "2": "你好"}
+
+        result = translator._build_input_with_context(subtitle_dict)
+
+        assert "Previous context" in result
+        assert "[1]: 早上好" in result
+        assert "[2]: 你好" in result
+        assert "Translate the following" in result
+        assert '{"3": "こんばんは"}' in result
