@@ -172,7 +172,23 @@ HOME=/tmp pytest tests/test_llm_client_vertex.py tests/test_config.py tests/test
 
 这说明当前改动已经能从 VAT 配置与翻译器调用链一路走到真实字幕文件产出。
 
-## 7. 后续建议
+## 7. Benchmark 说明
+
+现有的 `scripts/translation_benchmark.py` 现在已经支持：
+
+- `gemini-3-flash`
+  - 走 Google AI Studio 的官方 OpenAI-compatible 接口
+- `gemini-3-flash-vertex`
+  - 走 Google Vertex 的官方 Vertex Native 接口
+
+因此现在可以直接在同一套 benchmark 流程里，对比：
+
+- 旧的 Google 官方接入方式
+- 新的 Google 官方接入方式
+
+这次实际用 `gemini-3-flash-vertex` 跑过多视频 benchmark，接口可用，翻译质量整体与历史 `gemini-3-flash` 基线接近，但不是逐句完全一致，更接近“同模型不同官方入口下的自然改写”。
+
+## 8. 后续建议
 
 - 给 Vertex 增加 thinking 控制，降低 `thoughtsTokenCount`
 - 如果后续 Web UI 有流式显示需求，再单独评估 `streamGenerateContent`
