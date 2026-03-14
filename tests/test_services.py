@@ -167,3 +167,100 @@ class TestGetPlaylistVideosOrdering:
         videos = svc.get_playlist_videos("PL1", order_by="playlist_index")
         indices = [v.playlist_index for v in videos]
         assert indices == [1, 2, 3]
+
+
+class TestSyncPlaylistContracts:
+    def test_sync_playlist_uses_explicit_target_playlist_id(self, db):
+        service = PlaylistService(db)
+        service._downloader = type(
+            "FakeDownloader",
+            (),
+            {
+                "get_playlist_info": lambda _self, _url: {
+                    "id": "UC_raw",
+                    "title": "Channel Videos",
+                    "uploader": "Uploader",
+                    "uploader_id": "channel-1",
+                    "entries": [],
+                }
+            },
+        )()
+
+        result = service.sync_playlist(
+            "https://www.youtube.com/@demo/videos",
+            fetch_upload_dates=False,
+            target_playlist_id="UC_raw-videos",
+        )
+
+        assert result.playlist_id == "UC_raw-videos"
+        assert db.get_playlist("UC_raw-videos") is not None
+        assert db.get_playlist("UC_raw") is None
+
+    def test_sync_playlist_links_existing_video_without_duplicating_video_record(self, db):
+        existing_video = Video(
+            id="vid_existing",
+            source_type=SourceType.YOUTUBE,
+            source_url="https://www.youtube.com/watch?v=vid_existing",
+            title="Existing Video",
+            metadata={},
+        )
+        db.add_video(existing_video)
+
+        service = PlaylistService(db)
+        service._downloader = type(
+            "FakeDownloader",
+            (),
+            {
+                "get_playlist_info": lambda _self, _url: {
+                    "id": "PL_SYNC",
+                    "title": "Sync Target",
+                    "uploader": "Uploader",
+                    "uploader_id": "channel-2",
+                    "entries": [
+                        {"id": "vid_existing", "title": "Existing Video"},
+                    ],
+                }
+            },
+        )()
+
+        result = service.sync_playlist(
+            "https://youtube.com/playlist?list=PL_SYNC",
+            fetch_upload_dates=False,
+        )
+
+        assert result.new_videos == ["vid_existing"]
+        playlist_videos = db.get_playlist_video_ids("PL_SYNC")
+        assert playlist_videos == {"vid_existing"}
+        stored = db.get_video("vid_existing")
+        assert stored is not None
+        assert stored.title == "Existing Video"
+
+    def test_sync_playlist_updates_playlist_index_for_existing_members(self, db):
+        _setup_playlist(db, "PL_IDX")
+        _add_pl_video(db, "vid1", playlist_id="PL_IDX", index=7)
+
+        service = PlaylistService(db)
+        service._downloader = type(
+            "FakeDownloader",
+            (),
+            {
+                "get_playlist_info": lambda _self, _url: {
+                    "id": "PL_IDX",
+                    "title": "Indexed Playlist",
+                    "uploader": "Uploader",
+                    "uploader_id": "channel-3",
+                    "entries": [
+                        {"id": "vid1", "title": "Video One"},
+                    ],
+                }
+            },
+        )()
+
+        result = service.sync_playlist(
+            "https://youtube.com/playlist?list=PL_IDX",
+            fetch_upload_dates=False,
+        )
+
+        assert result.existing_videos == ["vid1"]
+        pv_info = db.get_playlist_video_info("PL_IDX", "vid1")
+        assert pv_info["playlist_index"] == 1

@@ -795,6 +795,7 @@ Run: `pytest tests -q`
   - `tests/test_tools_job.py` 中新增 tools job lifecycle 收敛测试
   - `tests/test_database_api.py`
   - `tests/test_cli_process.py` 中新增 `parse_stages` / `process -s` 阶段语义与 `--force` 下游失效契约测试
+  - `tests/test_services.py` 中新增 `sync_playlist()` 基础契约测试
 - `本轮修复的问题`:
   - 已完成工作区清理，按 task 提交现有改动，并在 `refactor/test-first-hardening` 分支开始正式修复。
   - 修复 `VideoProcessor` 直接持有共享 `config` 的问题；现在在初始化时深拷贝配置，每个 processor 都拥有独立配置副本，避免 `passthrough` 和自动 playlist prompt 覆写跨视频串扰。
@@ -814,6 +815,7 @@ Run: `pytest tests -q`
   - 补齐 `vat/web/routes/tasks.py` 的关键 API 契约测试：覆盖 `parse_steps`、`execute`、`get/list`、`cancel`、`delete`、`retry`，把 stage group 展开、force 下游失效、冲突拒绝、CLI 预览、异步取消与状态刷新语义固定下来。
   - 补齐 `vat/web/routes/playlists.py` 的第一批 API 契约测试：覆盖 `add/sync/refresh/retranslate` 的后台任务提交、重复提交保护，以及 `sync-status/refresh-status` 的状态映射。
   - 补齐 tools job 生命周期测试：`update_job_status()` 现在对 `[SUCCESS] / [FAILED] / cancel_requested` 三条收敛路径都有直接测试。
+  - 补齐 `PlaylistService.sync_playlist()` 的基础契约测试：覆盖显式 target playlist ID 归属、已有视频复用关联、不重建视频记录、已有关联 playlist_index 更新等底层语义。
   - 已完成本轮回归：
     - `pytest tests/test_pipeline.py tests/test_async_embedder.py tests/test_cli_process.py tests/test_web_jobs.py tests/test_watch_api.py tests/test_scheduled_upload.py tests/test_models.py tests/test_database_api.py -q`
     - `pytest tests/test_cli_process.py tests/test_models.py tests/test_pipeline.py tests/test_scheduled_upload.py -q`
@@ -823,8 +825,11 @@ Run: `pytest tests -q`
     - `pytest tests/test_pipeline.py tests/test_async_embedder.py tests/test_cli_process.py -q`
     - `pytest tests/test_playlists_api.py -q`
     - `pytest tests/test_tools_job.py -q`
+    - `pytest tests/test_services.py -q`
     - `pytest tests/test_tasks_api.py tests/test_playlists_api.py tests/test_web_jobs.py tests/test_watch_api.py tests/test_database_api.py -q`
     - `pytest tests/test_web_jobs.py tests/test_tasks_api.py tests/test_playlists_api.py tests/test_tools_job.py tests/test_watch_api.py tests/test_database_api.py tests/test_pipeline.py tests/test_async_embedder.py tests/test_cli_process.py -q`
+    - `pytest tests/test_services.py tests/test_tasks_api.py tests/test_playlists_api.py tests/test_web_jobs.py tests/test_watch_api.py tests/test_database_api.py -q`
+    - `pytest tests/test_pipeline.py tests/test_async_embedder.py tests/test_cli_process.py tests/test_web_jobs.py tests/test_tasks_api.py tests/test_playlists_api.py tests/test_watch_api.py tests/test_database_api.py -q`
 - `下一步`: 继续自底向上补剩余高风险模块测试，优先是阶段语义漂移、playlist/upload/season 的原子性，以及翻译零容忍契约
 
 ## 11. 进入下一阶段的门槛
