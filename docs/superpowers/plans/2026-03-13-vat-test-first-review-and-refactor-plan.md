@@ -159,7 +159,7 @@
 ### P0: Web / 外部交互
 
 - `web/jobs.py` 的结果判定过于乐观，早崩子进程可能被误判成功。
-- `cancel_job()` 不保证整个进程组与 GPU 子任务都退出。
+- `cancel_job()` 的旧实现既会把 zombie 误判为“仍存活”，也会在 async 路由中同步阻塞等待。
 - Web 层实际存在大量绕过 CLI/JobManager 的旁路。
 - `BilibiliUploader` 多步远程副作用缺少事务包装、补偿逻辑和统一错误分型。
 - `PlaylistService.sync_playlist()` 缺少 playlist 级原子性。
@@ -217,7 +217,8 @@
 | 长任务入口 | 默认必须通过 `JobManager -> CLI 子进程 -> 核心 pipeline/services` 路径执行 |
 | 允许的旁路 | 仅允许明确标记的只读查询、极薄协调逻辑或文档已声明的例外 |
 | `submit_job` 成功 | 只有在 DB 记录成功且子进程成功启动时才算成功 |
-| `cancel_job` 成功 | 必须确认整个进程组及其 GPU 子任务都已停止，不能只对父 PID 发信号 |
+| `cancel_job` 成功 | 只表示取消请求已被接受并已向目标进程组发出终止信号；不得在 Web 请求线程里阻塞等待退出 |
+| `cancelled` 终态 | 只能在 `update_job_status()` 等状态收敛路径确认子进程已结束后写入，不能在发出取消请求时乐观提前写入 |
 | `update_job_status` | 在证据不足时必须保守，宁可停留在不确定/失败，也不能乐观判完成 |
 | process job 完成 | 必须能证明目标视频集合对应阶段的任务状态满足完成契约 |
 | tools job 完成 | 必须能证明外部副作用或日志结果与任务类型契约一致 |
@@ -610,13 +611,13 @@ Expected: 在现状下能区分“共享配置被污染”和“隔离良好”
 - Modify: `tests/test_web_jobs.py`
 - Modify: `tests/test_tools_job.py`
 - Modify: `tests/test_watch_api.py`
-- Create: `tests/test_web_routes_tasks.py`
-- Create: `tests/test_web_routes_playlists.py`
+- Create: `tests/test_tasks_api.py`
+- Create: `tests/test_playlists_api.py`
 
 - [ ] **Step 1: 给 `JobManager` 补结果判定保守性测试**
 - [ ] **Step 2: 跑红并记录“早崩子进程被误判成功”的失败信号**
-- [ ] **Step 3: 给 `cancel_job()` 补进程组停止语义测试**
-- [ ] **Step 4: 跑红并记录取消语义不足的失败信号**
+- [ ] **Step 3: 给 `cancel_job()` 补“取消请求 / 最终收敛”分离测试**
+- [ ] **Step 4: 跑红并记录 zombie 误判与 async 阻塞的失败信号**
 - [ ] **Step 5: 给 `POST /api/watch/start` 补 API 级测试**
 - [ ] **Step 6: 给 tasks/playlists 关键路由补契约测试**
 
@@ -762,7 +763,7 @@ Run: `pytest tests -q`
 | `translate` 语义漂移 | `vat/models.py` `vat/cli/commands.py` | `tests/test_models.py` `tests/test_pipeline.py` | 能稳定区分“单阶段 translate”和“阶段组 translate” |
 | 共享 `config` 污染 | `vat/pipeline/executor.py` `vat/cli/commands.py` | `tests/test_pipeline.py` | 已有并发场景下配置不串扰测试 |
 | 子进程失败被误判成功 | `vat/web/jobs.py` | `tests/test_web_jobs.py` | 已有早崩/无 task 记录场景测试 |
-| 取消语义不完整 | `vat/web/jobs.py` | `tests/test_web_jobs.py` | 已有进程组停止语义测试 |
+| 取消语义不完整 | `vat/web/jobs.py` `vat/web/routes/tasks.py` | `tests/test_web_jobs.py` `tests/test_tasks_api.py` | 已有“取消请求 / 最终收敛 / route 非阻塞”测试 |
 | playlist sync 非原子 | `vat/services/playlist_service.py` | `tests/test_services.py` 或新增 sync 契约测试 | 已定义中断恢复语义 |
 | season / upload 多步副作用 | `vat/uploaders/bilibili.py` | `tests/test_scheduled_upload.py` `tests/test_bilibili_violation.py` 及新增幂等测试 | 已定义部分成功补偿或恢复规则 |
 | 翻译零容忍失效 | `vat/translator/llm_translator.py` `vat/translator/base.py` | `tests/test_translator_contracts.py` | 已有漏翻即失败测试 |
@@ -788,8 +789,11 @@ Run: `pytest tests -q`
   - `tests/test_async_embedder.py`
   - `tests/test_cli_process.py`
   - `tests/test_pipeline.py` 中新增配置隔离与早退恢复契约测试
-  - `tests/test_web_jobs.py` 中新增 process job 结果判定与 cancel contract 测试
+  - `tests/test_web_jobs.py` 中新增 process job 结果判定、取消请求收敛与 zombie contract 测试
+  - `tests/test_tasks_api.py`
+  - `tests/test_playlists_api.py`
   - `tests/test_database_api.py`
+  - `tests/test_cli_process.py` 中新增 `parse_stages` / `process -s` 阶段语义与 `--force` 下游失效契约测试
 - `本轮修复的问题`:
   - 已完成工作区清理，按 task 提交现有改动，并在 `refactor/test-first-hardening` 分支开始正式修复。
   - 修复 `VideoProcessor` 直接持有共享 `config` 的问题；现在在初始化时深拷贝配置，每个 processor 都拥有独立配置副本，避免 `passthrough` 和自动 playlist prompt 覆写跨视频串扰。
@@ -798,12 +802,22 @@ Run: `pytest tests -q`
   - 修复 `vat.embedder.async_embedder` 仍依赖旧版数据库接口的问题；异步嵌字队列现已改为使用当前 `Database` / `TaskStep` / `TaskStatus` 回写 `embed` 任务状态，并在 `embed_service` 初始化时显式传入数据库路径与输出根目录。
   - 修复 `cli process` 对缓存全局配置对象的命令级污染；命令入口现在先复制调用级配置，再应用 playlist prompt，上层 `CONFIG` 缓存不会被单次命令改脏。
   - 修复 `translate --backend` 的陈旧 CLI 契约；命令现在只接受 `local/online`，并正确映射到 `translator.backend_type`，不再写入不存在的 `default_backend` 字段，同时同样具备调用级配置隔离。
+  - 修复 `cli process --force` 未失效下游阶段的问题；现在会按目标阶段中最早的那个阶段统一调用 `invalidate_downstream_tasks()`，与 Web execute 路径保持一致。
   - 收紧 `JobManager._determine_job_result()`：进程结束后若某视频缺少任务记录或步骤未完成，不再被乐观判成成功；存在部分完成时返回 `partial_completed`。
-  - 修复 `JobManager.cancel_job()` 仅向父 PID 发信号且过早标记取消的问题；现在会向整个进程组发送 `SIGTERM`，必要时升级到 `SIGKILL`，只有确认进程组退出后才标记 `cancelled`。
+  - 修复 `JobManager.cancel_job()` 的同步阻塞设计；取消现在改为“接受请求并向进程组发送 `SIGTERM`”，不再在 Web 请求线程里等待退出。
+  - 修复 `cancel_job()` / `cancel_task` 的 zombie 与事件循环问题；取消状态通过 `cancel_requested` 持久化，由 `update_job_status()` 在确认子进程结束后收敛为 `cancelled`，`POST /api/tasks/{id}/cancel` 也改为 `asyncio.to_thread(...)` 非阻塞调用。
+  - 收敛 `update_job_status()` 的进程活性判断；僵尸进程现在视为已结束并尝试回收，不再把 zombie 当成“仍在运行”。
   - 修复 `vat/web/routes/database.py` 的 FastAPI 弃用项；`Query(..., regex=...)` 已迁移为 `pattern=`，并补了 API 参数校验测试。
+  - 补齐 `vat/web/routes/tasks.py` 的关键 API 契约测试：覆盖 `parse_steps`、`execute`、`get/list`、`cancel`、`delete`、`retry`，把 stage group 展开、force 下游失效、冲突拒绝、CLI 预览、异步取消等路由语义固定下来。
+  - 补齐 `vat/web/routes/playlists.py` 的第一批 API 契约测试：覆盖同步状态查询、重复同步保护、prompt/metadata 更新和删除委托，为 playlist 管理层建立直接测试护栏。
   - 已完成本轮回归：
     - `pytest tests/test_pipeline.py tests/test_async_embedder.py tests/test_cli_process.py tests/test_web_jobs.py tests/test_watch_api.py tests/test_scheduled_upload.py tests/test_models.py tests/test_database_api.py -q`
-- `下一步`: 继续处理剩余更深层、但仍尽量无争议的保守性缺口，优先是 `web/jobs.update_job_status()` 的误判边界，以及更后面的阶段语义漂移收口
+    - `pytest tests/test_cli_process.py tests/test_models.py tests/test_pipeline.py tests/test_scheduled_upload.py -q`
+    - `pytest tests/test_web_jobs.py tests/test_tasks_api.py tests/test_watch_api.py tests/test_database_api.py -q`
+    - `pytest tests/test_pipeline.py tests/test_async_embedder.py tests/test_cli_process.py -q`
+    - `pytest tests/test_playlists_api.py -q`
+    - `pytest tests/test_tasks_api.py tests/test_playlists_api.py tests/test_web_jobs.py tests/test_watch_api.py tests/test_database_api.py -q`
+- `下一步`: 继续自底向上补 Web / pipeline 邻近模块的遗漏测试，优先检查 `tools job` 生命周期、playlist sync 原子性，以及阶段语义漂移收口
 
 ## 11. 进入下一阶段的门槛
 

@@ -3,8 +3,9 @@ from unittest.mock import MagicMock
 
 from click.testing import CliRunner
 
-from vat.cli.commands import process as process_cmd, translate as translate_cmd
+from vat.cli.commands import process as process_cmd, translate as translate_cmd, parse_stages
 from vat.config import Config
+from vat.models import TaskStep
 
 
 def _minimal_config():
@@ -213,7 +214,226 @@ class TestCliHelpContracts:
         assert "仅执行 translate 阶段" in result.output
 
 
+class TestParseStagesContracts:
+    def test_translate_is_single_stage_not_group(self):
+        assert parse_stages("translate") == [TaskStep.TRANSLATE]
+
+    def test_asr_group_expands_and_deduplicates(self):
+        assert parse_stages("asr,translate,asr") == [
+            TaskStep.WHISPER,
+            TaskStep.SPLIT,
+            TaskStep.TRANSLATE,
+        ]
+
+    def test_invalid_stage_raises_valueerror(self):
+        try:
+            parse_stages("whisper,unknown-stage")
+        except ValueError as exc:
+            assert "未知" in str(exc)
+        else:
+            raise AssertionError("parse_stages 应对未知阶段抛出 ValueError")
+
+
+class TestProcessStageContracts:
+    def test_process_translate_stage_reaches_processor_as_single_stage(self, monkeypatch):
+        config = _minimal_config()
+        fake_db = MagicMock()
+        fake_db.get_video.return_value = SimpleNamespace(id="v1", title="title-v1")
+        observed = {}
+
+        class FakeProcessor:
+            def __init__(self, **kwargs):
+                pass
+
+            def process(self, steps):
+                observed["steps"] = steps
+                return True
+
+        monkeypatch.setattr("vat.cli.commands.get_config", lambda path: config)
+        monkeypatch.setattr("vat.cli.commands.get_logger", lambda: MagicMock())
+        monkeypatch.setattr("vat.cli.commands.Database", lambda *args, **kwargs: fake_db)
+        monkeypatch.setattr("vat.cli.commands.VideoProcessor", FakeProcessor)
+
+        result = CliRunner().invoke(
+            process_cmd,
+            ["-v", "v1", "-s", "translate"],
+            obj={"config_path": "unused.yaml"},
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert observed["steps"] == ["translate"]
+
+    def test_process_asr_group_reaches_processor_as_whisper_then_split(self, monkeypatch):
+        config = _minimal_config()
+        fake_db = MagicMock()
+        fake_db.get_video.return_value = SimpleNamespace(id="v1", title="title-v1")
+        observed = {}
+
+        class FakeProcessor:
+            def __init__(self, **kwargs):
+                pass
+
+            def process(self, steps):
+                observed["steps"] = steps
+                return True
+
+        monkeypatch.setattr("vat.cli.commands.get_config", lambda path: config)
+        monkeypatch.setattr("vat.cli.commands.get_logger", lambda: MagicMock())
+        monkeypatch.setattr("vat.cli.commands.Database", lambda *args, **kwargs: fake_db)
+        monkeypatch.setattr("vat.cli.commands.VideoProcessor", FakeProcessor)
+
+        result = CliRunner().invoke(
+            process_cmd,
+            ["-v", "v1", "-s", "asr"],
+            obj={"config_path": "unused.yaml"},
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert observed["steps"] == ["whisper", "split"]
+
+    def test_process_force_invalidates_downstream_from_earliest_requested_stage(self, monkeypatch):
+        config = _minimal_config()
+        fake_db = MagicMock()
+        fake_db.get_video.return_value = SimpleNamespace(id="v1", title="title-v1")
+
+        class FakeProcessor:
+            def __init__(self, **kwargs):
+                pass
+
+            def process(self, steps):
+                return True
+
+        monkeypatch.setattr("vat.cli.commands.get_config", lambda path: config)
+        monkeypatch.setattr("vat.cli.commands.get_logger", lambda: MagicMock())
+        monkeypatch.setattr("vat.cli.commands.Database", lambda *args, **kwargs: fake_db)
+        monkeypatch.setattr("vat.cli.commands.VideoProcessor", FakeProcessor)
+
+        result = CliRunner().invoke(
+            process_cmd,
+            ["-v", "v1", "-s", "translate,embed", "--force"],
+            obj={"config_path": "unused.yaml"},
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        fake_db.invalidate_downstream_tasks.assert_called_once_with("v1", TaskStep.TRANSLATE)
+
+    def test_process_rejects_invalid_stage_name(self, monkeypatch):
+        config = _minimal_config()
+        fake_db = MagicMock()
+
+        monkeypatch.setattr("vat.cli.commands.get_config", lambda path: config)
+        monkeypatch.setattr("vat.cli.commands.get_logger", lambda: MagicMock())
+        monkeypatch.setattr("vat.cli.commands.Database", lambda *args, **kwargs: fake_db)
+
+        result = CliRunner().invoke(
+            process_cmd,
+            ["-v", "v1", "-s", "download,unknown-stage"],
+            obj={"config_path": "unused.yaml"},
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert "无效的阶段参数" in result.output
+
+
 class TestTranslateCommandContracts:
+    def test_translate_all_only_selects_split_done_and_not_translated_videos(self, monkeypatch):
+        config = _minimal_config()
+        fake_db = MagicMock()
+        fake_db.list_videos.return_value = [
+            SimpleNamespace(id="v-split-pending"),
+            SimpleNamespace(id="v-translated"),
+            SimpleNamespace(id="v-no-split"),
+        ]
+
+        def is_step_completed(video_id, step):
+            table = {
+                ("v-split-pending", TaskStep.SPLIT): True,
+                ("v-split-pending", TaskStep.TRANSLATE): False,
+                ("v-translated", TaskStep.SPLIT): True,
+                ("v-translated", TaskStep.TRANSLATE): True,
+                ("v-no-split", TaskStep.SPLIT): False,
+                ("v-no-split", TaskStep.TRANSLATE): False,
+            }
+            return table.get((video_id, step), False)
+
+        fake_db.is_step_completed.side_effect = is_step_completed
+        scheduled = {}
+
+        monkeypatch.setattr("vat.cli.commands.get_config", lambda path: config)
+        monkeypatch.setattr("vat.cli.commands.get_logger", lambda: MagicMock())
+        monkeypatch.setattr("vat.cli.commands.Database", lambda *args, **kwargs: fake_db)
+        monkeypatch.setattr(
+            "vat.cli.commands.schedule_videos",
+            lambda cfg, video_ids, steps, use_multi_gpu, force: scheduled.update(
+                {"video_ids": video_ids, "steps": steps, "force": force}
+            ),
+        )
+
+        result = CliRunner().invoke(
+            translate_cmd,
+            ["--all"],
+            obj={"config_path": "unused.yaml"},
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert scheduled == {
+            "video_ids": ["v-split-pending"],
+            "steps": ["translate"],
+            "force": False,
+        }
+
+    def test_translate_all_force_reincludes_already_translated_videos(self, monkeypatch):
+        config = _minimal_config()
+        fake_db = MagicMock()
+        fake_db.list_videos.return_value = [
+            SimpleNamespace(id="v-split-pending"),
+            SimpleNamespace(id="v-translated"),
+            SimpleNamespace(id="v-no-split"),
+        ]
+
+        def is_step_completed(video_id, step):
+            table = {
+                ("v-split-pending", TaskStep.SPLIT): True,
+                ("v-split-pending", TaskStep.TRANSLATE): False,
+                ("v-translated", TaskStep.SPLIT): True,
+                ("v-translated", TaskStep.TRANSLATE): True,
+                ("v-no-split", TaskStep.SPLIT): False,
+                ("v-no-split", TaskStep.TRANSLATE): False,
+            }
+            return table.get((video_id, step), False)
+
+        fake_db.is_step_completed.side_effect = is_step_completed
+        scheduled = {}
+
+        monkeypatch.setattr("vat.cli.commands.get_config", lambda path: config)
+        monkeypatch.setattr("vat.cli.commands.get_logger", lambda: MagicMock())
+        monkeypatch.setattr("vat.cli.commands.Database", lambda *args, **kwargs: fake_db)
+        monkeypatch.setattr(
+            "vat.cli.commands.schedule_videos",
+            lambda cfg, video_ids, steps, use_multi_gpu, force: scheduled.update(
+                {"video_ids": video_ids, "steps": steps, "force": force}
+            ),
+        )
+
+        result = CliRunner().invoke(
+            translate_cmd,
+            ["--all", "--force"],
+            obj={"config_path": "unused.yaml"},
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert scheduled == {
+            "video_ids": ["v-split-pending", "v-translated"],
+            "steps": ["translate"],
+            "force": True,
+        }
+
     def test_translate_backend_online_maps_to_llm_backend_type(self, monkeypatch):
         config = _minimal_config()
         fake_db = MagicMock()

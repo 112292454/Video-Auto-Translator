@@ -656,6 +656,14 @@ def process(ctx, video_id, process_all, playlist, stages, gpu, force, dry_run, c
     
     # 去重
     video_ids = list(dict.fromkeys(video_ids))
+
+    if force and target_steps:
+        first_step = min(
+            target_steps,
+            key=lambda step: DEFAULT_STAGE_SEQUENCE.index(step),
+        )
+        for vid in video_ids:
+            db.invalidate_downstream_tasks(vid, first_step)
     
     # ========== upload-cron 校验与分流 ==========
     if upload_cron:

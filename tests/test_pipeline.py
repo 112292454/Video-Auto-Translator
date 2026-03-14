@@ -394,6 +394,12 @@ class TestProcessOrchestration:
         vp._run_embed.assert_called_once()
         # 中间阶段也被执行（直通填充）
         vp._run_whisper.assert_called_once()
+        assert db.get_task("test_vid", TaskStep.DOWNLOAD).status == TaskStatus.COMPLETED
+        assert db.get_task("test_vid", TaskStep.WHISPER).status == TaskStatus.SKIPPED
+        assert db.get_task("test_vid", TaskStep.SPLIT).status == TaskStatus.SKIPPED
+        assert db.get_task("test_vid", TaskStep.OPTIMIZE).status == TaskStatus.SKIPPED
+        assert db.get_task("test_vid", TaskStep.TRANSLATE).status == TaskStatus.SKIPPED
+        assert db.get_task("test_vid", TaskStep.EMBED).status == TaskStatus.COMPLETED
 
     def test_unavailable_video_skips_all(self, tmp_path):
         """不可用视频应跳过所有处理，标记全部完成"""

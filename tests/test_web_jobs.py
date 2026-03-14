@@ -279,6 +279,27 @@ class TestVideoDeduplication:
 class TestTaskParamsPersistence:
     """测试 task_params 统一持久化：process 特有参数存入 task_params JSON 字段"""
 
+    def test_submit_job_rolls_back_db_record_when_start_fails(self):
+        """子进程启动失败时，不应遗留 pending job 记录。"""
+        import tempfile, shutil
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmpdir, "test.db")
+            log_dir = os.path.join(tmpdir, "logs")
+            jm = JobManager(db_path, log_dir)
+
+            from unittest.mock import patch
+            with patch.object(jm, '_start_job_process', side_effect=RuntimeError("spawn failed")):
+                with pytest.raises(RuntimeError, match="spawn failed"):
+                    jm.submit_job(
+                        video_ids=["v1"],
+                        steps=["download"],
+                    )
+
+            assert jm.list_jobs() == []
+        finally:
+            shutil.rmtree(tmpdir)
+
     def test_process_params_merged_into_task_params(self):
         """process 任务的 playlist_id/upload_batch_size/upload_mode 应合并到 task_params"""
         import json, sqlite3, tempfile, shutil
@@ -532,7 +553,7 @@ class TestProcessJobResultContracts:
 
 
 class TestCancelJobContracts:
-    def test_cancel_job_terminates_process_group(self, job_env, monkeypatch):
+    def test_cancel_job_marks_cancel_requested_and_sends_sigterm(self, job_env, monkeypatch):
         jm, _, _ = job_env
         from datetime import datetime
         import json
@@ -545,45 +566,17 @@ class TestCancelJobContracts:
             """, ("job-cancel", json.dumps(["v1"]), json.dumps(["download"]), 4321, datetime.now().isoformat()))
 
         killpg_calls = []
+        monkeypatch.setattr("vat.web.jobs.JobManager.update_job_status", lambda _self, _job_id: None)
         monkeypatch.setattr("vat.web.jobs.os.getpgid", lambda pid: 9876)
         monkeypatch.setattr("vat.web.jobs.os.killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
-        monkeypatch.setattr("vat.web.jobs.os.kill", lambda pid, sig: (_ for _ in ()).throw(AssertionError("should use killpg")))
-        monkeypatch.setattr("vat.web.jobs.JobManager._wait_for_process_group_exit", lambda _self, _pgid: True)
 
         assert jm.cancel_job("job-cancel") is True
         assert killpg_calls == [(9876, __import__("signal").SIGTERM)]
+        job = jm.get_job("job-cancel")
+        assert job.status == JobStatus.RUNNING
+        assert job.cancel_requested is True
 
-    def test_cancel_job_escalates_to_sigkill_when_process_group_survives(self, job_env, monkeypatch):
-        jm, _, _ = job_env
-        from datetime import datetime
-        import json
-        import signal
-
-        with jm._get_connection() as conn:
-            conn.execute("""
-                INSERT INTO web_jobs (
-                    job_id, video_ids, steps, gpu_device, force, status, pid, created_at
-                ) VALUES (?, ?, ?, 'auto', 0, 'running', ?, ?)
-            """, ("job-kill", json.dumps(["v1"]), json.dumps(["download"]), 4322, datetime.now().isoformat()))
-
-        signals = []
-        wait_results = iter([False, True])
-
-        monkeypatch.setattr("vat.web.jobs.os.getpgid", lambda pid: 9999)
-        monkeypatch.setattr(
-            "vat.web.jobs.JobManager._wait_for_process_group_exit",
-            lambda _self, _pgid: next(wait_results),
-        )
-        monkeypatch.setattr(
-            "vat.web.jobs.os.killpg",
-            lambda pgid, sig: signals.append((pgid, sig)),
-        )
-
-        assert jm.cancel_job("job-kill") is True
-        assert signals == [(9999, signal.SIGTERM), (9999, signal.SIGKILL)]
-        assert jm.get_job("job-kill").status == JobStatus.CANCELLED
-
-    def test_cancel_job_does_not_mark_cancelled_when_group_still_alive(self, job_env, monkeypatch):
+    def test_cancel_job_returns_false_when_status_refresh_finishes_job(self, job_env, monkeypatch):
         jm, _, _ = job_env
         from datetime import datetime
         import json
@@ -593,14 +586,61 @@ class TestCancelJobContracts:
                 INSERT INTO web_jobs (
                     job_id, video_ids, steps, gpu_device, force, status, pid, created_at
                 ) VALUES (?, ?, ?, 'auto', 0, 'running', ?, ?)
-            """, ("job-stubborn", json.dumps(["v1"]), json.dumps(["download"]), 4323, datetime.now().isoformat()))
+            """, ("job-finished", json.dumps(["v1"]), json.dumps(["download"]), 4322, datetime.now().isoformat()))
 
-        monkeypatch.setattr("vat.web.jobs.os.getpgid", lambda pid: 7777)
-        monkeypatch.setattr(
-            "vat.web.jobs.JobManager._wait_for_process_group_exit",
-            lambda _self, _pgid: False,
-        )
-        monkeypatch.setattr("vat.web.jobs.os.killpg", lambda *_args, **_kwargs: None)
+        def mark_completed(_self, job_id):
+            with jm._get_connection() as conn:
+                conn.execute(
+                    "UPDATE web_jobs SET status = ?, finished_at = ? WHERE job_id = ?",
+                    (JobStatus.COMPLETED.value, datetime.now().isoformat(), job_id),
+                )
 
-        assert jm.cancel_job("job-stubborn") is False
-        assert jm.get_job("job-stubborn").status == JobStatus.RUNNING
+        monkeypatch.setattr("vat.web.jobs.JobManager.update_job_status", mark_completed)
+
+        assert jm.cancel_job("job-finished") is False
+        assert jm.get_job("job-finished").status == JobStatus.COMPLETED
+
+    def test_update_job_status_marks_cancel_requested_job_as_cancelled(self, job_env, monkeypatch):
+        jm, _, _ = job_env
+        from datetime import datetime
+        import json
+
+        with jm._get_connection() as conn:
+            conn.execute("""
+                INSERT INTO web_jobs (
+                    job_id, video_ids, steps, gpu_device, force, status, pid, created_at, cancel_requested
+                ) VALUES (?, ?, ?, 'auto', 0, 'running', ?, ?, 1)
+            """, ("job-cancelled", json.dumps(["v1"]), json.dumps(["download"]), 4323, datetime.now().isoformat()))
+
+        monkeypatch.setattr("vat.web.jobs.JobManager._is_process_alive", lambda _self, _pid: False)
+        monkeypatch.setattr("vat.web.jobs.JobManager._parse_progress_from_log", lambda _self, _log_file: 0.4)
+
+        jm.update_job_status("job-cancelled")
+
+        job = jm.get_job("job-cancelled")
+        assert job.status == JobStatus.CANCELLED
+        assert job.progress == 0.4
+        assert job.finished_at is not None
+
+    def test_is_process_alive_treats_zombie_as_exited(self, job_env, monkeypatch):
+        jm, _, _ = job_env
+
+        waitpid_calls = []
+
+        monkeypatch.setattr("vat.web.jobs.os.kill", lambda _pid, _sig: None)
+        monkeypatch.setattr("vat.web.jobs.os.waitpid", lambda pid, flags: waitpid_calls.append((pid, flags)))
+
+        class _StatusFile:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return "Name:\tpython\nState:\tZ (zombie)\n"
+
+        monkeypatch.setattr("builtins.open", lambda *_args, **_kwargs: _StatusFile())
+
+        assert jm._is_process_alive(4324) is False
+        assert waitpid_calls == [(4324, __import__("os").WNOHANG)]

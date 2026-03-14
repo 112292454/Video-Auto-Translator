@@ -432,7 +432,8 @@ class VideoProcessor:
             else:
                 steps = [s if isinstance(s, str) else s.value for s in steps]
 
-            # 展开阶段组名（如 'asr' → ['whisper', 'split'], 'translate' → ['optimize', 'translate']）
+            # 展开阶段组名（如 'asr' → ['whisper', 'split']）。
+            # 若名称同时匹配单阶段与阶段组（如 'translate'），优先按单阶段处理。
             expanded = []
             for s in steps:
                 try:
