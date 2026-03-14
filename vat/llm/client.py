@@ -3,11 +3,15 @@
 import os
 import threading
 from types import SimpleNamespace
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
 
+import google.auth
 import httpx
 import openai
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import service_account
 from openai import OpenAI
 from tenacity import (
     RetryCallState,
@@ -36,6 +40,18 @@ def _get_env_provider() -> str:
 
 def _get_env_vertex_location() -> str:
     return os.getenv("VAT_VERTEX_LOCATION", "global").strip() or "global"
+
+
+def _get_env_vertex_auth_mode() -> str:
+    return os.getenv("VAT_VERTEX_AUTH_MODE", "api_key").strip() or "api_key"
+
+
+def _get_env_vertex_project_id() -> str:
+    return os.getenv("VAT_VERTEX_PROJECT_ID", "").strip()
+
+
+def _get_env_vertex_credentials() -> str:
+    return os.getenv("VAT_VERTEX_CREDENTIALS", "").strip()
 
 
 def _resolve_provider(base_url: str = "") -> str:
@@ -117,6 +133,48 @@ def _raise_vertex_http_error(exc: httpx.HTTPStatusError) -> None:
     raise RuntimeError(f"Vertex API 请求失败({status_code}): {message}") from exc
 
 
+def _resolve_vertex_credentials_path(credentials_path: str = "") -> str:
+    raw_path = credentials_path or _get_env_vertex_credentials()
+    if not raw_path:
+        return ""
+
+    candidate = Path(raw_path).expanduser()
+    if candidate.exists():
+        return str(candidate.resolve())
+
+    if not candidate.is_absolute():
+        home_candidate = Path.home() / raw_path
+        if home_candidate.exists():
+            raise ValueError(
+                f"Vertex ADC 凭据路径不存在: {raw_path}。"
+                f"检测到用户目录下存在可用文件: {home_candidate}"
+            )
+
+    raise ValueError(f"Vertex ADC 凭据路径不存在: {raw_path}")
+
+
+def _get_vertex_access_token(credentials_path: str = "") -> str:
+    scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+    resolved_path = _resolve_vertex_credentials_path(credentials_path)
+
+    try:
+        if resolved_path:
+            credentials = service_account.Credentials.from_service_account_file(
+                resolved_path,
+                scopes=scopes,
+            )
+        else:
+            credentials, _ = google.auth.default(scopes=scopes)
+        credentials.refresh(GoogleAuthRequest())
+    except Exception as exc:
+        raise RuntimeError(f"Vertex ADC 认证失败: {exc}") from exc
+
+    token = getattr(credentials, "token", "")
+    if not token:
+        raise RuntimeError("Vertex ADC 认证失败: 未获取到 access token")
+    return token
+
+
 def _call_vertex_native(
     messages: List[dict],
     model: str,
@@ -127,20 +185,35 @@ def _call_vertex_native(
 ) -> Any:
     effective_key = api_key or os.getenv("OPENAI_API_KEY", "").strip()
     location = _get_env_vertex_location()
+    auth_mode = _get_env_vertex_auth_mode()
+    project_id = _get_env_vertex_project_id()
 
-    if not effective_key:
-        raise ValueError("Vertex LLM 配置不完整: api_key=缺失")
-    if not location:
-        raise ValueError("Vertex LLM 配置不完整: location=缺失")
-
-    endpoint = f"https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent?key={effective_key}"
     request_body = _build_vertex_request(messages, temperature, **kwargs)
+    headers = {"Content-Type": "application/json"}
+
+    if auth_mode == "adc":
+        if not project_id:
+            raise ValueError("Vertex LLM 配置不完整: project_id=缺失")
+        if not location:
+            raise ValueError("Vertex LLM 配置不完整: location=缺失")
+        headers["Authorization"] = f"Bearer {_get_vertex_access_token()}"
+        endpoint = (
+            "https://aiplatform.googleapis.com/v1/projects/"
+            f"{project_id}/locations/{location}/publishers/google/models/{model}:generateContent"
+        )
+    else:
+        if not effective_key:
+            raise ValueError("Vertex LLM 配置不完整: api_key=缺失")
+        endpoint = (
+            "https://aiplatform.googleapis.com/v1/publishers/google/models/"
+            f"{model}:generateContent?key={effective_key}"
+        )
 
     try:
         response = httpx.post(
             endpoint,
             json=request_body,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             timeout=openai.DEFAULT_TIMEOUT,
             proxy=proxy or None,
         )

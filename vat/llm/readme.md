@@ -10,7 +10,7 @@
 
 | 文件/目录 | 职责 |
 |-----------|------|
-| `client.py` | 统一 LLM 客户端：OpenAI 兼容 API 调用、自动重试、结果缓存、多端点支持 |
+| `client.py` | 统一 LLM 客户端：OpenAI 兼容 API 调用、Vertex Native 调用、自动重试、结果缓存、多端点支持 |
 | `prompts/` | 提示词管理：Markdown 文件存储 + 模板变量替换 + LRU 缓存 |
 | `scene_identifier.py` | 场景识别：基于视频标题/简介判断内容类型（游戏/聊天/唱歌等） |
 | `video_info_translator.py` | 视频信息翻译：翻译标题/简介/标签 + 推荐 B 站分区 |
@@ -30,7 +30,7 @@
 
 ### 2.2 多端点支持
 
-项目同时使用多个 LLM 服务商，通过 per-call 参数切换：
+项目同时使用多个 LLM 服务商，通过全局 `llm.provider` 和 per-call 参数切换：
 
 ```python
 # 默认端点（环境变量 OPENAI_BASE_URL / OPENAI_API_KEY）
@@ -48,9 +48,19 @@ call_llm(messages, model="gemini-3-flash-preview",
 
 客户端按 `(base_url, api_key, proxy)` 三元组缓存，相同配置复用同一连接。
 
+对于 Vertex Native：
+
+- `llm.provider=vertex_native`
+- `llm.auth_mode=api_key`
+  - 走 `https://aiplatform.googleapis.com/v1/publishers/google/models/{model}:generateContent?key=...`
+- `llm.auth_mode=adc`
+  - 走 `https://aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent`
+  - Bearer token 由 `google-auth` 在 client 层获取
+
 ### 2.3 特殊处理
 
 - **火山引擎 thinking 自动关闭**：检测到 `ark.cn-beijing.volces.com` 端点时，自动注入 `thinking: {type: disabled}`。kimi-k2.5 默认走 thinking 路径（34s/call），关闭后降至 0.7s/call，且实验验证对翻译/ASR 纠错无帮助
+- **Vertex 双认证模式**：`api_key` 适合快速接入，`adc` 适合长期和正式部署；两者都统一适配到 `response.choices[0].message.content`
 - **缓存**：基于 diskcache 的结果缓存（`@memoize`），相同输入 1 小时内复用结果。通过 `config.storage.cache_enabled` 控制开关
 - **重试**：仅对 `RateLimitError` 重试，指数退避 5-60 秒，最多 10 次
 - **响应验证**：空 choices 或空 content 抛出 `ValueError`（不会被缓存）
@@ -61,6 +71,11 @@ call_llm(messages, model="gemini-3-flash-preview",
 |------|------|
 | `OPENAI_BASE_URL` | 默认 API 端点（由 config.py 的 `LLMConfig.__post_init__` 自动设置） |
 | `OPENAI_API_KEY` | 默认 API Key |
+| `VAT_LLM_PROVIDER` | LLM provider，`openai_compatible` / `vertex_native` |
+| `VAT_VERTEX_AUTH_MODE` | Vertex 认证模式，`api_key` / `adc` |
+| `VAT_VERTEX_LOCATION` | Vertex location |
+| `VAT_VERTEX_PROJECT_ID` | Vertex ADC 使用的 project_id |
+| `VAT_VERTEX_CREDENTIALS` | Vertex ADC 使用的 service account JSON 路径 |
 | `VAT_VOLC_APIKEY` | 火山引擎 API Key（Optimize 阶段使用） |
 
 ---

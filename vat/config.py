@@ -345,8 +345,10 @@ class LLMConfig:
     base_url: str
     model: str = ""  # 全局默认模型（各阶段未指定 model 时的 fallback）
     provider: str = "openai_compatible"
+    auth_mode: str = "api_key"
     location: str = "global"
     project_id: str = ""
+    credentials_path: str = ""
     
     _initialized: bool = field(default=False, repr=False)
     
@@ -360,8 +362,10 @@ class LLMConfig:
         # 解析环境变量占位符
         self.api_key = _resolve_env_var(self.api_key)
         self.base_url = _resolve_env_var(self.base_url)
+        self.auth_mode = _resolve_env_var(self.auth_mode) if self.auth_mode else "api_key"
         self.location = _resolve_env_var(self.location) if self.location else "global"
         self.project_id = _resolve_env_var(self.project_id) if self.project_id else ""
+        self.credentials_path = _resolve_env_var(self.credentials_path) if self.credentials_path else ""
         
         # 统一设置环境变量（所有LLM调用都从环境变量读取）
         if self.api_key and not self.api_key.startswith("${"):
@@ -375,6 +379,9 @@ class LLMConfig:
         os.environ["VAT_LLM_PROVIDER"] = self.provider
         logger.debug(f"已设置 VAT_LLM_PROVIDER 环境变量: {self.provider}")
 
+        os.environ["VAT_VERTEX_AUTH_MODE"] = self.auth_mode
+        logger.debug(f"已设置 VAT_VERTEX_AUTH_MODE 环境变量: {self.auth_mode}")
+
         if self.location:
             os.environ["VAT_VERTEX_LOCATION"] = self.location
             logger.debug(f"已设置 VAT_VERTEX_LOCATION 环境变量: {self.location}")
@@ -382,13 +389,23 @@ class LLMConfig:
         if self.project_id:
             os.environ["VAT_VERTEX_PROJECT_ID"] = self.project_id
             logger.debug(f"已设置 VAT_VERTEX_PROJECT_ID 环境变量: {self.project_id}")
+
+        if self.credentials_path:
+            os.environ["VAT_VERTEX_CREDENTIALS"] = str(Path(self.credentials_path).expanduser())
+            logger.debug(f"已设置 VAT_VERTEX_CREDENTIALS 环境变量: {os.environ['VAT_VERTEX_CREDENTIALS']}")
         
         # 检查配置完整性
         if self.provider == "vertex_native":
-            if not self.api_key or not self.location:
+            if self.auth_mode == "adc":
+                if not self.project_id or not self.location:
+                    logger.warning(
+                        "LLM Vertex ADC 配置不完整，部分功能（智能断句、翻译、视频信息翻译）可能无法使用。"
+                        "请在配置文件中设置 llm.project_id 和 llm.location"
+                    )
+            elif not self.api_key:
                 logger.warning(
-                    "LLM Vertex 配置不完整，部分功能（智能断句、翻译、视频信息翻译）可能无法使用。"
-                    "请在配置文件中设置 llm.api_key 和 llm.location"
+                    "LLM Vertex API key 配置不完整，部分功能（智能断句、翻译、视频信息翻译）可能无法使用。"
+                    "请在配置文件中设置 llm.api_key"
                 )
         elif not self.api_key or not self.base_url:
             logger.warning(
@@ -401,7 +418,9 @@ class LLMConfig:
     def is_available(self) -> bool:
         """检查LLM配置是否可用"""
         if self.provider == "vertex_native":
-            return bool(self.api_key and self.location)
+            if self.auth_mode == "adc":
+                return bool(self.project_id and self.location)
+            return bool(self.api_key)
         return bool(self.api_key and self.base_url)
 
 
@@ -745,8 +764,10 @@ class Config:
             base_url=llm_data.get('base_url', ''),
             model=llm_data.get('model', ''),
             provider=llm_data.get('provider', 'openai_compatible'),
+            auth_mode=llm_data.get('auth_mode', 'api_key'),
             location=llm_data.get('location', 'global'),
             project_id=llm_data.get('project_id', ''),
+            credentials_path=llm_data.get('credentials_path', ''),
         )
         
         # 代理配置（全局默认 + 各环节独立覆盖，自动设置环境变量）
