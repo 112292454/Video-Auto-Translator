@@ -850,6 +850,7 @@ Run: `pytest tests -q`
   - `tests/test_scheduled_upload.py` 中新增 `_auto_season_sync()` 的“无待同步直接返回 / 失败后自动重试一次”测试
   - `tests/test_season_title_sync.py` 中新增 `sync_season_episode_titles()` 的无变更跳过、删除失败、部分重加失败、成功后恢复原顺序测试
   - `tests/test_translator_contracts.py` 中新增 `_set_segments_translated_text()` 的“索引映射正常 / 缺段立即失败”契约测试
+  - `tests/test_translator_contracts.py` 中新增 `LLMTranslator._get_cache_key()` 的 prompt / reflect / context 变更影响缓存键测试
 - `本轮修复的问题`:
   - 已完成工作区清理，按 task 提交现有改动，并在 `refactor/test-first-hardening` 分支开始正式修复。
   - 修复 `VideoProcessor` 直接持有共享 `config` 的问题；现在在初始化时深拷贝配置，每个 processor 都拥有独立配置副本，避免 `passthrough` 和自动 playlist prompt 覆写跨视频串扰。
@@ -934,6 +935,7 @@ Run: `pytest tests -q`
 | `vat/pipeline/executor.py` | `VideoProcessor.process` `_resolve_stage_gaps` `_set_passthrough_config` `_restore_passthrough_config` `_auto_apply_playlist_prompts` `_restore_playlist_prompts` `_is_no_speech` `_is_shorts_video` | `unit / contract / regression` | `covered_this_round` | 仍有大量 stage 实现函数未做直接函数级测试，但辅助控制逻辑这一轮已下探 |
 | `vat/uploaders/bilibili.py` | `season_sync` `sync_season_episode_titles` | `contract / regression` | `covered_this_round` | 已补成功同步、upload 已完成但无 aid 诊断、aid 查无、DB/合集不一致修复失败回写，以及删后重加标题同步的主要成功/失败路径；后续继续下探排序/删除组合原子性与真正补偿策略 |
 | `vat/translator/base.py` | `_set_segments_translated_text` | `contract / regression` | `covered_this_round` | 已收紧为“缺少任何翻译段即立即失败”，不再允许静默漏翻继续落盘 |
+| `vat/translator/llm_translator.py` | `_get_cache_key` | `contract / regression` | `covered_this_round` | 已补 prompt / reflect / context 维度进入缓存键，避免不同翻译语义错误复用旧缓存 |
 
 本节的维护规则：
 

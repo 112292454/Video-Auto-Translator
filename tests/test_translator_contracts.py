@@ -54,3 +54,42 @@ class TestSetSegmentsTranslatedTextContracts:
 
         with pytest.raises(RuntimeError, match="缺少翻译"):
             translator._set_segments_translated_text(segments, translated)
+
+
+class TestTranslatorCacheKeyContracts:
+    def _make_chunk(self):
+        from vat.translator.base import SubtitleProcessData
+
+        return [
+            SubtitleProcessData(index=1, original_text="おはよう"),
+            SubtitleProcessData(index=2, original_text="こんにちは"),
+        ]
+
+    def test_custom_prompt_changes_cache_key(self, translator):
+        chunk = self._make_chunk()
+        base_key = translator._get_cache_key(chunk)
+
+        translator.custom_prompt = "speaker=fubuki"
+        changed_key = translator._get_cache_key(chunk)
+
+        assert changed_key != base_key
+
+    def test_reflect_mode_changes_cache_key(self, translator):
+        chunk = self._make_chunk()
+        base_key = translator._get_cache_key(chunk)
+
+        translator.is_reflect = True
+        changed_key = translator._get_cache_key(chunk)
+
+        assert changed_key != base_key
+
+    def test_context_payload_changes_cache_key_when_context_enabled(self, translator):
+        chunk = self._make_chunk()
+        translator.enable_context = True
+        translator._previous_batch_result = {"1": "上一句"}
+        key_a = translator._get_cache_key(chunk)
+
+        translator._previous_batch_result = {"1": "另一句"}
+        key_b = translator._get_cache_key(chunk)
+
+        assert key_b != key_a

@@ -679,4 +679,10 @@ Translate the following (output ONLY these keys):
         chunk_key = generate_cache_key(chunk)
         lang = self.target_language.value
         model = self.model
-        return f"{class_name}:{chunk_key}:{lang}:{model}"
+        variant_key = generate_cache_key({
+            "custom_prompt": self.custom_prompt,
+            "is_reflect": self.is_reflect,
+            "enable_context": self.enable_context,
+            "previous_batch_result": self._previous_batch_result if self.enable_context else None,
+        })
+        return f"{class_name}:{chunk_key}:{lang}:{model}:{variant_key}"
