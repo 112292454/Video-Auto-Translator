@@ -52,14 +52,14 @@ VAT Web UI 是一个基于 FastAPI 的视频处理管理界面，提供以下核
 python -m vat.web.app
 
 # 方式2：使用 uvicorn
-uvicorn vat.web.app:app --host 0.0.0.0 --port 8080
+uvicorn vat.web.app:app --host 0.0.0.0 --port 13579
 
-# 服务默认运行在 http://localhost:8080
+# 服务默认运行在 http://localhost:13579
 ```
 
 ### 2.2 首页导航
 
-启动后访问 `http://localhost:8080`，顶部导航栏包含：
+启动后访问 `http://localhost:13579`，顶部导航栏包含：
 
 | 入口 | 说明 |
 |------|------|

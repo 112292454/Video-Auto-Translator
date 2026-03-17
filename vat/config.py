@@ -579,7 +579,7 @@ class ProxyConfig:
 class WebConfig:
     """Web UI 配置"""
     host: str = "0.0.0.0"    # 监听地址
-    port: int = 8080          # 监听端口
+    port: int = 13579         # 监听端口
 
 
 @dataclass
@@ -785,7 +785,7 @@ class Config:
         web_data = data.get('web', {})
         web = WebConfig(
             host=web_data.get('host', '0.0.0.0'),
-            port=web_data.get('port', 8080),
+            port=web_data.get('port', 13579),
         )
         
         # Watch 模式配置（可选，有默认值）
