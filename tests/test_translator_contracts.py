@@ -203,3 +203,216 @@ class TestBuildInputWithContextContracts:
         assert "[2]: 你好" in result
         assert "Translate the following" in result
         assert '{"3": "こんばんは"}' in result
+
+
+class TestValidateLlmResponseContracts:
+    def test_validate_llm_response_rejects_non_dict(self, translator):
+        ok, msg = translator._validate_llm_response(["bad"], {"1"})
+
+        assert ok is False
+        assert "dict" in msg
+
+    def test_validate_llm_response_rejects_missing_and_extra_keys(self, translator):
+        ok, msg = translator._validate_llm_response({"1": "a", "3": "c"}, {"1", "2"})
+
+        assert ok is False
+        assert "Missing keys" in msg
+        assert "Extra keys" in msg
+
+    def test_validate_llm_response_reflect_mode_requires_native_translation(self, translator):
+        translator.is_reflect = True
+
+        ok, msg = translator._validate_llm_response({"1": {"wrong": "x"}}, {"1"})
+
+        assert ok is False
+        assert "native_translation" in msg
+
+
+class TestOptimizationValidationContracts:
+    def test_normalize_kana_converts_katakana_to_hiragana(self, translator):
+        assert translator._normalize_kana("ルルドライオン") == "るるどらいおん"
+
+    def test_validate_optimization_result_accepts_kana_normalization_equivalent_text(self, translator):
+        ok, msg = translator._validate_optimization_result(
+            {"1": "ルルドライオン"},
+            {"1": "るるどらいおん"},
+        )
+
+        assert ok is True
+        assert msg == ""
+
+    def test_validate_optimization_result_rejects_key_mismatch(self, translator):
+        ok, msg = translator._validate_optimization_result(
+            {"1": "原文", "2": "第二句"},
+            {"1": "原文"},
+        )
+
+        assert ok is False
+        assert "Missing keys" in msg
+
+    def test_validate_optimization_result_rejects_excessive_change(self, translator):
+        ok, msg = translator._validate_optimization_result(
+            {"1": "これは十分に長い元の文章です"},
+            {"1": "完全不同的另一段内容"},
+        )
+
+        assert ok is False
+        assert "similarity" in msg
+
+
+class TestRealignShiftedKeysContracts:
+    def test_try_realign_shifted_keys_returns_none_when_not_systemic(self, translator):
+        result = translator._try_realign_shifted_keys(
+            {"1": "alpha", "2": "beta", "3": "gamma"},
+            {"1": "alpha", "2": "beta-fixed", "3": "gamma"},
+        )
+
+        assert result is None
+
+    def test_try_realign_shifted_keys_repairs_systemic_shift(self, translator):
+        original = {
+            "1": "apple zebra unique",
+            "2": "beta ocean quartz",
+            "3": "gamma sunset violin",
+            "4": "delta rocket willow",
+        }
+        shifted = {
+            "1": "beta ocean quartz",
+            "2": "gamma sunset violin",
+            "3": "delta rocket willow",
+            "4": "apple zebra unique",
+        }
+
+        result = translator._try_realign_shifted_keys(original, shifted)
+
+        assert result == original
+
+
+class TestAgentLoopContracts:
+    def test_agent_loop_retries_after_validation_failure(self, translator, monkeypatch):
+        calls = []
+
+        def fake_call_llm(*, messages, model, api_key, base_url, proxy):
+            calls.append(messages)
+            resp = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"1": "ok"}'))])
+            return resp
+
+        validation_results = iter([
+            (False, "missing key 2"),
+            (True, ""),
+        ])
+
+        monkeypatch.setattr("vat.translator.llm_translator.call_llm", fake_call_llm)
+        monkeypatch.setattr(
+            translator,
+            "_validate_llm_response",
+            lambda response_dict, expected_keys: next(validation_results),
+        )
+
+        result = translator._agent_loop("system", '{"1": "原文"}', expected_keys={"1"})
+
+        assert result == {"1": "ok"}
+        assert len(calls) == 2
+        assert calls[1][-1]["role"] == "user"
+        assert "Fix the errors above" in calls[1][-1]["content"]
+
+    def test_agent_loop_raises_on_empty_choices(self, translator, monkeypatch):
+        monkeypatch.setattr(
+            "vat.translator.llm_translator.call_llm",
+            lambda **kwargs: SimpleNamespace(choices=[]),
+        )
+
+        with pytest.raises(RuntimeError, match="LLM 未返回有效响应"):
+            translator._agent_loop("system", '{"1": "原文"}', expected_keys={"1"})
+
+    def test_agent_loop_raises_on_empty_content(self, translator, monkeypatch):
+        monkeypatch.setattr(
+            "vat.translator.llm_translator.call_llm",
+            lambda **kwargs: SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="   "))]
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="LLM 返回内容为空"):
+            translator._agent_loop("system", '{"1": "原文"}', expected_keys={"1"})
+
+
+class TestOptimizeChunkContracts:
+    def test_optimize_chunk_retries_after_validation_failure(self, translator, monkeypatch):
+        responses = iter([
+            '{"1": "first try"}',
+            '{"1": "second try"}',
+        ])
+        validation = iter([
+            (False, "still wrong"),
+            (True, ""),
+        ])
+        calls = []
+
+        def fake_call_llm(*, messages, model, temperature, api_key, base_url, proxy):
+            calls.append(messages)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=next(responses)))])
+
+        monkeypatch.setattr("vat.translator.llm_translator.call_llm", fake_call_llm)
+        monkeypatch.setattr(
+            translator,
+            "_validate_optimization_result",
+            lambda original_chunk, optimized_chunk: next(validation),
+        )
+
+        result = translator._optimize_chunk({"1": "原文"})
+
+        assert result == {"1": "second try"}
+        assert len(calls) == 2
+        assert calls[1][-1]["role"] == "user"
+        assert "Validation failed" in calls[1][-1]["content"]
+
+    def test_optimize_chunk_uses_realign_result_after_feedback_loop_exhausted(self, translator, monkeypatch):
+        shifted = {"1": "b", "2": "a"}
+        monkeypatch.setattr(
+            "vat.translator.llm_translator.call_llm",
+            lambda **kwargs: SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"1": "b", "2": "a"}'))]),
+        )
+        monkeypatch.setattr(
+            translator,
+            "_validate_optimization_result",
+            lambda original_chunk, optimized_chunk: (False, "bad"),
+        )
+        monkeypatch.setattr(
+            translator,
+            "_try_realign_shifted_keys",
+            lambda original_chunk, optimized_chunk: {"1": "a", "2": "b"},
+        )
+
+        result = translator._optimize_chunk({"1": "a", "2": "b"})
+
+        assert result == {"1": "a", "2": "b"}
+
+
+class TestTranslateChunkReflectContracts:
+    def test_translate_chunk_reflect_mode_extracts_native_translation_and_updates_context(self, translator, monkeypatch):
+        translator.is_reflect = True
+        chunk = [
+            SimpleNamespace(index=1, original_text="原文1", translated_text=""),
+            SimpleNamespace(index=2, original_text="原文2", translated_text=""),
+        ]
+        monkeypatch.setattr("vat.translator.llm_translator.get_prompt", lambda *args, **kwargs: "prompt")
+        monkeypatch.setattr(
+            translator,
+            "_build_input_with_context",
+            lambda subtitle_dict: '{"1": "原文1", "2": "原文2"}',
+        )
+        monkeypatch.setattr(
+            translator,
+            "_agent_loop",
+            lambda prompt, user_input, expected_keys=None: {
+                "1": {"native_translation": "译文1"},
+                "2": {"native_translation": "译文2"},
+            },
+        )
+
+        result = translator._translate_chunk(chunk)
+
+        assert result[0].translated_text == "译文1"
+        assert result[1].translated_text == "译文2"
+        assert translator._previous_batch_result == {"1": "译文1", "2": "译文2"}
