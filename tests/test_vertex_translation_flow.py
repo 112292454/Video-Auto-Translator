@@ -193,7 +193,7 @@ class TestVertexTranslationFlow:
 
         monkeypatch.setattr(
             "vat.llm.client._get_vertex_access_token",
-            lambda credentials_path="": "test-access-token",
+            lambda credentials_path="", proxy="": "test-access-token",
         )
 
         def fake_post(url, json, headers, timeout, proxy=None):
