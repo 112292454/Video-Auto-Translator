@@ -589,7 +589,7 @@ class YouTubeDownloader(PlatformDownloader):
                     ) from e
                 
                 logger.warning(
-                    f"[网络瞬态错误] {error_msg[:120]}... "
+                    f"[网络瞬态错误][proxy={effective_opts.get('proxy', '') or 'DIRECT/env'}] {error_msg[:120]}... "
                     f"等待 {wait_sec}s 后重试（已等待 {total_waited}s/{_RETRY_MAX_TOTAL_SEC}s）"
                 )
                 time.sleep(wait_sec)
@@ -634,7 +634,7 @@ class YouTubeDownloader(PlatformDownloader):
                                 f"视频: {video_id}，最后错误: {error_msg}"
                             )
                         logger.warning(
-                            f"[下载网络错误] {error_msg[:120]}... "
+                            f"[下载网络错误][proxy={effective_opts.get('proxy', '') or 'DIRECT/env'}] {error_msg[:120]}... "
                             f"等待 {wait_sec}s 后重试（已等待 {total_waited}s/{_RETRY_MAX_TOTAL_SEC}s）"
                         )
                         time.sleep(wait_sec)

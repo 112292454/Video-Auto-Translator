@@ -239,6 +239,10 @@ def _get_vertex_access_token(credentials_path: str = "", proxy: str = "") -> str
         for refresh_proxy in refresh_proxies:
             for attempt in range(len(_VERTEX_TOKEN_REFRESH_RETRY_DELAYS_SEC) + 1):
                 try:
+                    proxy_label = refresh_proxy if refresh_proxy is not None else "DIRECT(no env proxy)"
+                    logger.info(
+                        f"Vertex ADC token refresh attempt {attempt + 1} using {proxy_label}"
+                    )
                     if proxy and not refresh_proxy:
                         logger.warning(
                             f"Vertex ADC token refresh via proxy failed, retry without proxy: {last_exc}"
