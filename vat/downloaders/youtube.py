@@ -5,6 +5,8 @@ import logging
 import re
 import time
 import hashlib
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Optional, Any
@@ -96,6 +98,13 @@ _LIVE_FRAGMENT_ERROR_PATTERNS = [
     r'fragment \d+ not found',
     r'unable to continue',
 ]
+
+# 用于真正 download 路径的稳健 YouTube client 组合。
+# 经验现象：
+# - 默认 client 在部分直播回放页会直接报 "The page needs to be reloaded"
+# - 加入 mweb 后，这类页面通常可恢复
+# - 保留 web/web_safari/tv，让 yt-dlp 仍有机会从其他 client 获取更完整的格式信息
+_RESILIENT_DOWNLOAD_PLAYER_CLIENTS = ['web', 'web_safari', 'tv', 'mweb']
 
 
 def is_video_permanently_unavailable(error_msg: str) -> bool:
@@ -233,6 +242,12 @@ class YtDlpLogger:
         '[merger]',
         '[ffmpeg]',
     ]
+
+    def __init__(self):
+        self.last_error: str = ""
+
+    def reset_last_error(self) -> None:
+        self.last_error = ""
     
     def debug(self, msg):
         # DEBUG 级别：输出所有（含 [debug] 前缀的 yt-dlp 内部调试）
@@ -262,6 +277,12 @@ class YtDlpLogger:
         logger.warning(msg)
 
     def error(self, msg):
+        self.last_error = str(msg)
+        # 这类错误会在 get_video_info 中被结构化识别为 unavailable，
+        # 上层已有更清晰的业务日志，不需要再以 ERROR 刷屏。
+        if is_video_permanently_unavailable(msg):
+            logger.debug(msg)
+            return
         logger.error(msg)
 
 class YouTubeDownloader(PlatformDownloader):
@@ -518,8 +539,10 @@ class YouTubeDownloader(PlatformDownloader):
         wait_sec = _RETRY_INITIAL_WAIT_SEC
         
         while True:
+            isolated_cookie = None
             try:
-                with YoutubeDL(ydl_opts) as ydl:
+                effective_opts, isolated_cookie = self._materialize_isolated_cookiefile(ydl_opts)
+                with YoutubeDL(effective_opts) as ydl:
                     logger.info(f"正在提取视频信息: {url}")
                     info = ydl.extract_info(url, download=False)
                 
@@ -530,6 +553,22 @@ class YouTubeDownloader(PlatformDownloader):
                 
             except Exception as e:
                 error_msg = str(e)
+
+                if 'The page needs to be reloaded' in error_msg:
+                    if ydl_opts.get('cookiefile'):
+                        logger.warning(
+                            f"extract_info 命中 page reload，当前 YouTube cookie 可能已失效或不兼容；"
+                            f"建议按 yt-dlp wiki 用无痕窗口单独登录 YouTube 后只导出 youtube.com cookies，"
+                            f"并更新 {self.cookies_file}。将移除 cookie 后重试: {url}"
+                        )
+                        ydl_opts = dict(ydl_opts)
+                        ydl_opts.pop('cookiefile', None)
+                        continue
+                    if ydl_opts.get('extractor_args'):
+                        logger.warning(f"extract_info 命中 page reload，移除 player_client 覆写后重试: {url}")
+                        ydl_opts = dict(ydl_opts)
+                        ydl_opts.pop('extractor_args', None)
+                        continue
                 
                 # 预约/首播视频：yt-dlp 在 extract_info 就会抛异常，
                 # 必须在网络重试判断之前检测，否则会被包装为通用 RuntimeError
@@ -556,6 +595,9 @@ class YouTubeDownloader(PlatformDownloader):
                 time.sleep(wait_sec)
                 total_waited += wait_sec
                 wait_sec = min(wait_sec * _RETRY_BACKOFF_FACTOR, _RETRY_MAX_WAIT_SEC)
+            finally:
+                if isolated_cookie is not None:
+                    isolated_cookie.unlink(missing_ok=True)
     
     def _download_with_retry(self, url: str, ydl_opts: dict, video_id: str) -> None:
         """下载视频文件，遇到瞬态网络错误时自动等待重试
@@ -574,20 +616,53 @@ class YouTubeDownloader(PlatformDownloader):
         wait_sec = _RETRY_INITIAL_WAIT_SEC
         
         while True:
+            isolated_cookie = None
             try:
-                with YoutubeDL(ydl_opts) as ydl:
+                effective_opts, isolated_cookie = self._materialize_isolated_cookiefile(ydl_opts)
+                ydl_logger = effective_opts.get('logger')
+                if hasattr(ydl_logger, 'reset_last_error'):
+                    ydl_logger.reset_last_error()
+                with YoutubeDL(effective_opts) as ydl:
                     ret_code = ydl.download([url])
                 
                 if ret_code != 0:
-                    # yt-dlp 返回非零码，检查是否有可重试的错误
-                    # 非零码可能是字幕下载失败（ignoreerrors=True 时不致命）
-                    # 检查视频文件是否已存在来判断是否真的失败
-                    # 这里先 return，让调用方检查文件是否存在
-                    logger.warning(f"yt-dlp 返回码 {ret_code}，检查文件是否已下载")
+                    error_msg = getattr(ydl_logger, 'last_error', '') or f"yt-dlp 返回码 {ret_code}"
+                    if _is_retryable_network_error(error_msg):
+                        if total_waited >= _RETRY_MAX_TOTAL_SEC:
+                            raise RuntimeError(
+                                f"下载网络错误持续 {total_waited // 60} 分钟未恢复，放弃重试。"
+                                f"视频: {video_id}，最后错误: {error_msg}"
+                            )
+                        logger.warning(
+                            f"[下载网络错误] {error_msg[:120]}... "
+                            f"等待 {wait_sec}s 后重试（已等待 {total_waited}s/{_RETRY_MAX_TOTAL_SEC}s）"
+                        )
+                        time.sleep(wait_sec)
+                        total_waited += wait_sec
+                        wait_sec = min(wait_sec * _RETRY_BACKOFF_FACTOR, _RETRY_MAX_WAIT_SEC)
+                        continue
+
+                    raise RuntimeError(f"视频下载失败: {error_msg}")
                 return
                 
             except Exception as e:
                 error_msg = str(e)
+
+                if 'The page needs to be reloaded' in error_msg:
+                    if ydl_opts.get('cookiefile'):
+                        logger.warning(
+                            f"下载命中 page reload，当前 YouTube cookie 可能已失效或不兼容；"
+                            f"建议按 yt-dlp wiki 用无痕窗口单独登录 YouTube 后只导出 youtube.com cookies，"
+                            f"并更新 {self.cookies_file}。将移除 cookie 后重试: {video_id}"
+                        )
+                        ydl_opts = dict(ydl_opts)
+                        ydl_opts.pop('cookiefile', None)
+                        continue
+                    if ydl_opts.get('extractor_args'):
+                        logger.warning(f"下载命中 page reload，移除 player_client 覆写后重试: {video_id}")
+                        ydl_opts = dict(ydl_opts)
+                        ydl_opts.pop('extractor_args', None)
+                        continue
                 
                 if not _is_retryable_network_error(error_msg):
                     raise RuntimeError(
@@ -607,6 +682,9 @@ class YouTubeDownloader(PlatformDownloader):
                 time.sleep(wait_sec)
                 total_waited += wait_sec
                 wait_sec = min(wait_sec * _RETRY_BACKOFF_FACTOR, _RETRY_MAX_WAIT_SEC)
+            finally:
+                if isolated_cookie is not None:
+                    isolated_cookie.unlink(missing_ok=True)
     
     def _download_live_stream(
         self, url: str, output_dir: Path, ydl_opts: dict,
@@ -700,6 +778,7 @@ class YouTubeDownloader(PlatformDownloader):
         """
         poll_count = 0
         while True:
+            isolated_cookie = None
             poll_count += 1
             logger.info(
                 f"[直播] 等待直播结束... (第 {poll_count} 次轮询，"
@@ -718,7 +797,9 @@ class YouTubeDownloader(PlatformDownloader):
                         check_opts['cookiefile'] = str(cookie_path)
                 if self.remote_components:
                     check_opts['remote_components'] = self.remote_components
+                check_opts['extractor_args'] = {'youtube': {'player_client': list(_RESILIENT_DOWNLOAD_PLAYER_CLIENTS)}}
                 
+                check_opts, isolated_cookie = self._materialize_isolated_cookiefile(check_opts)
                 with YoutubeDL(check_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                 
@@ -742,6 +823,9 @@ class YouTubeDownloader(PlatformDownloader):
             except Exception as e:
                 # 轮询失败不致命，继续等待
                 logger.warning(f"[直播] 轮询状态失败: {e}，继续等待...")
+            finally:
+                if isolated_cookie is not None:
+                    isolated_cookie.unlink(missing_ok=True)
     
     @staticmethod
     def _is_live_fragment_error(error_msg: str) -> bool:
@@ -842,6 +926,54 @@ class YouTubeDownloader(PlatformDownloader):
             pass
         
         return None
+
+    def _build_video_info_ydl_opts(self, use_mweb_client: bool = False) -> Dict[str, Any]:
+        """构建 get_video_info 使用的 yt-dlp 配置。
+
+        metadata 抓取与实际 download 的 client 需求不同：
+        - 默认 client 在部分直播回放页会返回 "The page needs to be reloaded"
+        - mweb client 在这些页面上通常仍能返回标题/日期/封面等元信息
+
+        这里仅用于 metadata 抓取，不影响实际下载路径。
+        """
+        ydl_opts = {'quiet': True, 'logger': YtDlpLogger()}
+        if self.proxy:
+            ydl_opts['proxy'] = self.proxy
+        if self.cookies_file:
+            cookie_path = Path(self.cookies_file)
+            if cookie_path.exists():
+                ydl_opts['cookiefile'] = str(cookie_path)
+        if self.remote_components:
+            ydl_opts['remote_components'] = self.remote_components
+        if use_mweb_client:
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['mweb']}}
+        return ydl_opts
+
+    def _materialize_isolated_cookiefile(self, ydl_opts: Dict[str, Any]) -> tuple[Dict[str, Any], Optional[Path]]:
+        """为单次 yt-dlp 调用生成隔离的 cookie 副本。
+
+        yt-dlp 在退出时会把 cookie jar save 回 `cookiefile`。
+        多线程并发 `YoutubeDL(...)` 指向同一个 cookie 文件时，会产生并发写冲突，
+        导致其他线程读到半写入内容并报“不是 Netscape 格式”。
+
+        这里不降级 cookie，而是给每次调用提供独立副本，避免互相覆盖。
+        """
+        cookiefile = ydl_opts.get('cookiefile')
+        if not cookiefile:
+            return ydl_opts, None
+
+        source = Path(cookiefile)
+        fd, tmp_path = tempfile.mkstemp(prefix='vat-yt-cookie-', suffix=source.suffix or '.txt')
+        tmp_cookie = Path(tmp_path)
+        try:
+            shutil.copyfile(source, tmp_cookie)
+        except Exception:
+            tmp_cookie.unlink(missing_ok=True)
+            raise
+
+        isolated_opts = dict(ydl_opts)
+        isolated_opts['cookiefile'] = str(tmp_cookie)
+        return isolated_opts, tmp_cookie
     
     def get_video_info(self, url: str) -> 'VideoInfoResult':
         """
@@ -858,64 +990,75 @@ class YouTubeDownloader(PlatformDownloader):
         Returns:
             VideoInfoResult
         """
-        ydl_opts = {'quiet': True, 'logger': YtDlpLogger()}
-        if self.proxy:
-            ydl_opts['proxy'] = self.proxy
-        # cookies 和 remote_components 与 download 路径保持一致，
-        # 否则 YouTube bot 检测会拦截请求，导致 playlist sync 获取 upload_date 失败
-        if self.cookies_file:
-            cookie_path = Path(self.cookies_file)
-            if cookie_path.exists():
-                ydl_opts['cookiefile'] = str(cookie_path)
-        if self.remote_components:
-            ydl_opts['remote_components'] = self.remote_components
-        
-        try:
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                
+        def _to_result(info: Dict[str, Any]) -> VideoInfoResult:
+            return VideoInfoResult(
+                status='ok',
+                info={
+                    'video_id': info.get('id', ''),
+                    'title': info.get('title', ''),
+                    'description': info.get('description', ''),
+                    'duration': info.get('duration', 0),
+                    'uploader': info.get('uploader', ''),
+                    'upload_date': info.get('upload_date', ''),
+                    'thumbnail': info.get('thumbnail', ''),
+                    'live_status': info.get('live_status'),
+                    'view_count': info.get('view_count', 0),
+                    'like_count': info.get('like_count', 0),
+                    'url': url,
+                },
+            )
+
+        last_error_msg = None
+        for use_mweb_client in (False, True):
+            if use_mweb_client and last_error_msg and 'The page needs to be reloaded' not in last_error_msg:
+                break
+
+            ydl_opts = self._build_video_info_ydl_opts(use_mweb_client=use_mweb_client)
+            isolated_cookie = None
+
+            try:
+                ydl_opts, isolated_cookie = self._materialize_isolated_cookiefile(ydl_opts)
+                with YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+
                 if info is None:
+                    last_error_msg = 'yt-dlp extract_info 返回 None（原因未知）'
+                    continue
+
+                if use_mweb_client:
+                    logger.info(f"get_video_info 使用 mweb client 回退成功: {url}")
+                return _to_result(info)
+            except Exception as e:
+                error_msg = str(e)
+                last_error_msg = error_msg
+
+                if (not use_mweb_client) and 'The page needs to be reloaded' in error_msg:
+                    logger.info(f"默认 client 获取视频信息失败，回退 mweb: {url}")
+                    continue
+
+                # 预约/首播视频：临时性错误，视频开始后会变为可用
+                # 返回 error 状态，不要伪造成 ok（upcoming 会变化，不是永久失败）
+                if is_upcoming_event_error(error_msg):
+                    logger.info(f"视频为预约/首播状态（临时）: {url} — {error_msg}")
                     return VideoInfoResult(
                         status='error',
-                        error_message='yt-dlp extract_info 返回 None（原因未知）',
+                        error_message=f"upcoming: {error_msg}",
                     )
-                
-                return VideoInfoResult(
-                    status='ok',
-                    info={
-                        'video_id': info.get('id', ''),
-                        'title': info.get('title', ''),
-                        'description': info.get('description', ''),
-                        'duration': info.get('duration', 0),
-                        'uploader': info.get('uploader', ''),
-                        'upload_date': info.get('upload_date', ''),
-                        'thumbnail': info.get('thumbnail', ''),
-                        'live_status': info.get('live_status'),
-                        'url': url,
-                    },
-                )
-        except Exception as e:
-            error_msg = str(e)
-            # 预约/首播视频：临时性错误，视频开始后会变为可用
-            # 返回 error 状态，不要伪造成 ok（upcoming 会变化，不是永久失败）
-            if is_upcoming_event_error(error_msg):
-                logger.info(f"视频为预约/首播状态（临时）: {url} — {error_msg}")
-                return VideoInfoResult(
-                    status='error',
-                    error_message=f"upcoming: {error_msg}",
-                )
-            if is_video_permanently_unavailable(error_msg):
-                logger.info(f"视频永久不可用: {url} — {error_msg}")
-                return VideoInfoResult(
-                    status='unavailable',
-                    error_message=error_msg,
-                )
-            else:
-                logger.warning(f"获取视频信息失败（临时性）: {url} — {error_msg}")
-                return VideoInfoResult(
-                    status='error',
-                    error_message=error_msg,
-                )
+                if is_video_permanently_unavailable(error_msg):
+                    logger.info(f"视频永久不可用: {url} — {error_msg}")
+                    return VideoInfoResult(
+                        status='unavailable',
+                        error_message=error_msg,
+                    )
+            finally:
+                if isolated_cookie is not None:
+                    isolated_cookie.unlink(missing_ok=True)
+
+        logger.warning(f"获取视频信息失败（临时性）: {url} — {last_error_msg}")
+        return VideoInfoResult(
+            status='error',
+            error_message=last_error_msg or '无法获取视频信息',
+        )
     
     def check_manual_subtitles(self, url: str, target_lang: str = "ja") -> Dict[str, Any]:
         """
