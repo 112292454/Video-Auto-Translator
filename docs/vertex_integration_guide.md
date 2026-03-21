@@ -227,6 +227,61 @@ HOME=/tmp pytest tests/test_llm_client_vertex.py tests/test_config.py tests/test
   - 能进入真实 `translate` 阶段并调用 Vertex
   - 但长视频翻译过程中出现 `429`、空响应、TLS 握手超时，说明**链路已打通，但稳定性仍需收敛**
 
+### 真实质量对比（历史 AI Studio 结果 vs 当前 Vertex ADC）
+
+后续又做了一轮不覆盖生产结果的真实对比：
+
+- 使用当前默认 Vertex ADC 配置
+- `thread_num=5`
+- 复用 playlist prompt 与 scene prompt
+- 输出保存到独立目录：
+  - `/tmp/vat-vertex-quality-compare/<video_id>/translated.srt`
+  - `/tmp/vat-vertex-quality-compare/<video_id>/quality_compare.json`
+
+对比样本与结果：
+
+| Video ID | Segment Count | Exact Match Ratio | Avg Similarity | 结论 |
+|----------|---------------|-------------------|----------------|------|
+| `0MZfssRTiIQ` | 28 | 0.2857 | 0.7060 | 短视频，整体质量匹配，但极短歧义句存在误译风险 |
+| `-0IeIh3b51M` | 672 | 0.0491 | 0.6369 | 长直播，风格差异明显，但整体语义与口语感匹配 |
+| `0X-nKX6-5z4` | 859 | 0.0896 | 0.6240 | 同时视听类内容，笑声/拟声词写法差异明显，但整体可用 |
+
+人工判断：
+
+- 三条视频的**分段数量完全一致**
+- Vertex 版本与历史 AI Studio 版本**不逐句一致**
+- 主要差异来自：
+  - 口语化程度不同
+  - 笑声 / 拟声词处理不同
+  - 俚语与本地化表达不同
+- 当前没有看到“整体明显变差”的证据
+- 但对极短、歧义强、人名/拟声混淆的句子，Vertex 仍可能出现偶发偏差
+
+这一轮的整体结论是：
+
+- Vertex ADC 的 Gemini 3 Flash **已经可以用于正式翻译**
+- 质量与历史 AI Studio 版本**总体匹配**
+- 但不能期待逐句完全一致
+
+### 真实 5 线程 canary（补充）
+
+除了上面的三条质量对比，还单独跑了一条更接近生产的真实 canary：
+
+- 视频：`e11fsGDFB-E`
+- 阶段：`translate`
+- 认证：`vertex_native + adc`
+- 线程数：`5`
+- 结果：
+  - `20/20` 批次完成
+  - `translated.srt` 成功落盘
+  - CLI 返回“处理完成，全部成功”
+
+这说明：
+
+- `thread_num=5` 在真实长视频上**已经验证可用**
+- 但由于当前样本仍有限，默认值仍保守维持在 `3`
+- 若后续更多长视频都稳定，可以再把默认值上调到 `5`
+
 ## 7. Benchmark 说明
 
 现有的 `scripts/translation_benchmark.py` 现在已经支持：
@@ -314,3 +369,29 @@ Google 官方文档并没有给出 Gemini 3 Flash 这种共享容量模式下的
 - 给 Vertex 增加更细的空响应日志：把 `promptFeedback` / `finishReason` 记录出来
 - 如果后续 Web UI 有流式显示需求，再单独评估 `streamGenerateContent`
 - 若后续需要统计成本或调试 token 消耗，再考虑把 `usageMetadata` 暴露出来
+
+## 9. 额外 OpenAI-Compatible Endpoint 评估
+
+额外测试了一个候选 OpenAI-compatible 网关：
+
+- Base URL: `http://10.112.116.37:11455/`
+
+实测结果：
+
+- `GET /v1/models`
+  - 只返回 5 个 Claude 模型
+  - 没有 Gemini 模型
+- `POST /v1/chat/completions`
+  - 无论传 `gemini-3-flash-preview`、`gemini-3-flash`、`gemini-3.1-flash-lite-preview`、`gemini-2.5-flash`
+  - 还是传它自己模型列表中存在的 `claude-sonnet-4-6`
+  - 都统一返回：
+
+```json
+{"error":{"message":"Service temporarily unavailable","type":"api_error"}}
+```
+
+结论：
+
+- 当前这个 endpoint **暂时无法用于 Gemini 3 Flash 评估**
+- 甚至连它自己列出的 Claude 模型也返回 `503`
+- 因此当前无法对它的 Gemini 质量或并发能力做有效结论
