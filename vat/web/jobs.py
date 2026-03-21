@@ -65,6 +65,7 @@ class WebJob:
     fail_fast: bool = False
     task_type: str = 'process'       # 'process' | tools 任务类型
     task_params: Optional[Dict] = None  # tools 任务的额外参数
+    cancel_requested: bool = False
     
     @property
     def is_tools_task(self) -> bool:
@@ -92,6 +93,7 @@ class WebJob:
             "fail_fast": self.fail_fast,
             "task_type": self.task_type,
             "task_params": self.task_params or {},
+            "cancel_requested": self.cancel_requested,
         }
         return d
 
@@ -155,6 +157,7 @@ class JobManager:
                 "ALTER TABLE web_jobs ADD COLUMN fail_fast INTEGER DEFAULT 0",
                 "ALTER TABLE web_jobs ADD COLUMN task_type TEXT DEFAULT 'process'",
                 "ALTER TABLE web_jobs ADD COLUMN task_params TEXT DEFAULT '{}'",
+                "ALTER TABLE web_jobs ADD COLUMN cancel_requested INTEGER DEFAULT 0",
             ]:
                 try:
                     cursor.execute(col_sql)
@@ -236,11 +239,17 @@ class JobManager:
                 json.dumps(merged_params),
             ))
         
-        # 启动子进程
-        self._start_job_process(
-            job_id, video_ids, steps, gpu_device, force, log_file,
-            concurrency, upload_cron, fail_fast, task_type, merged_params
-        )
+        try:
+            # 启动子进程
+            self._start_job_process(
+                job_id, video_ids, steps, gpu_device, force, log_file,
+                concurrency, upload_cron, fail_fast, task_type, merged_params
+            )
+        except Exception:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM web_jobs WHERE job_id = ?", (job_id,))
+            raise
         
         logger.info(f"任务已提交: {job_id}, type={task_type}, 步骤: {steps}")
         return job_id
@@ -276,30 +285,46 @@ class JobManager:
         
         # 打开日志文件
         log_fd = open(log_file, "w", buffering=1)  # 行缓冲
-        
-        # 启动子进程（PYTHONUNBUFFERED=1 确保日志实时写入文件，不被缓冲）
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        
-        process = subprocess.Popen(
-            cmd,
-            stdout=log_fd,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,  # 独立进程组，不受父进程影响
-            cwd=str(Path(__file__).parent.parent.parent),  # VAT 项目根目录
-            env=env,
-        )
-        
-        # 更新数据库
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE web_jobs 
-                SET status = ?, pid = ?, started_at = ?
-                WHERE job_id = ?
-            """, (JobStatus.RUNNING.value, process.pid, datetime.now(), job_id))
+        process = None
+        try:
+            # 启动子进程（PYTHONUNBUFFERED=1 确保日志实时写入文件，不被缓冲）
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            
+            process = subprocess.Popen(
+                cmd,
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,  # 独立进程组，不受父进程影响
+                cwd=str(Path(__file__).parent.parent.parent),  # VAT 项目根目录
+                env=env,
+            )
+            
+            # 更新数据库
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE web_jobs 
+                    SET status = ?, pid = ?, started_at = ?
+                    WHERE job_id = ?
+                """, (JobStatus.RUNNING.value, process.pid, datetime.now(), job_id))
+        except Exception:
+            if process is not None:
+                self._terminate_process_group(process.pid)
+            raise
+        finally:
+            log_fd.close()
         
         logger.info(f"任务进程已启动: {job_id}, PID: {process.pid}")
+
+    def _terminate_process_group(self, pid: int) -> None:
+        """终止任务进程组；用于启动失败后的兜底清理。"""
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal.SIGTERM)
+            logger.warning(f"任务启动未完成，已终止遗留子进程组: pid={pid}, pgid={pgid}")
+        except ProcessLookupError:
+            logger.warning(f"任务启动清理时未找到进程: pid={pid}")
     
     @staticmethod
     def _build_process_command(
@@ -467,27 +492,65 @@ class JobManager:
             return [self._row_to_job(row) for row in cursor.fetchall()]
     
     def cancel_job(self, job_id: str) -> bool:
-        """取消任务（发送 SIGTERM）"""
+        """发起取消请求，不在调用线程中阻塞等待子进程退出。"""
+        self.update_job_status(job_id)
         job = self.get_job(job_id)
         if not job or job.status != JobStatus.RUNNING or not job.pid:
             return False
-        
+
         try:
-            os.kill(job.pid, signal.SIGTERM)
-            
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    UPDATE web_jobs 
-                    SET status = ?, finished_at = ?
-                    WHERE job_id = ?
-                """, (JobStatus.CANCELLED.value, datetime.now(), job_id))
-            
-            logger.info(f"任务已取消: {job_id}, PID: {job.pid}")
-            return True
+            pgid = os.getpgid(job.pid)
+            os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError:
-            # 进程已结束
+            # 进程已在退出/已退出，刷新状态后再决定能否视作取消完成。
+            self.update_job_status(job_id)
             return False
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE web_jobs
+                SET cancel_requested = 1
+                WHERE job_id = ?
+            """, (job_id,))
+
+        logger.info(f"已发送取消请求: {job_id}, PID: {job.pid}, PGID: {pgid}")
+        return True
+
+    def _mark_job_cancelled(self, job_id: str, pid: int) -> bool:
+        """将任务标记为已取消。"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE web_jobs 
+                SET status = ?, finished_at = ?
+                WHERE job_id = ?
+            """, (JobStatus.CANCELLED.value, datetime.now(), job_id))
+        
+        logger.info(f"任务已取消: {job_id}, PID: {pid}")
+        return True
+
+    def _is_process_alive(self, pid: int) -> bool:
+        """检查进程是否仍在运行；僵尸进程视为已结束。"""
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # 进程存在但当前进程无权限发送信号。
+            return True
+        try:
+            with open(f"/proc/{pid}/status", "r") as f:
+                status_content = f.read()
+                if "State:\tZ" in status_content:
+                    try:
+                        os.waitpid(pid, os.WNOHANG)
+                    except ChildProcessError:
+                        pass
+                    return False
+        except FileNotFoundError:
+            return False
+        return True
     
     def _parse_progress_from_log(self, log_file: str) -> float:
         """从日志中解析实时进度
@@ -522,28 +585,8 @@ class JobManager:
         job = self.get_job(job_id)
         if not job or job.status != JobStatus.RUNNING or not job.pid:
             return
-        
-        # 检查进程是否真正结束（包括僵尸进程）
-        process_ended = False
-        try:
-            os.kill(job.pid, 0)  # 检查进程是否存在
-            # 进程存在，但可能是僵尸进程，检查 /proc/pid/status
-            try:
-                with open(f"/proc/{job.pid}/status", "r") as f:
-                    status_content = f.read()
-                    if "State:\tZ" in status_content:  # Z = zombie
-                        process_ended = True
-                        # 尝试回收僵尸进程
-                        try:
-                            os.waitpid(job.pid, os.WNOHANG)
-                        except ChildProcessError:
-                            pass
-            except FileNotFoundError:
-                process_ended = True
-        except ProcessLookupError:
-            process_ended = True
-        
-        if not process_ended:
+
+        if self._is_process_alive(job.pid):
             # 进程仍在运行，更新实时进度
             progress = self._parse_progress_from_log(job.log_file)
             if progress > job.progress:
@@ -557,9 +600,12 @@ class JobManager:
         # tools 任务没有 tasks 表记录，无需清理孤儿 task
         if not job.is_tools_task:
             self._cleanup_orphaned_running_tasks(job)
-        
-        # 判定 job 结果
-        status, error, progress = self._determine_job_result(job)
+
+        if job.cancel_requested:
+            status, error, progress = JobStatus.CANCELLED, None, self._parse_progress_from_log(job.log_file)
+        else:
+            # 判定 job 结果
+            status, error, progress = self._determine_job_result(job)
         
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -631,8 +677,8 @@ class JobManager:
             return JobStatus.COMPLETED, None, 1.0
         
         # 查询所有相关视频的任务状态
-        # 对每个视频，检查请求步骤中是否有 failed 状态的任务
-        failed_videos = []  # [(video_id, failed_step, error_message)]
+        # 对每个视频，检查请求步骤中是否存在 failed / missing / incomplete。
+        failed_videos = []  # [(video_id, step, error_message)]
         completed_videos = []
         
         with self._get_connection() as conn:
@@ -668,7 +714,21 @@ class JobManager:
                         failed_videos.append((vid, step_name, info.get('error', '')))
                         break
                 
-                if not has_failed:
+                if has_failed:
+                    continue
+
+                incomplete_steps = []
+                for step_name in requested_steps:
+                    info = step_statuses.get(step_name, {})
+                    if info.get('status') != 'completed':
+                        incomplete_steps.append(step_name)
+
+                if incomplete_steps:
+                    step_name = incomplete_steps[0]
+                    failed_videos.append(
+                        (vid, step_name, f"步骤未完成或缺少任务记录: {step_name}")
+                    )
+                else:
                     completed_videos.append(vid)
         
         total = len(video_ids)
@@ -945,6 +1005,12 @@ class JobManager:
             fail_fast = bool(row['fail_fast'])
         except (IndexError, KeyError):
             fail_fast = False
+
+        # cancel_requested 列可能不存在（旧数据库），安全读取
+        try:
+            cancel_requested = bool(row['cancel_requested'])
+        except (IndexError, KeyError):
+            cancel_requested = False
         
         # task_type 列可能不存在（旧数据库），安全读取
         try:
@@ -978,4 +1044,5 @@ class JobManager:
             fail_fast=fail_fast,
             task_type=task_type,
             task_params=task_params,
+            cancel_requested=cancel_requested,
         )

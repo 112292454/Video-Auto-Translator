@@ -100,6 +100,20 @@ class TestConfigFromDict:
         assert config.storage.work_dir == '/tmp/work'
         assert config.storage.database_path == '/tmp/db.db'
 
+    def test_vertex_adc_llm_config_is_available_without_api_key(self):
+        config = Config.from_dict(_minimal_config_dict(
+            llm={
+                'api_key': '',
+                'base_url': '',
+                'provider': 'vertex_native',
+                'auth_mode': 'adc',
+                'location': 'global',
+                'project_id': 'vertex-490203',
+                'credentials_path': '/home/gzy/.ssh/vat_vertex.json',
+            }
+        ))
+        assert config.llm.is_available() is True
+
 
 class TestYouTubeDownloaderConfig:
     """YouTubeDownloaderConfig 字段测试"""

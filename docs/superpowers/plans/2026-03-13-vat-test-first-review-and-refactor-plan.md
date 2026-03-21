@@ -24,10 +24,16 @@
 
 ## 2. 当前上下文
 
-- 日期：`2026-03-13`
-- 当前分支：`master`
-- 当前工作区不是干净状态，存在多组已跟踪改动和未跟踪新文件。
-- 当前 HEAD：`6f9c5bc docs: 更新全部文档 — 新增 Watch 模式/数据库浏览/直播处理等功能说明`
+- 日期：`2026-03-14`
+- 当前分支：`refactor/test-first-hardening`
+- 当前工作区：`clean`
+- 当前分支尖端提交：`59491f8 test: assert task routes refresh stale status`
+- 当前阶段：`测试补强仍在进行中，尚未进入高争议核心模块的大规模重构`
+- 当前已完成的主线：
+  - Web job 生命周期第一轮契约收口
+  - CLI / pipeline 第一轮阶段语义与 force 失效护栏
+  - `tasks` / `playlists` 路由第一轮 API 契约测试
+  - `PlaylistService.sync_playlist()` 第一轮基础契约测试
 - 当前仓库应用代码与测试代码总量约 `33894` 行。
 - 目录体量最大的区域：`vat/web`、`vat/asr`、`vat/llm`、`tests`。
 
@@ -158,7 +164,7 @@
 ### P0: Web / 外部交互
 
 - `web/jobs.py` 的结果判定过于乐观，早崩子进程可能被误判成功。
-- `cancel_job()` 不保证整个进程组与 GPU 子任务都退出。
+- `cancel_job()` 的旧实现既会把 zombie 误判为“仍存活”，也会在 async 路由中同步阻塞等待。
 - Web 层实际存在大量绕过 CLI/JobManager 的旁路。
 - `BilibiliUploader` 多步远程副作用缺少事务包装、补偿逻辑和统一错误分型。
 - `PlaylistService.sync_playlist()` 缺少 playlist 级原子性。
@@ -216,7 +222,8 @@
 | 长任务入口 | 默认必须通过 `JobManager -> CLI 子进程 -> 核心 pipeline/services` 路径执行 |
 | 允许的旁路 | 仅允许明确标记的只读查询、极薄协调逻辑或文档已声明的例外 |
 | `submit_job` 成功 | 只有在 DB 记录成功且子进程成功启动时才算成功 |
-| `cancel_job` 成功 | 必须确认整个进程组及其 GPU 子任务都已停止，不能只对父 PID 发信号 |
+| `cancel_job` 成功 | 只表示取消请求已被接受并已向目标进程组发出终止信号；不得在 Web 请求线程里阻塞等待退出 |
+| `cancelled` 终态 | 只能在 `update_job_status()` 等状态收敛路径确认子进程已结束后写入，不能在发出取消请求时乐观提前写入 |
 | `update_job_status` | 在证据不足时必须保守，宁可停留在不确定/失败，也不能乐观判完成 |
 | process job 完成 | 必须能证明目标视频集合对应阶段的任务状态满足完成契约 |
 | tools job 完成 | 必须能证明外部副作用或日志结果与任务类型契约一致 |
@@ -464,6 +471,49 @@
 - 关联回归测试转绿。
 - 文档同步后，才能勾选任务完成。
 
+### 6.6 文件 / 函数级测试审计法
+
+从这一轮开始，测试策略进一步收紧：不只按“模块”补测试，还要按“文件 -> 函数 -> 上层调用链”自底向上审计。
+
+执行顺序固定为：
+
+1. 先扫纯函数和数据转换函数。
+2. 再扫单文件内状态推进函数。
+3. 再扫 service / manager 层的组合逻辑。
+4. 再扫 CLI / Web route / JobManager 这类入口层。
+5. 最后补跨层集成与回归测试。
+
+每个文件都必须建立一个最小审计记录，至少回答：
+
+- 这个文件的职责是什么。
+- 这个文件里哪些函数是纯逻辑、哪些是状态推进、哪些是 I/O 边界。
+- 哪些函数已经有直接测试。
+- 哪些函数目前只被上层间接覆盖。
+- 哪些函数完全没有测试。
+- 哪些测试是在“验证需求/契约”，哪些只是“贴实现”。
+
+从现在开始，后续每轮新增测试时，都要在文档或状态回写中至少标出下面四项：
+
+- `文件`
+- `函数/方法`
+- `测试层级`：`unit / contract / integration / regression`
+- `当前状态`：`covered / indirectly_covered / missing / needs_rewrite`
+
+禁止把“被某个大集成测试顺便走到”当成充分覆盖。对于高风险函数，默认要求直接测试，而不是只靠上层路由或命令间接经过。
+
+优先要做函数级审计的文件：
+
+- `vat/models.py`
+- `vat/database.py`
+- `vat/pipeline/executor.py`
+- `vat/web/jobs.py`
+- `vat/web/routes/tasks.py`
+- `vat/web/routes/playlists.py`
+- `vat/services/playlist_service.py`
+- `vat/uploaders/bilibili.py`
+- `vat/translator/llm_translator.py`
+- `vat/embedder/async_embedder.py`
+
 ## 7. 工作区整理计划
 
 这一步先执行，未完成前不进入后续重构。
@@ -609,13 +659,13 @@ Expected: 在现状下能区分“共享配置被污染”和“隔离良好”
 - Modify: `tests/test_web_jobs.py`
 - Modify: `tests/test_tools_job.py`
 - Modify: `tests/test_watch_api.py`
-- Create: `tests/test_web_routes_tasks.py`
-- Create: `tests/test_web_routes_playlists.py`
+- Create: `tests/test_tasks_api.py`
+- Create: `tests/test_playlists_api.py`
 
 - [ ] **Step 1: 给 `JobManager` 补结果判定保守性测试**
 - [ ] **Step 2: 跑红并记录“早崩子进程被误判成功”的失败信号**
-- [ ] **Step 3: 给 `cancel_job()` 补进程组停止语义测试**
-- [ ] **Step 4: 跑红并记录取消语义不足的失败信号**
+- [ ] **Step 3: 给 `cancel_job()` 补“取消请求 / 最终收敛”分离测试**
+- [ ] **Step 4: 跑红并记录 zombie 误判与 async 阻塞的失败信号**
 - [ ] **Step 5: 给 `POST /api/watch/start` 补 API 级测试**
 - [ ] **Step 6: 给 tasks/playlists 关键路由补契约测试**
 
@@ -761,7 +811,7 @@ Run: `pytest tests -q`
 | `translate` 语义漂移 | `vat/models.py` `vat/cli/commands.py` | `tests/test_models.py` `tests/test_pipeline.py` | 能稳定区分“单阶段 translate”和“阶段组 translate” |
 | 共享 `config` 污染 | `vat/pipeline/executor.py` `vat/cli/commands.py` | `tests/test_pipeline.py` | 已有并发场景下配置不串扰测试 |
 | 子进程失败被误判成功 | `vat/web/jobs.py` | `tests/test_web_jobs.py` | 已有早崩/无 task 记录场景测试 |
-| 取消语义不完整 | `vat/web/jobs.py` | `tests/test_web_jobs.py` | 已有进程组停止语义测试 |
+| 取消语义不完整 | `vat/web/jobs.py` `vat/web/routes/tasks.py` | `tests/test_web_jobs.py` `tests/test_tasks_api.py` | 已有“取消请求 / 最终收敛 / route 非阻塞”测试 |
 | playlist sync 非原子 | `vat/services/playlist_service.py` | `tests/test_services.py` 或新增 sync 契约测试 | 已定义中断恢复语义 |
 | season / upload 多步副作用 | `vat/uploaders/bilibili.py` | `tests/test_scheduled_upload.py` `tests/test_bilibili_violation.py` 及新增幂等测试 | 已定义部分成功补偿或恢复规则 |
 | 翻译零容忍失效 | `vat/translator/llm_translator.py` `vat/translator/base.py` | `tests/test_translator_contracts.py` | 已有漏翻即失败测试 |
@@ -782,10 +832,184 @@ Run: `pytest tests -q`
 
 ### 10.1 当前状态
 
-- `当前处理子块`: `Workspace Cleanup`
-- `本轮新增测试`: 无
-- `本轮修复的问题`: 无，当前只在整理工作区与补强主计划文档
-- `下一步`: 确认 Group C 是否可先提交，确认 Group A/B/E 的拆分边界，然后决定是否实际执行清理
+- `当前处理子块`: `Chunk 8: Runtime Contract Hardening`
+- `本轮新增测试`:
+  - `tests/test_async_embedder.py`
+  - `tests/test_cli_process.py`
+  - `tests/test_pipeline.py` 中新增配置隔离与早退恢复契约测试
+  - `tests/test_web_jobs.py` 中新增 process job 结果判定、取消请求收敛与 zombie contract 测试
+  - `tests/test_tasks_api.py`
+  - `tests/test_playlists_api.py`
+  - `tests/test_tools_job.py` 中新增 tools job lifecycle 收敛测试
+  - `tests/test_database_api.py`
+  - `tests/test_cli_process.py` 中新增 `parse_stages` / `process -s` 阶段语义与 `--force` 下游失效契约测试
+  - `tests/test_services.py` 中新增 `sync_playlist()` 基础契约测试
+  - `tests/test_database.py` 中新增连接回滚、锁重试、运行时 output_dir 解析、字段过滤与空 video_id 约束测试
+  - `tests/test_pipeline.py` 中新增 passthrough config 恢复、playlist prompt 自动应用/恢复、`_is_no_speech`、`_is_shorts_video` 的函数级测试
+  - `tests/test_season_sync.py` 中新增 `season_sync()` 的成功、诊断、不一致修复失败路径测试
+  - `tests/test_scheduled_upload.py` 中新增 `_auto_season_sync()` 的“无待同步直接返回 / 失败后自动重试一次”测试
+  - `tests/test_season_title_sync.py` 中新增 `sync_season_episode_titles()` 的无变更跳过、删除失败、部分重加失败、成功后恢复原顺序测试
+  - `tests/test_translator_contracts.py` 中新增 `_set_segments_translated_text()` 的“索引映射正常 / 缺段立即失败”契约测试
+  - `tests/test_translator_contracts.py` 中新增 `LLMTranslator._get_cache_key()` 的 prompt / reflect / context 变更影响缓存键测试
+  - `tests/test_season_sorting.py` 中新增 `_extract_title_index()`、`sort_season_episodes()`、`auto_sort_season()` 的函数级契约测试
+  - `tests/test_translator_contracts.py` 中新增 `BaseTranslator._safe_translate_chunk()` 的缓存命中、写回、SQLite 锁降级测试
+  - `tests/test_services.py` 中新增 `_calc_interpolated_date()` 与 `_process_failed_fetches()` 的失败恢复 helper 测试
+  - `tests/test_services.py` 中新增 `_submit_translate_task()` 的“已有翻译跳过 / force 重翻并更新 metadata”测试
+  - `tests/test_translator_contracts.py` 中新增 `_build_input_with_context()` 的纯 JSON / 带 reference context 拼接格式测试
+  - `tests/test_translator_contracts.py` 中新增 `_validate_llm_response()`、`_validate_optimization_result()`、`_try_realign_shifted_keys()`、`_optimize_chunk()` 的函数级契约测试
+  - `tests/test_bilibili_season_api.py` 中新增 `get_season_episodes()`、`add_to_season()`、`remove_from_season()` 的 API 底座契约测试
+  - `tests/test_bilibili_editing_api.py` 中新增 `edit_video_info()` 的 archive 缺失、videos 为空、公共 API 补 tag/desc、显式参数覆盖测试
+  - `tests/test_bilibili_replace_video.py` 中新增 `replace_video()` 的 archive 缺失、videos 为空、上传后无 filename、公共 API 补全字段、编辑失败返回 False 测试
+  - `tests/test_services.py` 中新增 `get_playlist_videos()/get_pending_videos()/get_completed_videos()/delete_playlist()/refresh_videos()` 的函数级契约测试
+  - `tests/test_bilibili_misc_api.py` 中新增 `delete_video()/get_my_videos()/get_video_detail()/get_archive_detail()/_get_full_desc()/bvid_to_aid()/download_video()` 的 wrapper 契约测试
+  - `tests/test_bilibili_upload_api.py` 中新增 `upload()/upload_with_metadata()/validate_credentials()/list_seasons()/create_season()` 的入口契约测试
+  - `tests/test_services.py` 中新增 `retranslate_videos()` 与 `downloader` property 的函数级契约测试
+  - `tests/test_services.py` 中新增 `sync_playlist(fetch_upload_dates=True)` 的成功补抓与异常回退插值测试
+  - `tests/test_video_info_translator.py` 中新增 `TranslatedVideoInfo` roundtrip 与 `VideoInfoTranslator` helper/translate 契约测试
+  - `tests/test_scene_identifier.py` 中新增 `SceneIdentifier` 的 helper 与 `detect_scene()` 契约测试
+  - `tests/test_upload_template.py` 中新增上传模板渲染与上下文构建测试
+  - `tests/test_upload_config.py` 中新增上传配置加载/保存/update_bilibili 测试
+  - `tests/test_docs_and_defaults.py` 中新增 Web 默认端口与 watch 默认值的一致性测试
+  - `tests/test_video_info_translator.py` 中新增空标题 fail-fast 与 JSON 解析重试测试
+  - `tests/test_scene_identifier.py` 中新增 `_load_scenes_config()` 缺失文件 fallback 与 `detect_scene()` 异常 fallback 测试
+  - `tests/test_upload_template.py` 中新增 `get_available_vars()` 与默认模板渲染测试
+  - `tests/test_upload_config.py` 中新增 `save_upload_config()` 便捷函数测试
+  - `tests/test_services.py` 中新增 `sync_playlist()` 的 playlist_info 为空、entries 无效、auto_add_videos=False 测试
+  - `tests/test_video_info_translator.py` 中新增网络重试与缺少 `title_translated` 时失败测试
+  - `tests/test_scene_identifier.py` 中新增 `_build_system_prompt()` 与空 choices fallback 测试
+  - `tests/test_upload_config.py` 中新增 `load_upload_config()` 与 `get_bilibili_dict()` 测试
+  - `tests/test_upload_template.py` 中新增 `_format_duration()` 测试
+- `本轮修复的问题`:
+  - 已完成工作区清理，按 task 提交现有改动，并在 `refactor/test-first-hardening` 分支开始正式修复。
+  - 修复 `VideoProcessor` 直接持有共享 `config` 的问题；现在在初始化时深拷贝配置，每个 processor 都拥有独立配置副本，避免 `passthrough` 和自动 playlist prompt 覆写跨视频串扰。
+  - 修复 `VideoProcessor.process()` 早退路径的 prompt 泄漏问题；自动 playlist prompt 应用已经纳入同一 `try/finally`，`unavailable` 和 “无待执行步骤” 两类早退也会正确恢复配置。
+  - 修复 `AsyncEmbedderQueue._process_task()` 对 `FFmpegWrapper.embed_subtitle_hard()` 的参数错位；现在通过关键字参数传递 `gpu_device`，不再把 `gpu_id` 错塞进 `progress_callback` 槽位。
+  - 修复 `vat.embedder.async_embedder` 仍依赖旧版数据库接口的问题；异步嵌字队列现已改为使用当前 `Database` / `TaskStep` / `TaskStatus` 回写 `embed` 任务状态，并在 `embed_service` 初始化时显式传入数据库路径与输出根目录。
+  - 修复 `cli process` 对缓存全局配置对象的命令级污染；命令入口现在先复制调用级配置，再应用 playlist prompt，上层 `CONFIG` 缓存不会被单次命令改脏。
+  - 修复 `translate --backend` 的陈旧 CLI 契约；命令现在只接受 `local/online`，并正确映射到 `translator.backend_type`，不再写入不存在的 `default_backend` 字段，同时同样具备调用级配置隔离。
+  - 修复 `cli process --force` 未失效下游阶段的问题；现在会按目标阶段中最早的那个阶段统一调用 `invalidate_downstream_tasks()`，与 Web execute 路径保持一致。
+  - 收紧 `JobManager._determine_job_result()`：进程结束后若某视频缺少任务记录或步骤未完成，不再被乐观判成成功；存在部分完成时返回 `partial_completed`。
+  - 修复 `JobManager.cancel_job()` 的同步阻塞设计；取消现在改为“接受请求并向进程组发送 `SIGTERM`”，不再在 Web 请求线程里等待退出。
+  - 修复 `cancel_job()` / `cancel_task` 的 zombie 与事件循环问题；取消状态通过 `cancel_requested` 持久化，由 `update_job_status()` 在确认子进程结束后收敛为 `cancelled`，`POST /api/tasks/{id}/cancel` 也改为 `asyncio.to_thread(...)` 非阻塞调用。
+  - 收敛 `update_job_status()` 的进程活性判断；僵尸进程现在视为已结束并尝试回收，不再把 zombie 当成“仍在运行”。
+  - 修复 `JobManager.submit_job()` 的原子性缺口；当 `_start_job_process()` 失败时，现在会回滚 `web_jobs` 记录，避免残留脏的 `pending` job。
+  - 修复 `vat/web/routes/database.py` 的 FastAPI 弃用项；`Query(..., regex=...)` 已迁移为 `pattern=`，并补了 API 参数校验测试。
+  - 修复 `vat/web/routes/tasks.py` 的陈旧状态问题；`delete` 与 `retry` 现在都会先 `update_job_status()` 再判定 running，避免已结束任务因陈旧状态被误拦截。
+  - 补齐 `vat/web/routes/tasks.py` 的关键 API 契约测试：覆盖 `parse_steps`、`execute`、`get/list`、`cancel`、`delete`、`retry`，把 stage group 展开、force 下游失效、冲突拒绝、CLI 预览、异步取消与状态刷新语义固定下来。
+  - 补齐 `vat/web/routes/playlists.py` 的第一批 API 契约测试：覆盖 `add/sync/refresh/retranslate` 的后台任务提交、重复提交保护，以及 `sync-status/refresh-status` 的状态映射。
+  - 补齐 tools job 生命周期测试：`update_job_status()` 现在对 `[SUCCESS] / [FAILED] / cancel_requested` 三条收敛路径都有直接测试。
+  - 补齐 `PlaylistService.sync_playlist()` 的基础契约测试：覆盖显式 target playlist ID 归属、已有视频复用关联、不重建视频记录、已有关联 playlist_index 更新等底层语义。
+  - 修复 `PlaylistService.sync_playlist()` 的一个缺陷：已有视频若 `metadata` 恰好为空 dict，会被错误跳过“缺失日期补抓”分支；现在空 metadata 也会正确进入 `videos_missing_date` 检查。
+  - 修复 Web 默认端口漂移：`vat/config.py` 的 `WebConfig`/`Config.from_dict()` fallback 以及 `README.md` / `README_EN.md` / `docs/webui_manual.md` 已统一到 `13579`。
+  - 已完成本轮回归：
+    - `pytest tests/test_pipeline.py tests/test_async_embedder.py tests/test_cli_process.py tests/test_web_jobs.py tests/test_watch_api.py tests/test_scheduled_upload.py tests/test_models.py tests/test_database_api.py -q`
+    - `pytest tests/test_cli_process.py tests/test_models.py tests/test_pipeline.py tests/test_scheduled_upload.py -q`
+    - `pytest tests/test_web_jobs.py tests/test_tasks_api.py tests/test_watch_api.py tests/test_database_api.py -q`
+    - `pytest tests/test_tools_job.py tests/test_playlists_api.py -q`
+    - `pytest tests/test_pipeline.py tests/test_async_embedder.py tests/test_cli_process.py tests/test_web_jobs.py tests/test_tasks_api.py tests/test_watch_api.py tests/test_scheduled_upload.py tests/test_models.py tests/test_database_api.py -q`
+    - `pytest tests/test_pipeline.py tests/test_async_embedder.py tests/test_cli_process.py -q`
+    - `pytest tests/test_playlists_api.py -q`
+    - `pytest tests/test_tools_job.py -q`
+    - `pytest tests/test_services.py -q`
+    - `pytest tests/test_tasks_api.py tests/test_playlists_api.py tests/test_web_jobs.py tests/test_watch_api.py tests/test_database_api.py -q`
+    - `pytest tests/test_web_jobs.py tests/test_tasks_api.py tests/test_playlists_api.py tests/test_tools_job.py tests/test_watch_api.py tests/test_database_api.py tests/test_pipeline.py tests/test_async_embedder.py tests/test_cli_process.py -q`
+    - `pytest tests/test_services.py tests/test_tasks_api.py tests/test_playlists_api.py tests/test_web_jobs.py tests/test_watch_api.py tests/test_database_api.py -q`
+    - `pytest tests/test_pipeline.py tests/test_async_embedder.py tests/test_cli_process.py tests/test_web_jobs.py tests/test_tasks_api.py tests/test_playlists_api.py tests/test_watch_api.py tests/test_database_api.py -q`
+    - `HOME=/tmp pytest tests/test_database.py -q`
+    - `HOME=/tmp pytest tests/test_pipeline.py -q`
+    - `HOME=/tmp pytest tests/test_models.py tests/test_database.py tests/test_pipeline.py -q`
+    - `HOME=/tmp pytest tests/test_season_sync.py -q`
+    - `HOME=/tmp pytest tests/test_scheduled_upload.py tests/test_season_sync.py -q`
+    - `HOME=/tmp pytest tests/test_tools_job.py tests/test_scheduled_upload.py tests/test_season_sync.py -q`
+    - `HOME=/tmp pytest tests/test_season_title_sync.py -q`
+    - `HOME=/tmp pytest tests/test_bilibili_violation.py tests/test_tools_job.py tests/test_scheduled_upload.py tests/test_season_sync.py tests/test_season_title_sync.py -q`
+    - `HOME=/tmp pytest tests/test_translator_contracts.py tests/test_translator_error_handling.py -q`
+    - `HOME=/tmp pytest tests/test_translator_contracts.py tests/test_translator_error_handling.py tests/test_vertex_translation_flow.py -q`
+    - `HOME=/tmp pytest tests/test_season_sorting.py -q`
+    - `HOME=/tmp pytest tests/test_bilibili_violation.py tests/test_tools_job.py tests/test_scheduled_upload.py tests/test_season_sync.py tests/test_season_title_sync.py tests/test_season_sorting.py -q`
+    - `HOME=/tmp pytest tests/test_translator_contracts.py -q`
+    - `HOME=/tmp pytest tests/test_translator_contracts.py tests/test_translator_error_handling.py tests/test_vertex_translation_flow.py -q`
+    - `HOME=/tmp pytest tests/test_services.py -q`
+    - `HOME=/tmp pytest tests/test_video_info_translator.py tests/test_scene_identifier.py -q`
+    - `HOME=/tmp pytest tests/test_upload_template.py tests/test_upload_config.py -q`
+    - `HOME=/tmp pytest tests/test_docs_and_defaults.py -q`
+    - `HOME=/tmp pytest tests/test_config.py tests/test_docs_and_defaults.py -q`
+    - `HOME=/tmp pytest tests/test_video_info_translator.py tests/test_scene_identifier.py tests/test_upload_template.py tests/test_upload_config.py -q`
+    - `HOME=/tmp pytest tests/test_services.py tests/test_translator_contracts.py tests/test_video_info_translator.py tests/test_scene_identifier.py tests/test_upload_template.py tests/test_upload_config.py tests/test_bilibili_upload_api.py tests/test_bilibili_misc_api.py tests/test_bilibili_season_api.py tests/test_bilibili_editing_api.py tests/test_bilibili_replace_video.py tests/test_bilibili_violation.py tests/test_tools_job.py tests/test_scheduled_upload.py tests/test_season_sync.py tests/test_season_title_sync.py tests/test_season_sorting.py tests/test_docs_and_defaults.py tests/test_config.py -q`
+    - `HOME=/tmp pytest tests --collect-only -q`
+    - `HOME=/tmp pytest tests/test_services.py tests/test_video_info_translator.py tests/test_scene_identifier.py -q`
+    - `HOME=/tmp pytest tests/test_translator_contracts.py -q`
+    - `HOME=/tmp pytest tests/test_translator_contracts.py tests/test_translator_error_handling.py tests/test_vertex_translation_flow.py -q`
+    - `HOME=/tmp pytest tests/test_bilibili_season_api.py -q`
+    - `HOME=/tmp pytest tests/test_bilibili_editing_api.py -q`
+    - `HOME=/tmp pytest tests/test_bilibili_replace_video.py -q`
+    - `HOME=/tmp pytest tests/test_bilibili_season_api.py tests/test_bilibili_editing_api.py tests/test_bilibili_replace_video.py tests/test_bilibili_violation.py tests/test_tools_job.py tests/test_scheduled_upload.py tests/test_season_sync.py tests/test_season_title_sync.py tests/test_season_sorting.py -q`
+    - `HOME=/tmp pytest tests/test_services.py -q`
+    - `HOME=/tmp pytest tests/test_bilibili_misc_api.py -q`
+    - `HOME=/tmp pytest tests/test_bilibili_upload_api.py -q`
+    - `HOME=/tmp pytest tests/test_bilibili_upload_api.py tests/test_bilibili_misc_api.py tests/test_bilibili_season_api.py tests/test_bilibili_editing_api.py tests/test_bilibili_replace_video.py tests/test_bilibili_violation.py tests/test_tools_job.py tests/test_scheduled_upload.py tests/test_season_sync.py tests/test_season_title_sync.py tests/test_season_sorting.py -q`
+    - `HOME=/tmp pytest tests/test_services.py -q`
+- `下一步`: 继续自底向上补剩余高风险模块测试，优先是阶段语义漂移、playlist/upload/season 的原子性，以及翻译零容忍契约
+
+补充说明：
+
+- 当前累计的高价值子集回归已经稳定通过，最近一次大子集结果为 `437 passed`。
+- `pytest tests --collect-only -q` 已成功收集 `777` 条测试。
+- `pytest tests -q` 已启动过，但在本轮观察窗口内未收口，因此不能宣称“全量测试已通过”。
+
+### 10.2 规划文档当前状态
+
+这份规划文档相较最初版本，已经不再是“待完善草案”，而是当前正式执行中的主控文档。
+
+当前判断：
+
+- `契约基线`: 已基本成型，可以直接指导后续实现与 review。
+- `测试优先总策略`: 已成型，并已在多个子块实际执行验证。
+- `状态回写机制`: 已成型，但后续还要继续按轮次更新。
+- `文件 / 函数级测试审计台账`: 已立项并写入本计划，下一轮开始要按此方式持续落地。
+- `高争议重构规划`: 仍未完成，必须等更底层测试护栏补齐后再进入。
+
+因此，本规划文件当前状态应视为：
+
+- `已完成 70% 的长期执行基线定义`
+- `已进入持续维护状态，而不是继续大改结构的草案阶段`
+- `后续新增内容以状态更新、测试审计台账、风险收口记录为主`
+
+后续记录方式固定为三类：
+
+1. `状态回写`
+   - 写进 `10.1 当前状态`
+2. `测试审计进展`
+   - 按 `6.6 文件 / 函数级测试审计法` 追加
+3. `高风险模块收口记录`
+   - 当某个模块进入“可重构”状态时，在风险映射表和当前状态中同时更新
+
+### 10.3 当前文件 / 函数级测试审计进展
+
+这一节从 `models.py -> database.py -> executor.py` 的底层链开始维护，只记录“已经实际审过并补过测试”的文件。
+
+| 文件 | 本轮已审函数/方法 | 测试层级 | 当前状态 | 备注 |
+|---|---|---|---|---|
+| `vat/models.py` | `expand_stage_group` `get_required_stages` `Video.__post_init__` `Task.__post_init__` `Playlist.__post_init__` | `unit / contract` | `partially_covered` | 阶段语义主路径已有测试；后续仍可补显式时间戳保留与枚举 coercion 边界 |
+| `vat/database.py` | `get_connection` `_retry_on_locked` `add_video` `get_video` `_row_to_video` `update_video` | `unit / contract` | `covered_this_round` | 已补事务回滚、锁重试、运行时 output_dir 解析、字段过滤、空 video_id 约束 |
+| `vat/pipeline/executor.py` | `VideoProcessor.process` `_resolve_stage_gaps` `_set_passthrough_config` `_restore_passthrough_config` `_auto_apply_playlist_prompts` `_restore_playlist_prompts` `_is_no_speech` `_is_shorts_video` | `unit / contract / regression` | `covered_this_round` | 仍有大量 stage 实现函数未做直接函数级测试，但辅助控制逻辑这一轮已下探 |
+| `vat/uploaders/bilibili.py` | `season_sync` `sync_season_episode_titles` | `contract / regression` | `covered_this_round` | 已补成功同步、upload 已完成但无 aid 诊断、aid 查无、DB/合集不一致修复失败回写，以及删后重加标题同步的主要成功/失败路径；后续继续下探排序/删除组合原子性与真正补偿策略 |
+| `vat/translator/base.py` | `_set_segments_translated_text` `_safe_translate_chunk` | `contract / regression` | `covered_this_round` | 已收紧为“缺少任何翻译段即立即失败”，并补了缓存命中、写回、SQLite 锁降级的直接测试 |
+| `vat/translator/llm_translator.py` | `_get_cache_key` `_build_input_with_context` `_validate_llm_response` `_validate_optimization_result` `_try_realign_shifted_keys` `_optimize_chunk` | `contract / regression` | `covered_this_round` | 已补 prompt / reflect / context 缓存键、上下文输入格式、响应验证、优化验证、错位自动修复和优化反馈循环收敛路径 |
+| `vat/uploaders/bilibili.py` | `_extract_title_index` `sort_season_episodes` `auto_sort_season` | `unit / contract` | `covered_this_round` | 已补标题编号提取、缺失 aid 直接失败、未列出视频自动补尾、顺序已正确时跳过排序、新增视频已在末尾时跳过排序 |
+| `vat/services/playlist_service.py` | `_calc_interpolated_date` `_process_failed_fetches` `_submit_translate_task` `get_playlist_videos` `get_pending_videos` `get_completed_videos` `delete_playlist` `refresh_videos` `retranslate_videos` `downloader` `sync_playlist(fetch_upload_dates=True)` | `unit / contract` | `covered_this_round` | 已补日期插值、失败恢复、视频信息翻译调度，以及选择/删除/刷新/补抓日期/重翻译主路径的关键契约 |
+| `vat/uploaders/bilibili.py` | `get_season_episodes` `add_to_season` `remove_from_season` `edit_video_info` `replace_video` | `unit / contract / regression` | `covered_this_round` | 已补合集 API 底座、编辑 payload 组合、replace_video 两阶段失败返回语义；真正的远端补偿策略仍待后续设计 |
+| `vat/uploaders/bilibili.py` | `upload` `upload_with_metadata` `validate_credentials` `list_seasons` `create_season` `delete_video` `get_my_videos` `get_video_detail` `get_archive_detail` `_get_full_desc` `bvid_to_aid` `download_video` | `unit / contract` | `covered_this_round` | 上传器常规入口与常见 wrapper 现已补到位，剩余重点更多是补偿设计而非明显缺测试 |
+| `vat/llm/video_info_translator.py` | `TranslatedVideoInfo.to_dict/from_dict` `_strip_uploader_prefix` `_normalize_translations` `_build_zones_info` `translate` | `unit / contract` | `covered_this_round` | 已补 roundtrip、旧字段兼容、标题前缀剥离、译名规范化、JSON markdown 解析和重试 |
+| `vat/llm/scene_identifier.py` | `_load_scenes_config` `_is_valid_scene` `_get_scene_name` `_get_default_scene` `get_scene_prompts` `detect_scene` | `unit / contract` | `covered_this_round` | 已补缺失配置 fallback、有效/无效输出、异常 fallback 与默认场景收敛 |
+| `vat/uploaders/template.py` | `TemplateRenderer.render/get_available_vars` `build_upload_context` `render_upload_metadata` | `unit / contract` | `covered_this_round` | 已补模板渲染、未知变量保留、上下文字段构建和默认模板行为 |
+| `vat/uploaders/upload_config.py` | `UploadConfigManager.load/save/update_bilibili` `save_upload_config` | `unit / contract` | `covered_this_round` | 已补默认加载、save/load roundtrip、嵌套模板更新和便捷保存函数 |
+
+本节的维护规则：
+
+- 只有真正新增或重写了测试后，才更新状态。
+- `partially_covered` 不等于“可以停止”，而是表示已经进入函数级审计。
+- `covered_this_round` 仅表示本轮新增了直接测试，不表示该文件已无缺口。
 
 ## 11. 进入下一阶段的门槛
 
@@ -816,10 +1040,12 @@ Run: `pytest tests -q`
 
 ## 12. 当前建议的立即执行项
 
-- [ ] 先做工作区分组确认，不提交、不重构。
-- [ ] 然后校验并修订当前文档中的阶段契约表、状态机不变量表、Web/Job 契约表。
-- [ ] 然后先补核心状态机测试和 Web Job 生命周期测试。
-- [ ] 在这些测试稳定之前，不进入任何架构重构。
+- [x] 先做工作区分组确认，不提交、不重构。
+- [x] 整理并提交当前工作区，确保重要脚本和文档进入 git。
+- [x] 切换到新的开发分支开始正式实现。
+- [x] 先补最小 runtime 契约测试，修复 async embedder 参数错位与批量 process 配置复用。
+- [ ] 继续补核心状态机测试和 Web Job 生命周期测试。
+- [ ] 在 `web/jobs.py` 与上传/同步链路进入重构前，先补早崩、取消、远端副作用恢复等约束测试。
 
 ## 13. 备注
 

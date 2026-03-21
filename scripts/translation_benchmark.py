@@ -36,6 +36,22 @@ from vat.llm.prompts import get_prompt
 
 logger = logging.getLogger("translation_benchmark")
 
+
+def _default_google_proxy() -> str:
+    """Google / Vertex 系列模型默认代理。
+
+    优先级：
+    1. VAT_BENCHMARK_GOOGLE_PROXY
+    2. HTTPS_PROXY / https_proxy
+    3. 历史默认值 http://localhost:7990
+    """
+    return (
+        os.environ.get("VAT_BENCHMARK_GOOGLE_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or "http://localhost:7990"
+    )
+
 # ============================================================
 # 模型配置注册表
 # 每个模型一个 dict，包含 name/model/api_key/base_url/proxy
@@ -181,25 +197,36 @@ MODEL_CONFIGS = {
         "model": "gemini-3-flash-preview",
         "api_key": os.environ.get("VAT_GOOGLE_APIKEY", ""),
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "proxy": "http://localhost:7990",
+        "proxy": _default_google_proxy(),
     },
     "gemini-3.1-flash-lite": {
         "model": "gemini-3.1-flash-lite-preview",
         "api_key": os.environ.get("VAT_GOOGLE_APIKEY", ""),
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "proxy": "http://localhost:7990",
+        "proxy": _default_google_proxy(),
     },
     "gemini-2.5-flash": {
         "model": "gemini-2.5-flash",
         "api_key": os.environ.get("VAT_GOOGLE_APIKEY", ""),
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "proxy": "http://localhost:7990",
+        "proxy": _default_google_proxy(),
     },
     "gemini-2.5-flash-lite": {
         "model": "gemini-2.5-flash-lite",
         "api_key": os.environ.get("VAT_GOOGLE_APIKEY", ""),
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-        "proxy": "http://localhost:7990",
+        "proxy": _default_google_proxy(),
+    },
+    "gemini-3-flash-vertex": {
+        "model": "gemini-3-flash-preview",
+        "api_key": os.environ.get("VAT_VERTEX_APIKEY", os.environ.get("VAT_GOOGLE_APIKEY", "")),
+        "base_url": "",
+        "proxy": _default_google_proxy(),
+        "provider": "vertex_native",
+        "auth_mode": "api_key",
+        "location": "global",
+        "project_id": "",
+        "credentials_path": "",
     },
 }
 
@@ -211,6 +238,54 @@ RESULTS_DIR = Path(__file__).resolve().parent / "translation_benchmark_results"
 
 # 中文提示词目录
 ZH_PROMPTS_DIR = Path(__file__).resolve().parent / "translation_benchmark_prompts"
+
+
+_RUNTIME_ENV_KEYS = [
+    "VAT_LLM_PROVIDER",
+    "VAT_VERTEX_AUTH_MODE",
+    "VAT_VERTEX_LOCATION",
+    "VAT_VERTEX_PROJECT_ID",
+    "VAT_VERTEX_CREDENTIALS",
+]
+
+
+def _apply_model_runtime_env(config: dict) -> dict:
+    """为本次 benchmark 运行设置 provider 相关环境变量，并返回旧值快照。"""
+    previous = {key: os.environ.get(key) for key in _RUNTIME_ENV_KEYS}
+
+    provider = config.get("provider", "openai_compatible")
+    os.environ["VAT_LLM_PROVIDER"] = provider
+
+    if provider == "vertex_native":
+        os.environ["VAT_VERTEX_AUTH_MODE"] = config.get("auth_mode", "api_key")
+        os.environ["VAT_VERTEX_LOCATION"] = config.get("location", "global")
+
+        project_id = config.get("project_id", "")
+        credentials_path = config.get("credentials_path", "")
+
+        if project_id:
+            os.environ["VAT_VERTEX_PROJECT_ID"] = project_id
+        else:
+            os.environ.pop("VAT_VERTEX_PROJECT_ID", None)
+
+        if credentials_path:
+            os.environ["VAT_VERTEX_CREDENTIALS"] = credentials_path
+        else:
+            os.environ.pop("VAT_VERTEX_CREDENTIALS", None)
+    else:
+        for key in _RUNTIME_ENV_KEYS[1:]:
+            os.environ.pop(key, None)
+
+    return previous
+
+
+def _restore_runtime_env(previous: dict) -> None:
+    """恢复 benchmark 前的 provider 相关环境变量。"""
+    for key, value in previous.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 def _install_zh_prompt_patch():
@@ -330,212 +405,270 @@ def run_benchmark(
         )
 
     config = MODEL_CONFIGS[model_name]
+    runtime_env_snapshot = _apply_model_runtime_env(config)
     
-    # 火山引擎模型：注入 thinking=disabled 参数以避免reasoning导致的巨大延迟
-    # kimi-k2.5 默认走thinking路径（34s/call），关闭后降至0.7s/call，与DashScope持平
-    # 方案：patch get_or_create_client，对火山引擎的 client wrap 其 create 方法
-    if config.get("base_url", "").startswith("https://ark.cn-beijing.volces.com"):
-        import vat.llm.client as llm_client_mod
-        _original_get_or_create = llm_client_mod.get_or_create_client
-        
-        def _patched_get_or_create(*args, **kwargs):
-            client = _original_get_or_create(*args, **kwargs)
-            # 只 patch 一次：检查是否已 patch
-            if getattr(client, '_volc_thinking_disabled', False):
+    try:
+        # 火山引擎模型：注入 thinking=disabled 参数以避免reasoning导致的巨大延迟
+        # kimi-k2.5 默认走thinking路径（34s/call），关闭后降至0.7s/call，与DashScope持平
+        # 方案：patch get_or_create_client，对火山引擎的 client wrap 其 create 方法
+        if config.get("base_url", "").startswith("https://ark.cn-beijing.volces.com"):
+            import vat.llm.client as llm_client_mod
+            _original_get_or_create = llm_client_mod.get_or_create_client
+            
+            def _patched_get_or_create(*args, **kwargs):
+                client = _original_get_or_create(*args, **kwargs)
+                # 只 patch 一次：检查是否已 patch
+                if getattr(client, '_volc_thinking_disabled', False):
+                    return client
+                base_url_str = str(client.base_url)
+                if 'ark.cn-beijing.volces.com' in base_url_str:
+                    _orig_create = client.chat.completions.create
+                    def _create_no_thinking(*a, **kw):
+                        kw.setdefault('extra_body', {})
+                        kw['extra_body']['thinking'] = {'type': 'disabled'}
+                        return _orig_create(*a, **kw)
+                    client.chat.completions.create = _create_no_thinking
+                    client._volc_thinking_disabled = True
                 return client
-            base_url_str = str(client.base_url)
-            if 'ark.cn-beijing.volces.com' in base_url_str:
-                _orig_create = client.chat.completions.create
-                def _create_no_thinking(*a, **kw):
-                    kw.setdefault('extra_body', {})
-                    kw['extra_body']['thinking'] = {'type': 'disabled'}
-                    return _orig_create(*a, **kw)
-                client.chat.completions.create = _create_no_thinking
-                client._volc_thinking_disabled = True
-            return client
+            
+            llm_client_mod.get_or_create_client = _patched_get_or_create
+            logger.info("已安装火山引擎 thinking=disabled 补丁（via get_or_create_client）")
         
-        llm_client_mod.get_or_create_client = _patched_get_or_create
-        logger.info("已安装火山引擎 thinking=disabled 补丁（via get_or_create_client）")
-    
-    # 中转站模型：强制 stream=true 适配
-    # 该中转站 API 要求 stream 必须为 true，否则返回错误
-    # 方案：wrap client.create，强制 stream=True，收集 chunks 拼装为非流式响应
-    if config.get("base_url", "").startswith("http://81.70.32.82"):
-        import vat.llm.client as llm_client_mod
-        from openai.types.chat import ChatCompletion, ChatCompletionMessage
-        from openai.types.chat.chat_completion import Choice
-        _original_get_or_create_proxy = llm_client_mod.get_or_create_client
-        
-        def _patched_get_or_create_proxy(*args, **kwargs):
-            client = _original_get_or_create_proxy(*args, **kwargs)
-            if getattr(client, '_proxy_stream_patched', False):
+        # 中转站模型：强制 stream=true 适配
+        # 该中转站 API 要求 stream 必须为 true，否则返回错误
+        # 方案：wrap client.create，强制 stream=True，收集 chunks 拼装为非流式响应
+        if config.get("base_url", "").startswith("http://81.70.32.82"):
+            import vat.llm.client as llm_client_mod
+            from openai.types.chat import ChatCompletion, ChatCompletionMessage
+            from openai.types.chat.chat_completion import Choice
+            _original_get_or_create_proxy = llm_client_mod.get_or_create_client
+            
+            def _patched_get_or_create_proxy(*args, **kwargs):
+                client = _original_get_or_create_proxy(*args, **kwargs)
+                if getattr(client, '_proxy_stream_patched', False):
+                    return client
+                base_url_str = str(client.base_url)
+                if '81.70.32.82' in base_url_str:
+                    _orig_create = client.chat.completions.create
+                    def _create_with_stream(*a, **kw):
+                        kw['stream'] = True
+                        stream = _orig_create(*a, **kw)
+                        # 收集所有 chunk 的 content
+                        content_parts = []
+                        model_name_resp = kw.get('model', 'unknown')
+                        resp_id = None
+                        for chunk in stream:
+                            if not resp_id and hasattr(chunk, 'id'):
+                                resp_id = chunk.id
+                            if not chunk.choices:
+                                continue
+                            delta = chunk.choices[0].delta
+                            if hasattr(delta, 'content') and delta.content:
+                                content_parts.append(delta.content)
+                        # 拼装为 ChatCompletion 格式
+                        full_content = "".join(content_parts)
+                        return ChatCompletion(
+                            id=resp_id or "proxy-stream",
+                            object="chat.completion",
+                            created=0,
+                            model=model_name_resp,
+                            choices=[Choice(
+                                index=0,
+                                message=ChatCompletionMessage(
+                                    role="assistant",
+                                    content=full_content,
+                                ),
+                                finish_reason="stop",
+                            )],
+                        )
+                    client.chat.completions.create = _create_with_stream
+                    client._proxy_stream_patched = True
                 return client
-            base_url_str = str(client.base_url)
-            if '81.70.32.82' in base_url_str:
-                _orig_create = client.chat.completions.create
-                def _create_with_stream(*a, **kw):
-                    kw['stream'] = True
-                    stream = _orig_create(*a, **kw)
-                    # 收集所有 chunk 的 content
-                    content_parts = []
-                    model_name_resp = kw.get('model', 'unknown')
-                    resp_id = None
-                    for chunk in stream:
-                        if not resp_id and hasattr(chunk, 'id'):
-                            resp_id = chunk.id
-                        if not chunk.choices:
-                            continue
-                        delta = chunk.choices[0].delta
-                        if hasattr(delta, 'content') and delta.content:
-                            content_parts.append(delta.content)
-                    # 拼装为 ChatCompletion 格式
-                    full_content = "".join(content_parts)
-                    return ChatCompletion(
-                        id=resp_id or "proxy-stream",
-                        object="chat.completion",
-                        created=0,
-                        model=model_name_resp,
-                        choices=[Choice(
-                            index=0,
-                            message=ChatCompletionMessage(
-                                role="assistant",
-                                content=full_content,
-                            ),
-                            finish_reason="stop",
-                        )],
-                    )
-                client.chat.completions.create = _create_with_stream
-                client._proxy_stream_patched = True
-            return client
+            
+            llm_client_mod.get_or_create_client = _patched_get_or_create_proxy
+            logger.info("已安装中转站 stream=true 适配补丁")
         
-        llm_client_mod.get_or_create_client = _patched_get_or_create_proxy
-        logger.info("已安装中转站 stream=true 适配补丁")
-    
-    # 安装中文提示词补丁
-    if prompt_lang == "zh":
-        _install_zh_prompt_patch()
-    
-    # 准备输出目录
-    dir_suffix = model_name
-    if prompt_lang == "zh":
-        dir_suffix += "_zh"
-    if sample_count == 0:
-        dir_suffix += "_full"
-    if tag:
-        dir_suffix += f"_{tag}"
-    output_dir = RESULTS_DIR / video_id / dir_suffix
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 加载输入数据
-    asr_data = load_and_sample_srt(video_id, sample_count)
-    
-    # 保存采样输入（方便回溯）
-    input_srt = RESULTS_DIR / video_id / "input.srt"
-    if not input_srt.exists():
-        input_srt.parent.mkdir(parents=True, exist_ok=True)
-        asr_data.save(str(input_srt))
-        logger.info(f"保存采样输入: {input_srt}")
-    
-    # 读取自定义 prompt
-    if prompt_lang == "zh":
-        # 中文版 custom prompt
-        custom_translate_prompt_file = ZH_PROMPTS_DIR / "custom_translate_fubuki_zh.md"
-        custom_optimize_prompt_file = ZH_PROMPTS_DIR / "custom_optimize_fubuki_zh.md"
-    else:
-        # 英文版（与 config/default.yaml 中的 fubuki 一致）
-        custom_translate_prompt_file = PROJECT_ROOT / "vat/llm/prompts/custom/translate/fubuki.md"
-        custom_optimize_prompt_file = PROJECT_ROOT / "vat/llm/prompts/custom/optimize/fubuki.md"
-    # 如果指定了自定义翻译prompt路径，使用它
-    if custom_translate_prompt_path:
-        ctp = Path(custom_translate_prompt_path)
-        if not ctp.exists():
-            raise FileNotFoundError(f"自定义翻译prompt文件不存在: {ctp}")
-        custom_translate_prompt = ctp.read_text(encoding="utf-8")
-        logger.info(f"  使用自定义翻译prompt: {ctp}")
-    else:
-        custom_translate_prompt = custom_translate_prompt_file.read_text(encoding="utf-8") if custom_translate_prompt_file.exists() else ""
-    custom_optimize_prompt = custom_optimize_prompt_file.read_text(encoding="utf-8") if custom_optimize_prompt_file.exists() else ""
-    
-    # 温度覆盖（translate阶段的_agent_loop默认temp=1.0，通过monkey-patch注入）
-    if temperature != 1.0:
-        import vat.translator.llm_translator as translator_mod
-        _original_call_llm = translator_mod.call_llm
-        def _temp_override_call_llm(*args, **kwargs):
-            kwargs['temperature'] = temperature
-            return _original_call_llm(*args, **kwargs)
-        translator_mod.call_llm = _temp_override_call_llm
-        logger.info(f"  已注入温度覆盖: {temperature}")
-    
-    logger.info(f"=== 开始测试模型: {model_name} (prompt_lang={prompt_lang}) ===")
-    logger.info(f"  模型: {config['model']}")
-    logger.info(f"  Base URL: {config['base_url']}")
-    logger.info(f"  提示词语言: {prompt_lang}")
-    logger.info(f"  温度: {temperature}")
-    logger.info(f"  批大小: {batch_size}")
-    logger.info(f"  字幕条数: {len(asr_data)}")
-    logger.info(f"  输出目录: {output_dir}")
-    
-    start_time = time.time()
-    
-    # 混合方案：如果提供了预优化输入，直接加载它跳过optimize
-    if optimized_input_path:
-        opt_input = Path(optimized_input_path)
-        if not opt_input.exists():
-            raise FileNotFoundError(f"预优化字幕文件不存在: {opt_input}")
-        optimized_data = ASRData.from_subtitle_file(str(opt_input))
-        # 采样同样数量
-        if sample_count > 0 and len(optimized_data.segments) > sample_count:
-            optimized_data = ASRData(optimized_data.segments[:sample_count])
-        opt_elapsed = 0
-        skip_optimize = True
-        logger.info(f"使用预优化输入: {opt_input} ({len(optimized_data)} 条)")
-    
-    # 创建 translator（用于 optimize）
-    if not skip_optimize:
-        logger.info("--- 阶段 1: Optimize ---")
-        opt_start = time.time()
+        # 安装中文提示词补丁
+        if prompt_lang == "zh":
+            _install_zh_prompt_patch()
         
-        optimizer = LLMTranslator(
+        # 准备输出目录
+        dir_suffix = model_name
+        if prompt_lang == "zh":
+            dir_suffix += "_zh"
+        if sample_count == 0:
+            dir_suffix += "_full"
+        if tag:
+            dir_suffix += f"_{tag}"
+        output_dir = RESULTS_DIR / video_id / dir_suffix
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 加载输入数据
+        asr_data = load_and_sample_srt(video_id, sample_count)
+        
+        # 保存采样输入（方便回溯）
+        input_srt = RESULTS_DIR / video_id / "input.srt"
+        if not input_srt.exists():
+            input_srt.parent.mkdir(parents=True, exist_ok=True)
+            asr_data.save(str(input_srt))
+            logger.info(f"保存采样输入: {input_srt}")
+        
+        # 读取自定义 prompt
+        if prompt_lang == "zh":
+            # 中文版 custom prompt
+            custom_translate_prompt_file = ZH_PROMPTS_DIR / "custom_translate_fubuki_zh.md"
+            custom_optimize_prompt_file = ZH_PROMPTS_DIR / "custom_optimize_fubuki_zh.md"
+        else:
+            # 英文版（与 config/default.yaml 中的 fubuki 一致）
+            custom_translate_prompt_file = PROJECT_ROOT / "vat/llm/prompts/custom/translate/fubuki.md"
+            custom_optimize_prompt_file = PROJECT_ROOT / "vat/llm/prompts/custom/optimize/fubuki.md"
+        # 如果指定了自定义翻译prompt路径，使用它
+        if custom_translate_prompt_path:
+            ctp = Path(custom_translate_prompt_path)
+            if not ctp.exists():
+                raise FileNotFoundError(f"自定义翻译prompt文件不存在: {ctp}")
+            custom_translate_prompt = ctp.read_text(encoding="utf-8")
+            logger.info(f"  使用自定义翻译prompt: {ctp}")
+        else:
+            custom_translate_prompt = custom_translate_prompt_file.read_text(encoding="utf-8") if custom_translate_prompt_file.exists() else ""
+        custom_optimize_prompt = custom_optimize_prompt_file.read_text(encoding="utf-8") if custom_optimize_prompt_file.exists() else ""
+        
+        # 温度覆盖（translate阶段的_agent_loop默认temp=1.0，通过monkey-patch注入）
+        if temperature != 1.0:
+            import vat.translator.llm_translator as translator_mod
+            _original_call_llm = translator_mod.call_llm
+            def _temp_override_call_llm(*args, **kwargs):
+                kwargs['temperature'] = temperature
+                return _original_call_llm(*args, **kwargs)
+            translator_mod.call_llm = _temp_override_call_llm
+            logger.info(f"  已注入温度覆盖: {temperature}")
+        
+        logger.info(f"=== 开始测试模型: {model_name} (prompt_lang={prompt_lang}) ===")
+        logger.info(f"  模型: {config['model']}")
+        logger.info(f"  Base URL: {config['base_url']}")
+        logger.info(f"  提示词语言: {prompt_lang}")
+        logger.info(f"  温度: {temperature}")
+        logger.info(f"  批大小: {batch_size}")
+        logger.info(f"  字幕条数: {len(asr_data)}")
+        logger.info(f"  输出目录: {output_dir}")
+        
+        start_time = time.time()
+        
+        # 混合方案：如果提供了预优化输入，直接加载它跳过optimize
+        if optimized_input_path:
+            opt_input = Path(optimized_input_path)
+            if not opt_input.exists():
+                raise FileNotFoundError(f"预优化字幕文件不存在: {opt_input}")
+            optimized_data = ASRData.from_subtitle_file(str(opt_input))
+            # 采样同样数量
+            if sample_count > 0 and len(optimized_data.segments) > sample_count:
+                optimized_data = ASRData(optimized_data.segments[:sample_count])
+            opt_elapsed = 0
+            skip_optimize = True
+            logger.info(f"使用预优化输入: {opt_input} ({len(optimized_data)} 条)")
+        
+        # 创建 translator（用于 optimize）
+        if not skip_optimize:
+            logger.info("--- 阶段 1: Optimize ---")
+            opt_start = time.time()
+            
+            optimizer = LLMTranslator(
+                thread_num=thread_num,
+                batch_num=batch_size,
+                target_language=TargetLanguage.SIMPLIFIED_CHINESE,
+                output_dir=str(output_dir),
+                model=config["model"],
+                custom_translate_prompt=custom_translate_prompt,
+                is_reflect=False,
+                enable_optimize=True,
+                custom_optimize_prompt=custom_optimize_prompt,
+                enable_context=True,
+                api_key=config["api_key"],
+                base_url=config["base_url"],
+                optimize_model=config["model"],
+                optimize_api_key=config["api_key"],
+                optimize_base_url=config["base_url"],
+                proxy=config.get("proxy", ""),
+                optimize_proxy=config.get("proxy", ""),
+            )
+            
+            try:
+                optimized_data = optimizer._optimize_subtitle(asr_data)
+                optimized_srt = output_dir / "optimized.srt"
+                optimized_data.save(str(optimized_srt))
+                opt_elapsed = time.time() - opt_start
+                logger.info(f"Optimize 完成: {len(optimized_data)} 条, 耗时 {opt_elapsed:.1f}s")
+            except Exception as e:
+                logger.error(f"Optimize 失败: {e}")
+                import traceback
+                traceback.print_exc()
+                optimized_data = asr_data  # fallback 到原文
+                opt_elapsed = time.time() - opt_start
+            finally:
+                optimizer.stop()
+        else:
+            optimized_data = asr_data
+            opt_elapsed = 0
+        
+        # optimize_only 模式：只跑 optimize，跳过 translate
+        if optimize_only:
+            total_elapsed = time.time() - start_time
+            meta = {
+                "model_name": model_name,
+                "model": config["model"],
+                "base_url": config["base_url"],
+                "video_id": video_id,
+                "sample_count": len(asr_data),
+                "skip_optimize": skip_optimize,
+                "optimize_only": True,
+                "optimize_time_sec": round(opt_elapsed, 1),
+                "total_time_sec": round(total_elapsed, 1),
+                "timestamp": datetime.now().isoformat(),
+                "prompt_lang": prompt_lang,
+                "tag": tag,
+            }
+            meta_path = output_dir / "meta.json"
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info(f"=== Optimize-only 完成: {model_name}, 耗时 {total_elapsed:.1f}s ===")
+            logger.info(f"  optimized.srt: {output_dir / 'optimized.srt'}")
+            return True
+
+        # 创建 translator（用于 translate）
+        logger.info("--- 阶段 2: Translate (reflect mode) ---")
+        trans_start = time.time()
+        
+        translator = LLMTranslator(
             thread_num=thread_num,
             batch_num=batch_size,
             target_language=TargetLanguage.SIMPLIFIED_CHINESE,
             output_dir=str(output_dir),
             model=config["model"],
             custom_translate_prompt=custom_translate_prompt,
-            is_reflect=False,
-            enable_optimize=True,
-            custom_optimize_prompt=custom_optimize_prompt,
+            is_reflect=not skip_reflect,  # reflect或standard模式
+            enable_optimize=False,   # optimize 已单独跑过
+            custom_optimize_prompt="",
             enable_context=True,
             api_key=config["api_key"],
             base_url=config["base_url"],
-            optimize_model=config["model"],
-            optimize_api_key=config["api_key"],
-            optimize_base_url=config["base_url"],
             proxy=config.get("proxy", ""),
-            optimize_proxy=config.get("proxy", ""),
         )
         
         try:
-            optimized_data = optimizer._optimize_subtitle(asr_data)
-            optimized_srt = output_dir / "optimized.srt"
-            optimized_data.save(str(optimized_srt))
-            opt_elapsed = time.time() - opt_start
-            logger.info(f"Optimize 完成: {len(optimized_data)} 条, 耗时 {opt_elapsed:.1f}s")
+            translated_data = translator.translate_subtitle(optimized_data)
+            trans_elapsed = time.time() - trans_start
+            logger.info(f"Translate 完成: {len(translated_data)} 条, 耗时 {trans_elapsed:.1f}s")
         except Exception as e:
-            logger.error(f"Optimize 失败: {e}")
+            logger.error(f"Translate 失败: {e}")
             import traceback
             traceback.print_exc()
-            optimized_data = asr_data  # fallback 到原文
-            opt_elapsed = time.time() - opt_start
+            translated_data = None
+            trans_elapsed = time.time() - trans_start
         finally:
-            optimizer.stop()
-    else:
-        optimized_data = asr_data
-        opt_elapsed = 0
-    
-    # optimize_only 模式：只跑 optimize，跳过 translate
-    if optimize_only:
+            translator.stop()
+        
         total_elapsed = time.time() - start_time
+        
+        # 保存元信息
         meta = {
             "model_name": model_name,
             "model": config["model"],
@@ -543,81 +676,27 @@ def run_benchmark(
             "video_id": video_id,
             "sample_count": len(asr_data),
             "skip_optimize": skip_optimize,
-            "optimize_only": True,
             "optimize_time_sec": round(opt_elapsed, 1),
+            "translate_time_sec": round(trans_elapsed, 1),
             "total_time_sec": round(total_elapsed, 1),
             "timestamp": datetime.now().isoformat(),
+            "reflect_mode": not skip_reflect,
+            "batch_size": batch_size,
+            "thread_num": thread_num,
             "prompt_lang": prompt_lang,
+            "temperature": temperature,
             "tag": tag,
         }
         meta_path = output_dir / "meta.json"
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        logger.info(f"=== Optimize-only 完成: {model_name}, 耗时 {total_elapsed:.1f}s ===")
-        logger.info(f"  optimized.srt: {output_dir / 'optimized.srt'}")
-        return True
-
-    # 创建 translator（用于 translate）
-    logger.info("--- 阶段 2: Translate (reflect mode) ---")
-    trans_start = time.time()
-    
-    translator = LLMTranslator(
-        thread_num=thread_num,
-        batch_num=batch_size,
-        target_language=TargetLanguage.SIMPLIFIED_CHINESE,
-        output_dir=str(output_dir),
-        model=config["model"],
-        custom_translate_prompt=custom_translate_prompt,
-        is_reflect=not skip_reflect,  # reflect或standard模式
-        enable_optimize=False,   # optimize 已单独跑过
-        custom_optimize_prompt="",
-        enable_context=True,
-        api_key=config["api_key"],
-        base_url=config["base_url"],
-        proxy=config.get("proxy", ""),
-    )
-    
-    try:
-        translated_data = translator.translate_subtitle(optimized_data)
-        trans_elapsed = time.time() - trans_start
-        logger.info(f"Translate 完成: {len(translated_data)} 条, 耗时 {trans_elapsed:.1f}s")
-    except Exception as e:
-        logger.error(f"Translate 失败: {e}")
-        import traceback
-        traceback.print_exc()
-        translated_data = None
-        trans_elapsed = time.time() - trans_start
+        
+        logger.info(f"=== 测试完成: {model_name} ===")
+        logger.info(f"  总耗时: {total_elapsed:.1f}s (optimize: {opt_elapsed:.1f}s, translate: {trans_elapsed:.1f}s)")
+        logger.info(f"  结果目录: {output_dir}")
+        
+        return translated_data is not None
     finally:
-        translator.stop()
-    
-    total_elapsed = time.time() - start_time
-    
-    # 保存元信息
-    meta = {
-        "model_name": model_name,
-        "model": config["model"],
-        "base_url": config["base_url"],
-        "video_id": video_id,
-        "sample_count": len(asr_data),
-        "skip_optimize": skip_optimize,
-        "optimize_time_sec": round(opt_elapsed, 1),
-        "translate_time_sec": round(trans_elapsed, 1),
-        "total_time_sec": round(total_elapsed, 1),
-        "timestamp": datetime.now().isoformat(),
-        "reflect_mode": not skip_reflect,
-        "batch_size": batch_size,
-        "thread_num": thread_num,
-        "prompt_lang": prompt_lang,
-        "temperature": temperature,
-        "tag": tag,
-    }
-    meta_path = output_dir / "meta.json"
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    
-    logger.info(f"=== 测试完成: {model_name} ===")
-    logger.info(f"  总耗时: {total_elapsed:.1f}s (optimize: {opt_elapsed:.1f}s, translate: {trans_elapsed:.1f}s)")
-    logger.info(f"  结果目录: {output_dir}")
-    
-    return translated_data is not None
+        _restore_runtime_env(runtime_env_snapshot)
 
 
 def generate_comparison(video_id: str, sample_count: int = 50):

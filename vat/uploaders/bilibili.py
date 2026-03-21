@@ -819,7 +819,6 @@ class BilibiliUploader(BaseUploader):
         Returns:
             是否成功
         """
-        session = self._get_authenticated_session()
         bili_jct = self.cookie_data.get('bili_jct', '')
         assert bili_jct, "bili_jct 为空，无法调用需要 CSRF 的 API（cookie 未正确加载？）"
         
@@ -868,6 +867,7 @@ class BilibiliUploader(BaseUploader):
                 'Referer': 'https://member.bilibili.com/platform/upload-manager/ep',
                 'Origin': 'https://member.bilibili.com',
             }
+            session = self._get_authenticated_session()
             resp = session.post(
                 f'https://member.bilibili.com/x2/creative/web/season/section/edit?csrf={bili_jct}',
                 json=payload,
@@ -1955,32 +1955,31 @@ def season_sync(db, uploader: BilibiliUploader, playlist_id: str) -> Dict[str, A
     
     if not pending:
         logger.info(f"Playlist {playlist_id}: 没有待同步的视频")
-        return result
-    
-    logger.info(f"Playlist {playlist_id}: 找到 {len(pending)} 个待同步视频")
-    
-    for i, (video, aid, season_id) in enumerate(pending):
-        result['season_ids'].add(season_id)
-        try:
-            add_result = uploader.add_to_season(aid, season_id)
-            if add_result:
-                result['success'] += 1
-                # 更新 DB 标记
-                updated_meta = dict(video.metadata or {})
-                updated_meta['bilibili_season_added'] = True
-                db.update_video(video.id, metadata=updated_meta)
-                logger.info(f"✓ {video.title or video.id} -> 合集 {season_id}")
-            else:
+    else:
+        logger.info(f"Playlist {playlist_id}: 找到 {len(pending)} 个待同步视频")
+        
+        for i, (video, aid, season_id) in enumerate(pending):
+            result['season_ids'].add(season_id)
+            try:
+                add_result = uploader.add_to_season(aid, season_id)
+                if add_result:
+                    result['success'] += 1
+                    # 更新 DB 标记
+                    updated_meta = dict(video.metadata or {})
+                    updated_meta['bilibili_season_added'] = True
+                    db.update_video(video.id, metadata=updated_meta)
+                    logger.info(f"✓ {video.title or video.id} -> 合集 {season_id}")
+                else:
+                    result['failed'] += 1
+                    result['failed_videos'].append(video.id)
+                    logger.warning(f"✗ {video.title or video.id} -> 合集 {season_id} 失败")
+            except Exception as e:
                 result['failed'] += 1
                 result['failed_videos'].append(video.id)
-                logger.warning(f"✗ {video.title or video.id} -> 合集 {season_id} 失败")
-        except Exception as e:
-            result['failed'] += 1
-            result['failed_videos'].append(video.id)
-            logger.error(f"✗ {video.title or video.id} -> 合集 {season_id} 异常: {e}")
-        # B站合集编辑 API 有频率限制（code=20111），请求间需间隔避免触发
-        if i < len(pending) - 1:
-            time.sleep(3)
+                logger.error(f"✗ {video.title or video.id} -> 合集 {season_id} 异常: {e}")
+            # B站合集编辑 API 有频率限制（code=20111），请求间需间隔避免触发
+            if i < len(pending) - 1:
+                time.sleep(3)
     
     # === 诊断：检测有 aid 但 B站找不到的视频 ===
     # 从失败列表中，尝试区分"B站找不到"和"添加接口报错"两种情况
@@ -2245,6 +2244,109 @@ def resync_video_info(
         result['message'] = f'av{aid} edit_video_info 调用失败'
         _cb(f"  ❌ {result['message']}")
     
+    return result
+
+
+def resync_season_video_infos(
+    db: Any,
+    uploader: BilibiliUploader,
+    config: Any,
+    season_id: int,
+    delay_seconds: float = 1.0,
+    callback: Optional[callable] = None,
+) -> Dict[str, Any]:
+    """
+    按合集批量刷新视频元信息。
+
+    复用 ``resync_video_info`` 的 DB 模板渲染与 ``edit_video_info`` 调用链，
+    顺序处理合集中的每个视频，并在请求之间加入短暂等待，避免频繁编辑触发限流。
+
+    Args:
+        db: Database 实例
+        uploader: BilibiliUploader 实例
+        config: 配置对象
+        season_id: B站合集 ID
+        delay_seconds: 相邻视频之间的等待秒数
+        callback: 日志回调（可选）
+
+    Returns:
+        {
+            'success': bool,         # 批处理是否成功执行到结束；单条失败会体现在 failed 中
+            'season_id': int,
+            'refreshed': int,        # 成功同步数量
+            'failed': int,           # 同步失败数量
+            'skipped': int,          # 缺少 aid 等被跳过数量
+            'details': list,         # 每个条目的结果
+            'message': str,
+        }
+    """
+    _cb = callback or (lambda msg: None)
+    result = {
+        'success': False,
+        'season_id': season_id,
+        'refreshed': 0,
+        'failed': 0,
+        'skipped': 0,
+        'details': [],
+        'message': '',
+    }
+
+    season_info = uploader.get_season_episodes(season_id)
+    if not season_info:
+        result['message'] = '无法获取合集信息'
+        _cb(result['message'])
+        return result
+
+    episodes = season_info.get('episodes', [])
+    if not episodes:
+        result['success'] = True
+        result['message'] = f'合集 {season_id} 中暂无视频'
+        _cb(result['message'])
+        return result
+
+    total = len(episodes)
+    _cb(f"开始同步合集 {season_id} 元信息，共 {total} 个视频")
+
+    for idx, ep in enumerate(episodes):
+        aid = ep.get('aid')
+        if not aid:
+            result['skipped'] += 1
+            result['details'].append({
+                'aid': None,
+                'success': False,
+                'title': '',
+                'message': '合集条目缺少 aid，已跳过',
+            })
+            _cb(f"[{idx + 1}/{total}] 缺少 aid，跳过")
+        else:
+            _cb(f"[{idx + 1}/{total}] 开始同步 av{aid}")
+            try:
+                item = resync_video_info(db, uploader, config, int(aid), callback=_cb)
+            except Exception as e:
+                logger.error(f"批量同步合集 {season_id} 的 av{aid} 异常: {e}", exc_info=True)
+                item = {'success': False, 'title': '', 'message': str(e)}
+
+            if item.get('success'):
+                result['refreshed'] += 1
+            else:
+                result['failed'] += 1
+
+            result['details'].append({
+                'aid': int(aid),
+                'success': bool(item.get('success')),
+                'title': item.get('title', ''),
+                'message': item.get('message', ''),
+            })
+
+        if idx < total - 1 and delay_seconds > 0:
+            time.sleep(delay_seconds)
+
+    result['success'] = True
+    result['message'] = (
+        f"合集 {season_id} 元信息同步完成：成功 {result['refreshed']}，"
+        f"失败 {result['failed']}，跳过 {result['skipped']}"
+    )
+    _cb(result['message'])
     return result
 
 

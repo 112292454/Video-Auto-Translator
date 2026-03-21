@@ -2,6 +2,7 @@
 命令行接口实现
 """
 import os
+from copy import deepcopy
 import click
 from pathlib import Path
 from typing import List, Optional
@@ -167,18 +168,18 @@ def asr(ctx, video_id, process_all, force):
 @cli.command()
 @click.option('--video-id', '-v', help='视频ID')
 @click.option('--all', 'process_all', is_flag=True, help='翻译所有已转录但未翻译的视频')
-@click.option('--backend', '-b', type=click.Choice(['local', 'online', 'hybrid']), help='翻译后端')
+@click.option('--backend', '-b', type=click.Choice(['local', 'online']), help='翻译后端（local=本地模型，online=LLM）')
 @click.option('--force', '-f', is_flag=True, help='强制重新处理（即使已完成）')
 @click.pass_context
 def translate(ctx, video_id, process_all, backend, force):
-    """翻译字幕"""
-    config = get_config(ctx.obj.get('config_path'))
+    """翻译字幕（仅执行 translate 阶段，不含 optimize）"""
+    config = deepcopy(get_config(ctx.obj.get('config_path')))
     logger = get_logger()
     db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
     
     # 覆盖后端设置
     if backend:
-        config.translator.default_backend = backend
+        config.translator.backend_type = 'local' if backend == 'local' else 'llm'
     
     # 确定要处理的视频
     if video_id:
@@ -517,7 +518,8 @@ def parse_stages(stages_str: str) -> List[TaskStep]:
     
     支持格式：
     - 单个阶段: "whisper", "translate"
-    - 阶段组: "asr" (展开为 whisper,split), "translate" (展开为 optimize,translate)
+    - 阶段组: "asr" (展开为 whisper,split)
+    - 整组翻译: 显式写 "optimize,translate"
     - 多个阶段: "whisper,split,optimize"
     - 全部: "all"
     """
@@ -551,7 +553,7 @@ def parse_stages(stages_str: str) -> List[TaskStep]:
 @click.option('--all', 'process_all', is_flag=True, help='处理所有待处理的视频')
 @click.option('--playlist', '-p', help='处理指定 Playlist 中的视频')
 @click.option('--stages', '-s', default='all', 
-              help='要执行的阶段（逗号分隔）: download,whisper,split,optimize,translate,embed,upload 或阶段组 asr 或 all')
+              help='要执行的阶段（逗号分隔）: download,whisper,split,optimize,translate,embed,upload；阶段组仅支持 asr；整组翻译请显式写 optimize,translate；all 表示全部')
 @click.option('--gpu', '-g', default='auto',
               help='GPU 设备: auto（自动选择）, cpu, cuda:0, cuda:1 等')
 @click.option('--force', '-f', is_flag=True, help='强制重新处理（即使已完成）')
@@ -577,8 +579,11 @@ def process(ctx, video_id, process_all, playlist, stages, gpu, force, dry_run, c
       # 只执行 ASR 阶段（whisper + split）
       vat process -v VIDEO_ID -s asr
       
-      # 只执行翻译阶段（optimize + translate）
+      # 只执行 translate 单阶段
       vat process -v VIDEO_ID -s translate
+      
+      # 执行整组翻译阶段（optimize + translate）
+      vat process -v VIDEO_ID -s optimize,translate
       
       # 执行特定细粒度阶段
       vat process -v VIDEO_ID -s whisper,split
@@ -589,7 +594,8 @@ def process(ctx, video_id, process_all, playlist, stages, gpu, force, dry_run, c
       # 处理 Playlist 中的所有视频
       vat process -p PLAYLIST_ID -s all
     """
-    config = get_config(ctx.obj.get('config_path'))
+    # 使用调用级副本，避免 playlist prompt 等临时覆写污染全局缓存配置。
+    config = deepcopy(get_config(ctx.obj.get('config_path')))
     logger = get_logger()
     db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
     
@@ -650,6 +656,17 @@ def process(ctx, video_id, process_all, playlist, stages, gpu, force, dry_run, c
     
     # 去重
     video_ids = list(dict.fromkeys(video_ids))
+
+    def _invalidate_requested_downstream_tasks():
+        if not force or not target_steps:
+            return
+
+        first_step = min(
+            target_steps,
+            key=lambda step: DEFAULT_STAGE_SEQUENCE.index(step),
+        )
+        for vid in video_ids:
+            db.invalidate_downstream_tasks(vid, first_step)
     
     # ========== upload-cron 校验与分流 ==========
     if upload_cron:
@@ -685,6 +702,8 @@ def process(ctx, video_id, process_all, playlist, stages, gpu, force, dry_run, c
             return
         
         # 进入定时上传流程
+        if not dry_run:
+            _invalidate_requested_downstream_tasks()
         if upload_mode == 'dtime':
             _run_dtime_uploads(config, db, logger, video_ids, upload_cron, force, dry_run, playlist_id=playlist, batch_size=upload_batch_size)
         else:
@@ -716,6 +735,8 @@ def process(ctx, video_id, process_all, playlist, stages, gpu, force, dry_run, c
         cli_cmd = _generate_process_cli(video_ids, stages, gpu, force)
         logger.info(f"等价 CLI 命令: {cli_cmd}")
         return
+
+    _invalidate_requested_downstream_tasks()
     
     # 设置 GPU
     config.gpu.device = gpu
@@ -752,9 +773,10 @@ def process(ctx, video_id, process_all, playlist, stages, gpu, force, dry_run, c
         logger.info(f"[{idx + 1}/{total}] 开始处理: {title}")
         
         try:
+            video_config = deepcopy(config)
             processor = VideoProcessor(
                 video_id=vid,
-                config=config,
+                config=video_config,
                 gpu_id=gpu_id,
                 force=force,
                 video_index=idx,

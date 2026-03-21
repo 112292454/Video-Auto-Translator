@@ -368,7 +368,7 @@ data/videos/<VIDEO_ID>/
 The Web UI is a visual wrapper around CLI capabilities. All tasks execute via CLI subprocesses, fully decoupled from the web server lifecycle — restarting the web server does not affect running tasks.
 
 ```bash
-# Start (default port 8094)
+# Start (default port 13579)
 vat web
 # Or specify port
 vat web --port 8080

@@ -394,7 +394,7 @@ data/videos/<VIDEO_ID>/
 WebUI 是对 CLI 能力的可视化封装。所有任务通过子进程调用 CLI 执行，与 Web 服务器生命周期完全解耦——Web 服务重启不影响正在运行的任务。
 
 ```bash
-# 启动（默认端口 8094）
+# 启动（默认端口 13579）
 vat web
 # 或指定端口
 vat web --port 8080

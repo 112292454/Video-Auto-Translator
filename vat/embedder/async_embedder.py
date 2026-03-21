@@ -16,7 +16,8 @@ from enum import Enum
 import json
 
 from ..embedder.ffmpeg_wrapper import FFmpegWrapper
-from ..database import SessionLocal, Video, ProcessingStatus
+from ..database import Database
+from ..models import TaskStep, TaskStatus
 from ..utils.logger import setup_logger
 
 
@@ -84,7 +85,9 @@ class AsyncEmbedderQueue:
         self,
         gpu_devices: List[int] = [0],
         max_concurrent_per_gpu: int = 1,
-        persist_file: Optional[Path] = None
+        persist_file: Optional[Path] = None,
+        database_path: Optional[Path] = None,
+        output_base_dir: Optional[Path] = None,
     ):
         """
         初始化异步嵌字队列
@@ -93,10 +96,14 @@ class AsyncEmbedderQueue:
             gpu_devices: 可用GPU设备列表
             max_concurrent_per_gpu: 每个GPU同时处理的任务数
             persist_file: 任务持久化文件路径（用于重启后恢复任务）
+            database_path: 数据库路径（用于回写任务状态）
+            output_base_dir: 输出根目录（Database 构造需要）
         """
         self.gpu_devices = gpu_devices
         self.max_concurrent_per_gpu = max_concurrent_per_gpu
         self.persist_file = persist_file
+        self.database_path = Path(database_path).expanduser() if database_path else None
+        self.output_base_dir = str(Path(output_base_dir).expanduser()) if output_base_dir else ""
         
         # 任务队列
         self.pending_tasks: asyncio.Queue = asyncio.Queue()
@@ -277,19 +284,20 @@ class AsyncEmbedderQueue:
         """
         try:
             # 在线程池中执行同步的 FFmpeg 操作
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
+            gpu_device = f"cuda:{task.gpu_id}" if task.use_gpu else "auto"
             success = await loop.run_in_executor(
                 None,
-                self.ffmpeg.embed_subtitle_hard,
-                task.video_path,
-                task.subtitle_path,
-                task.output_path,
-                task.video_codec,
-                task.audio_codec,
-                task.crf,
-                task.preset,
-                task.use_gpu,
-                task.gpu_id
+                lambda: self.ffmpeg.embed_subtitle_hard(
+                    video_path=task.video_path,
+                    subtitle_path=task.subtitle_path,
+                    output_path=task.output_path,
+                    video_codec=task.video_codec,
+                    audio_codec=task.audio_codec,
+                    crf=task.crf,
+                    preset=task.preset,
+                    gpu_device=gpu_device,
+                ),
             )
             
             if not success:
@@ -305,20 +313,20 @@ class AsyncEmbedderQueue:
     async def _update_database_status(self, task: EmbedTask):
         """更新数据库中的视频状态"""
         try:
-            db = SessionLocal()
-            video = db.query(Video).filter(Video.id == task.video_id).first()
-            
-            if video:
-                if task.status == EmbedTaskStatus.COMPLETED:
-                    video.status = ProcessingStatus.COMPLETED
-                    video.final_video_path = str(task.output_path)
-                elif task.status == EmbedTaskStatus.FAILED:
-                    video.status = ProcessingStatus.FAILED
-                    video.error_message = task.error_message
-                
-                db.commit()
-            
-            db.close()
+            if self.database_path is None:
+                self.logger.warning("未配置 database_path，跳过异步嵌字状态回写")
+                return
+
+            db = Database(str(self.database_path), output_base_dir=self.output_base_dir)
+            if task.status == EmbedTaskStatus.COMPLETED:
+                db.update_task_status(task.video_id, TaskStep.EMBED, TaskStatus.COMPLETED)
+            elif task.status == EmbedTaskStatus.FAILED:
+                db.update_task_status(
+                    task.video_id,
+                    TaskStep.EMBED,
+                    TaskStatus.FAILED,
+                    error_message=task.error_message or "异步嵌字失败",
+                )
         except Exception as e:
             self.logger.error(f"更新数据库状态失败: {e}", exc_info=True)
     
@@ -401,13 +409,17 @@ def get_global_queue() -> AsyncEmbedderQueue:
 def init_global_queue(
     gpu_devices: List[int] = [0],
     max_concurrent_per_gpu: int = 1,
-    persist_file: Optional[Path] = None
+    persist_file: Optional[Path] = None,
+    database_path: Optional[Path] = None,
+    output_base_dir: Optional[Path] = None,
 ):
     """初始化全局队列实例"""
     global _global_queue
     _global_queue = AsyncEmbedderQueue(
         gpu_devices=gpu_devices,
         max_concurrent_per_gpu=max_concurrent_per_gpu,
-        persist_file=persist_file
+        persist_file=persist_file,
+        database_path=database_path,
+        output_base_dir=output_base_dir,
     )
     return _global_queue

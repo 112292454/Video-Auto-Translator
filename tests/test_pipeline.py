@@ -9,12 +9,13 @@ import shutil
 import inspect
 import tempfile
 import logging
+import copy
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from vat.database import Database
 from vat.models import (
-    Video, Task, TaskStep, TaskStatus, SourceType,
+    Video, Task, TaskStep, TaskStatus, SourceType, Playlist,
     DEFAULT_STAGE_SEQUENCE,
 )
 
@@ -237,6 +238,57 @@ def _make_vp(tmp_path, force=False, video_metadata=None):
     return vp, database
 
 
+def _make_real_vp(
+    tmp_path,
+    video_id="test_vid",
+    *,
+    config=None,
+    playlist_metadata=None,
+    playlist_id=None,
+    video_metadata=None,
+):
+    """构造真实初始化的 VideoProcessor，用于验证 config 隔离契约。"""
+    from vat.pipeline.executor import VideoProcessor
+    from vat.config import load_config
+
+    db_path = str(tmp_path / "real.db")
+    database = Database(db_path)
+
+    video = Video(
+        id=video_id,
+        source_type=SourceType.YOUTUBE,
+        source_url=f"https://youtube.com/watch?v={video_id}",
+        title=f"Video {video_id}",
+        output_dir=str(tmp_path / video_id),
+        metadata=video_metadata or {},
+    )
+    database.add_video(video)
+    for step in DEFAULT_STAGE_SEQUENCE:
+        database.add_task(Task(video_id=video_id, step=step, status=TaskStatus.PENDING))
+
+    if playlist_id:
+        database.add_playlist(
+            Playlist(
+                id=playlist_id,
+                title=f"Playlist {playlist_id}",
+                source_url=f"https://youtube.com/playlist?list={playlist_id}",
+                metadata=playlist_metadata or {},
+            )
+        )
+        database.add_video_to_playlist(video_id, playlist_id, playlist_index=1)
+
+    if config is None:
+        config = load_config()
+    config.storage.database_path = db_path
+    config.storage.output_dir = str(tmp_path / "outputs")
+    config.storage.cache_dir = str(tmp_path / "cache")
+
+    processor = VideoProcessor(video_id=video_id, config=config, playlist_id=playlist_id)
+    processor.progress_callback = lambda _msg: None
+    processor._default_progress_callback = processor.progress_callback
+    return processor, database, config
+
+
 class TestProcessOrchestration:
     """VideoProcessor.process() 调度逻辑（mock _run_* 验证编排行为）"""
 
@@ -342,6 +394,12 @@ class TestProcessOrchestration:
         vp._run_embed.assert_called_once()
         # 中间阶段也被执行（直通填充）
         vp._run_whisper.assert_called_once()
+        assert db.get_task("test_vid", TaskStep.DOWNLOAD).status == TaskStatus.COMPLETED
+        assert db.get_task("test_vid", TaskStep.WHISPER).status == TaskStatus.SKIPPED
+        assert db.get_task("test_vid", TaskStep.SPLIT).status == TaskStatus.SKIPPED
+        assert db.get_task("test_vid", TaskStep.OPTIMIZE).status == TaskStatus.SKIPPED
+        assert db.get_task("test_vid", TaskStep.TRANSLATE).status == TaskStatus.SKIPPED
+        assert db.get_task("test_vid", TaskStep.EMBED).status == TaskStatus.COMPLETED
 
     def test_unavailable_video_skips_all(self, tmp_path):
         """不可用视频应跳过所有处理，标记全部完成"""
@@ -437,6 +495,188 @@ class TestPassthroughConfigBackupRestore:
 
         assert vp.config.asr.split.enable == original_split_enable
 
+    def test_restore_passthrough_config_recovers_original_flags(self, tmp_path):
+        vp, _ = _make_vp(tmp_path)
+        original = (
+            vp.config.asr.split.enable,
+            vp.config.translator.llm.optimize.enable,
+            vp.config.translator.skip_translate,
+        )
+
+        vp._set_passthrough_config({"split", "optimize", "translate"})
+
+        assert vp.config.asr.split.enable is False
+        assert vp.config.translator.llm.optimize.enable is False
+        assert vp.config.translator.skip_translate is True
+
+        vp._restore_passthrough_config()
+
+        assert (
+            vp.config.asr.split.enable,
+            vp.config.translator.llm.optimize.enable,
+            vp.config.translator.skip_translate,
+        ) == original
+
+
+class TestConfigIsolationContracts:
+    """VideoProcessor 不应污染调用方共享配置。"""
+
+    def test_video_processor_copies_config_on_init(self, tmp_path):
+        from vat.config import load_config
+
+        shared_config = load_config()
+        original_skip_translate = shared_config.translator.skip_translate
+        original_split_enable = shared_config.asr.split.enable
+
+        processor, _, _ = _make_real_vp(tmp_path, config=shared_config)
+        processor._set_passthrough_config({"split", "translate"})
+
+        assert shared_config.translator.skip_translate == original_skip_translate
+        assert shared_config.asr.split.enable == original_split_enable
+
+    def test_playlist_prompts_restored_on_unavailable_early_return(self, tmp_path):
+        from vat.config import load_config
+
+        shared_config = load_config()
+        original_translate_prompt = copy.deepcopy(shared_config.translator.llm.custom_prompt)
+        original_optimize_prompt = copy.deepcopy(shared_config.translator.llm.optimize.custom_prompt)
+
+        processor, database, _ = _make_real_vp(
+            tmp_path,
+            config=shared_config,
+            playlist_id="PL_PROMPT",
+            playlist_metadata={
+                "custom_prompt_translate": "fubuki",
+                "custom_prompt_optimize": "fubuki",
+            },
+            video_metadata={"unavailable": True},
+        )
+
+        result = processor.process(steps=["download"])
+
+        assert result is True
+        assert shared_config.translator.llm.custom_prompt == original_translate_prompt
+        assert shared_config.translator.llm.optimize.custom_prompt == original_optimize_prompt
+        for step in DEFAULT_STAGE_SEQUENCE:
+            task = database.get_task("test_vid", step)
+            assert task.status == TaskStatus.COMPLETED
+
+    def test_playlist_prompts_restored_when_no_steps_to_run(self, tmp_path):
+        from vat.config import load_config
+
+        shared_config = load_config()
+        original_translate_prompt = copy.deepcopy(shared_config.translator.llm.custom_prompt)
+        original_optimize_prompt = copy.deepcopy(shared_config.translator.llm.optimize.custom_prompt)
+
+        processor, database, _ = _make_real_vp(
+            tmp_path,
+            config=shared_config,
+            playlist_id="PL_DONE",
+            playlist_metadata={
+                "custom_prompt_translate": "fubuki",
+                "custom_prompt_optimize": "fubuki",
+            },
+        )
+
+        for step in DEFAULT_STAGE_SEQUENCE:
+            database.update_task_status("test_vid", step, TaskStatus.COMPLETED)
+
+        result = processor.process(steps=None)
+
+        assert result is True
+        assert shared_config.translator.llm.custom_prompt == original_translate_prompt
+        assert shared_config.translator.llm.optimize.custom_prompt == original_optimize_prompt
+
+
+class TestPlaylistPromptAutoApply:
+    def test_auto_apply_playlist_prompts_for_single_playlist(self, tmp_path):
+        processor, _, _ = _make_real_vp(
+            tmp_path,
+            playlist_id="PL_SINGLE",
+            playlist_metadata={
+                "custom_prompt_translate": "fubuki",
+                "custom_prompt_optimize": "fubuki",
+            },
+        )
+        original_translate = processor.config.translator.llm.custom_prompt
+        original_optimize = processor.config.translator.llm.optimize.custom_prompt
+
+        processor._playlist_id = None
+        processor._auto_apply_playlist_prompts()
+
+        assert processor._prompt_backup is not None
+        assert processor._prompt_backup["translate_custom_prompt"] == original_translate
+        assert processor._prompt_backup["optimize_custom_prompt"] == original_optimize
+
+    def test_auto_apply_playlist_prompts_skips_when_video_has_multiple_playlists(self, tmp_path):
+        processor, database, _ = _make_real_vp(
+            tmp_path,
+            playlist_id="PL_A",
+            playlist_metadata={"custom_prompt_translate": "fubuki"},
+        )
+        database.add_playlist(
+            Playlist(
+                id="PL_B",
+                title="Playlist B",
+                source_url="https://youtube.com/playlist?list=PL_B",
+                metadata={"custom_prompt_translate": "other"},
+            )
+        )
+        database.add_video_to_playlist("test_vid", "PL_B", playlist_index=2)
+        original_translate_prompt = processor.config.translator.llm.custom_prompt
+
+        processor._playlist_id = None
+        processor._auto_apply_playlist_prompts()
+
+        assert processor._prompt_backup is None
+        assert processor.config.translator.llm.custom_prompt == original_translate_prompt
+
+    def test_restore_playlist_prompts_recovers_original_values(self, tmp_path):
+        processor, _, _ = _make_real_vp(
+            tmp_path,
+            playlist_id="PL_RESTORE",
+            playlist_metadata={
+                "custom_prompt_translate": "fubuki",
+                "custom_prompt_optimize": "fubuki",
+            },
+        )
+        original_translate = processor.config.translator.llm.custom_prompt
+        original_optimize = processor.config.translator.llm.optimize.custom_prompt
+
+        processor._playlist_id = None
+        processor._auto_apply_playlist_prompts()
+        processor._restore_playlist_prompts()
+
+        assert processor.config.translator.llm.custom_prompt == original_translate
+        assert processor.config.translator.llm.optimize.custom_prompt == original_optimize
+
+
+class TestVideoMetadataHelpers:
+    def test_is_no_speech_reads_flag_from_latest_video_metadata(self, tmp_path):
+        processor, database, _ = _make_real_vp(
+            tmp_path,
+            video_metadata={"no_speech": False},
+        )
+        database.update_video("test_vid", metadata={"no_speech": True})
+
+        assert processor._is_no_speech() is True
+
+    def test_is_shorts_video_detects_shorts_playlist_suffix(self, tmp_path):
+        processor, database, _ = _make_real_vp(
+            tmp_path,
+            playlist_id="PL_REGULAR",
+        )
+        database.add_playlist(
+            Playlist(
+                id="UC_demo-shorts",
+                title="Shorts",
+                source_url="https://youtube.com/@demo/shorts",
+            )
+        )
+        database.add_video_to_playlist("test_vid", "UC_demo-shorts", playlist_index=2)
+
+        assert processor._is_shorts_video() is True
+
 
 class TestExecuteStepDispatch:
     """_execute_step 步骤分发"""
@@ -458,6 +698,137 @@ class TestExecuteStepDispatch:
         fake_step.value = "nonexistent"
         with pytest.raises(ValueError, match="未知步骤"):
             vp._execute_step(fake_step)
+
+
+class TestDownloadStageContracts:
+    def test_run_download_fails_when_guaranteed_field_missing(self, tmp_path, monkeypatch):
+        from vat.pipeline.exceptions import DownloadError
+
+        processor, _, _ = _make_real_vp(tmp_path)
+        video_file = processor.output_dir / "video.mp4"
+        video_file.write_bytes(b"00")
+
+        class _FakeDownloader:
+            guaranteed_fields = {"title"}
+
+            def download(self, source_url, output_dir, **kwargs):
+                return {
+                    "video_path": str(video_file),
+                    "title": "",
+                    "metadata": {"duration": 120},
+                    "subtitles": {},
+                }
+
+        processor._downloader = _FakeDownloader()
+        monkeypatch.setattr(processor, "_download_thumbnail", lambda *_args, **_kwargs: None)
+
+        with pytest.raises(DownloadError, match="数据契约违反"):
+            processor._run_download()
+
+    def test_run_download_sets_manual_subtitle_source_when_manual_target_sub_exists(self, tmp_path, monkeypatch):
+        processor, db, _ = _make_real_vp(tmp_path)
+        video_file = processor.output_dir / "video.mp4"
+        sub_file = processor.output_dir / "ja.vtt"
+        video_file.write_bytes(b"00")
+        sub_file.write_text("WEBVTT", encoding="utf-8")
+
+        class _FakeDownloader:
+            guaranteed_fields = {"title", "duration"}
+
+            def download(self, source_url, output_dir, **kwargs):
+                return {
+                    "video_path": str(video_file),
+                    "title": "视频标题",
+                    "metadata": {
+                        "duration": 120,
+                        "available_subtitles": ["ja"],
+                        "available_auto_subtitles": [],
+                        "uploader": "频道",
+                    },
+                    "subtitles": {"ja": sub_file},
+                }
+
+        monkeypatch.setattr(processor, "_download_thumbnail", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr("vat.llm.scene_identifier.SceneIdentifier", lambda *args, **kwargs: MagicMock(detect_scene=lambda title, description: {
+            "scene_id": "chatting", "scene_name": "闲聊", "auto_detected": True,
+        }))
+        monkeypatch.setattr("vat.llm.video_info_translator.VideoInfoTranslator", lambda *args, **kwargs: MagicMock(translate=lambda **_kw: SimpleNamespace(
+            to_dict=lambda: {"title_translated": "翻译标题"},
+            recommended_tid_name="日常",
+        )))
+        processor._downloader = _FakeDownloader()
+
+        assert processor._run_download() is True
+        video = db.get_video("test_vid")
+        assert video.metadata["subtitle_source"] == "manual"
+        assert video.metadata["manual_subtitle_path"] == str(sub_file)
+
+    def test_run_download_sets_auto_subtitle_source_when_only_auto_sub_available(self, tmp_path, monkeypatch):
+        processor, db, _ = _make_real_vp(tmp_path)
+        video_file = processor.output_dir / "video.mp4"
+        video_file.write_bytes(b"00")
+
+        class _FakeDownloader:
+            guaranteed_fields = {"title", "duration"}
+
+            def download(self, source_url, output_dir, **kwargs):
+                return {
+                    "video_path": str(video_file),
+                    "title": "视频标题",
+                    "metadata": {
+                        "duration": 120,
+                        "available_subtitles": [],
+                        "available_auto_subtitles": ["ja"],
+                        "uploader": "频道",
+                    },
+                    "subtitles": {},
+                }
+
+        monkeypatch.setattr(processor, "_download_thumbnail", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr("vat.llm.scene_identifier.SceneIdentifier", lambda *args, **kwargs: MagicMock(detect_scene=lambda title, description: {
+            "scene_id": "chatting", "scene_name": "闲聊", "auto_detected": True,
+        }))
+        monkeypatch.setattr("vat.llm.video_info_translator.VideoInfoTranslator", lambda *args, **kwargs: MagicMock(translate=lambda **_kw: SimpleNamespace(
+            to_dict=lambda: {"title_translated": "翻译标题"},
+            recommended_tid_name="日常",
+        )))
+        processor._downloader = _FakeDownloader()
+
+        assert processor._run_download() is True
+        video = db.get_video("test_vid")
+        assert video.metadata["subtitle_source"] == "auto"
+
+    def test_run_download_reuses_existing_translated_video_info_when_not_forced(self, tmp_path, monkeypatch):
+        processor, db, _ = _make_real_vp(tmp_path)
+        db.update_video("test_vid", metadata={"translated": {"title_translated": "旧翻译"}})
+        processor.video = db.get_video("test_vid")
+        video_file = processor.output_dir / "video.mp4"
+        video_file.write_bytes(b"00")
+
+        class _FakeDownloader:
+            guaranteed_fields = {"title", "duration"}
+
+            def download(self, source_url, output_dir, **kwargs):
+                return {
+                    "video_path": str(video_file),
+                    "title": "视频标题",
+                    "metadata": {"duration": 120, "uploader": "频道"},
+                    "subtitles": {},
+                }
+
+        monkeypatch.setattr(processor, "_download_thumbnail", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr("vat.llm.scene_identifier.SceneIdentifier", lambda *args, **kwargs: MagicMock(detect_scene=lambda title, description: {
+            "scene_id": "chatting", "scene_name": "闲聊", "auto_detected": True,
+        }))
+        monkeypatch.setattr(
+            "vat.llm.video_info_translator.VideoInfoTranslator",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not create translator")),
+        )
+        processor._downloader = _FakeDownloader()
+
+        assert processor._run_download() is True
+        video = db.get_video("test_vid")
+        assert video.metadata["translated"] == {"title_translated": "旧翻译"}
 
 
 # ==================== Scheduler download_delay mock 测试 ====================

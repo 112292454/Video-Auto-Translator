@@ -295,11 +295,11 @@ async def cancel_task(
     task_id: str,
     job_manager: JobManager = Depends(get_job_manager)
 ):
-    """取消任务（发送 SIGTERM 到子进程）"""
-    success = job_manager.cancel_job(task_id)
+    """取消任务（异步发起取消请求，不阻塞等待子进程退出）"""
+    success = await asyncio.to_thread(job_manager.cancel_job, task_id)
     if not success:
         raise HTTPException(400, "Task cannot be cancelled")
-    return {"status": "cancelled", "task_id": task_id}
+    return {"status": "cancelling", "task_id": task_id}
 
 
 @router.delete("/{task_id}")
@@ -308,6 +308,7 @@ async def delete_task(
     job_manager: JobManager = Depends(get_job_manager)
 ):
     """删除任务记录（仅已完成/失败/取消的任务）"""
+    job_manager.update_job_status(task_id)
     job = job_manager.get_job(task_id)
     if not job:
         raise HTTPException(404, "Task not found")
@@ -327,6 +328,7 @@ async def retry_task(
     job_manager: JobManager = Depends(get_job_manager)
 ):
     """重新运行任务（基于原任务参数创建新任务）"""
+    job_manager.update_job_status(task_id)
     job = job_manager.get_job(task_id)
     if not job:
         raise HTTPException(404, "Task not found")
