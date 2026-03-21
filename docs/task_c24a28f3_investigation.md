@@ -151,6 +151,45 @@
 但在更精简的 YouTube-only cookie 复测中，问题依然存在。
 所以“混入 Google 域 cookie”最多只能算风险放大因素，不能算唯一根因。
 
+#### 进一步验证：升级 yt-dlp 确实会改变结果
+
+继续排查后，发现“重新安装 / 升级 yt-dlp”在这台机器上并不是无效尝试，而是**真正有效**：
+
+- 当前环境旧版本：`yt-dlp 2026.03.03`
+  - 带 cookie 时：
+    - `extract_info` 仍然 `The page needs to be reloaded`
+    - 当前应用代码只能靠“移除 cookie fallback”继续往下走
+- 在隔离虚拟环境安装 nightly：`yt-dlp 2026.03.17.232108.dev0`
+  - 同一份 `cookies/www.youtube.com_cookies.txt`
+  - 同一代理 `http://localhost:11420`
+  - 对同一视频 `NsueHCfU1Ak`
+    - `--skip-download --cookies ...` 已可成功 `extract_info`
+    - `--test --cookies ... --write-auto-subs --write-subs ...` 已可进入字幕和音视频下载阶段
+    - 最终失败只剩 `--test` 模式特有的“10KiB 截断片段无法 ffmpeg 合并”，不再是 `page reload`
+
+随后已把当前运行环境中的 yt-dlp 升级到 nightly：
+
+- 当前环境版本：`2026.03.17.232108`
+- 升级后再用**当前应用代码**复测：
+  - `YouTubeDownloader._extract_info_with_retry()` 对 `NsueHCfU1Ak` 已可直接使用 cookie 成功，不再先触发 `page reload`
+
+因此这一轮的更准确结论是：
+
+- cookie fallback 仍然应该保留，作为兜底
+- 但真正让“账号态 cookie 路径恢复工作”的决定性因素，是 **yt-dlp 版本升级**
+- 在当前机器上，`2026.03.03` 与 `2026.03.17 nightly` 的行为存在实质差异
+
+#### 认证方式当前建议
+
+结合本地实验和 yt-dlp 官方 wiki：
+
+1. 首选：YouTube-only cookies（无痕窗口单独登录、导出后关闭窗口）
+2. 当前机器无本地浏览器 profile，`--cookies-from-browser chrome/chromium/firefox/edge` 都不可用
+3. 运行时必须使用较新的 yt-dlp（当前已升级到 nightly `2026.03.17.232108`）
+4. 代码层面继续保留：
+   - `page reload -> 去 cookie fallback`
+   - `EOF/network error -> retry`
+
 #### 断句失败是次要问题
 
 仅 `5` 个视频在 `split` 阶段失败，日志中可以对应到：
