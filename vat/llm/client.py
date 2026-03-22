@@ -3,6 +3,7 @@
 import os
 import time
 import threading
+import urllib.parse
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from pathlib import Path
@@ -13,6 +14,7 @@ import google.auth
 import httpx
 import openai
 import requests
+from google.auth import metrics
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
 from openai import OpenAI
@@ -39,6 +41,7 @@ _vertex_token_cache: Dict[str, Tuple[str, Optional[float]]] = {}
 _vertex_token_lock = threading.Lock()
 _VERTEX_TOKEN_REFRESH_SKEW_SEC = 120
 _VERTEX_TOKEN_REFRESH_RETRY_DELAYS_SEC = [1, 2]
+_VERTEX_TOKEN_HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 
 logger = setup_logger("llm_client")
 
@@ -67,6 +70,18 @@ def _resolve_provider(base_url: str = "") -> str:
     if base_url.strip():
         return "openai_compatible"
     return _get_env_provider()
+
+
+def prewarm_vertex_access_token(base_url: str = "", proxy: str = "") -> None:
+    """Best-effort prewarm for Vertex ADC access tokens.
+
+    No-op unless current provider resolves to vertex_native and auth_mode=adc.
+    """
+    if _resolve_provider(base_url) != "vertex_native":
+        return
+    if _get_env_vertex_auth_mode() != "adc":
+        return
+    _get_vertex_access_token(proxy=proxy)
 
 
 def _extract_message_text(content: Any) -> str:
@@ -196,6 +211,57 @@ def _vertex_token_is_fresh(expiry_ts: Optional[float]) -> bool:
     return expiry_ts - now_ts > _VERTEX_TOKEN_REFRESH_SKEW_SEC
 
 
+def _request_service_account_token_httpx(
+    credentials: Any,
+    refresh_proxy: Optional[str],
+) -> Tuple[str, Optional[float]]:
+    token_uri = (
+        getattr(credentials, "_token_uri", "")
+        or getattr(credentials, "token_uri", "")
+        or "https://oauth2.googleapis.com/token"
+    )
+    assertion = credentials._make_authorization_grant_assertion()
+    if isinstance(assertion, bytes):
+        assertion = assertion.decode("utf-8")
+
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        metrics.API_CLIENT_HEADER: metrics.token_request_access_token_sa_assertion(),
+    }
+    body = urllib.parse.urlencode(
+        {
+            "assertion": assertion,
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        }
+    ).encode("utf-8")
+
+    client_kwargs: Dict[str, Any] = {"timeout": _VERTEX_TOKEN_HTTP_TIMEOUT}
+    if refresh_proxy is None:
+        client_kwargs["trust_env"] = False
+    elif refresh_proxy:
+        client_kwargs["proxy"] = refresh_proxy
+        client_kwargs["trust_env"] = False
+
+    with httpx.Client(**client_kwargs) as client:
+        response = client.post(token_uri, content=body, headers=headers)
+        response.raise_for_status()
+        response_data = response.json()
+
+    token = response_data.get("access_token", "")
+    if not token:
+        raise RuntimeError("Vertex ADC 认证失败: token endpoint 未返回 access_token")
+
+    expiry_ts: Optional[float] = None
+    expires_in = response_data.get("expires_in")
+    if expires_in is not None:
+        try:
+            expiry_ts = datetime.now(timezone.utc).timestamp() + int(expires_in)
+        except Exception:
+            expiry_ts = None
+
+    return token, expiry_ts
+
+
 def _get_vertex_access_token(credentials_path: str = "", proxy: str = "") -> str:
     scopes = ["https://www.googleapis.com/auth/cloud-platform"]
     resolved_path = _resolve_vertex_credentials_path(credentials_path)
@@ -219,6 +285,19 @@ def _get_vertex_access_token(credentials_path: str = "", proxy: str = "") -> str
 
         def _refresh_with_proxy(refresh_proxy: Optional[str]):
             credentials = _load_credentials()
+            if (
+                resolved_path
+                and hasattr(credentials, "_make_authorization_grant_assertion")
+            ):
+                token, expiry_ts = _request_service_account_token_httpx(
+                    credentials,
+                    refresh_proxy,
+                )
+                credentials.token = token
+                if expiry_ts is not None:
+                    credentials.expiry = datetime.fromtimestamp(expiry_ts, tz=timezone.utc)
+                return credentials
+
             request_kwargs = {}
             if refresh_proxy is None:
                 session = requests.Session()

@@ -227,3 +227,45 @@ class TestVertexTranslationFlow:
             "publishers/google/models/gemini-2.5-flash:generateContent"
         )
         assert captured["headers"]["Authorization"] == "Bearer test-access-token"
+
+    def test_vertex_adc_translate_prewarms_access_token_before_parallel_work(self, monkeypatch, tmp_path):
+        config = Config.from_dict(
+            _minimal_vertex_config_dict(
+                auth_mode="adc",
+                api_key="",
+                project_id="vertex-490203",
+                credentials_path="/home/gzy/.ssh/vat_vertex.json",
+            )
+        )
+        translator = _create_translator(config, str(tmp_path))
+        token_calls = []
+
+        def fake_get_vertex_access_token(credentials_path="", proxy=""):
+            token_calls.append((credentials_path, proxy))
+            return "test-access-token"
+
+        def fake_post(url, json, headers, timeout, proxy=None):
+            response = MagicMock()
+            response.json.return_value = {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"text": '{"1": "你好"}'}
+                            ]
+                        }
+                    }
+                ]
+            }
+            response.raise_for_status.return_value = None
+            return response
+
+        monkeypatch.setattr("vat.llm.client._get_vertex_access_token", fake_get_vertex_access_token)
+        monkeypatch.setattr("vat.llm.client.httpx.post", fake_post)
+
+        translator.translate_subtitle(
+            ASRData([ASRDataSeg(text="こんにちは", start_time=0, end_time=1000)])
+        )
+
+        # 1 次预热 + 1 次实际请求（后续将命中缓存）
+        assert len(token_calls) == 2

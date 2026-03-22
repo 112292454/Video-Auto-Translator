@@ -300,11 +300,11 @@ proxy:
   # 解析优先级：环节专属 → llm（LLM环节共用） → http_proxy
   # downloader: "http://localhost:11420"                          # 下载器（YouTube 访问） zqm inf
   # llm: ""                                 # 所有 LLM API 调用的默认代理
-  translate: "http://localhost:11400"                           # 翻译 LLM（如 Google API 需特定地区代理） # glados
+  translate: "http://localhost:11401"                           # 翻译 LLM（当前环境下对 Vertex ADC token 刷新更稳定） # glados
   optimize: ""                              # 优化 LLM（火山引擎国内服务，不需要代理）
   # split: ""                               # 断句 LLM
   # scene_identify: ""                      # 场景识别 LLM
-  video_info_translate: "http://localhost:11400"                # 视频信息翻译 LLM
+  video_info_translate: "http://localhost:11401"                # 视频信息翻译 LLM
 
 # =============================================================================
 # Web UI 配置

@@ -216,6 +216,115 @@ class TestVertexNativeClient:
 
 
 class TestVertexAccessTokenProxyContracts:
+    def test_get_vertex_access_token_uses_httpx_for_service_account_credentials(self, monkeypatch):
+        captured = {}
+
+        class FakeCredentials:
+            token = ""
+            expiry = None
+            _token_uri = "https://oauth2.googleapis.com/token"
+
+            def _make_authorization_grant_assertion(self):
+                return b"fake-jwt-assertion"
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"access_token": "httpx-token", "expires_in": 3600}
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                captured["client_kwargs"] = kwargs
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, content=None, headers=None):
+                captured["url"] = url
+                captured["content"] = content
+                captured["headers"] = headers
+                return FakeResponse()
+
+        monkeypatch.setattr("vat.llm.client._vertex_token_cache", {}, raising=False)
+        monkeypatch.setattr("vat.llm.client._resolve_vertex_credentials_path", lambda _path="": "/tmp/fake-sa.json")
+        monkeypatch.setattr(
+            "vat.llm.client.service_account.Credentials.from_service_account_file",
+            lambda path, scopes: FakeCredentials(),
+        )
+        monkeypatch.setattr("vat.llm.client.httpx.Client", FakeClient)
+        monkeypatch.setattr(
+            "vat.llm.client.GoogleAuthRequest",
+            lambda session=None: (_ for _ in ()).throw(AssertionError("should not use google-auth request transport")),
+        )
+
+        token = _get_vertex_access_token("/tmp/fake-sa.json", proxy="http://translate-proxy:7890")
+
+        assert token == "httpx-token"
+        assert captured["url"] == "https://oauth2.googleapis.com/token"
+        assert captured["client_kwargs"]["proxy"] == "http://translate-proxy:7890"
+        assert captured["client_kwargs"]["trust_env"] is False
+        assert b"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer" in captured["content"]
+        assert b"assertion=fake-jwt-assertion" in captured["content"]
+
+    def test_get_vertex_access_token_service_account_retries_without_proxy(self, monkeypatch):
+        warnings = []
+        sleeps = []
+        attempts = []
+
+        class FakeCredentials:
+            token = ""
+            expiry = None
+            _token_uri = "https://oauth2.googleapis.com/token"
+
+            def _make_authorization_grant_assertion(self):
+                return b"fake-jwt-assertion"
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"access_token": "fallback-httpx-token", "expires_in": 3600}
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                attempts.append(kwargs)
+                self._kwargs = kwargs
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, content=None, headers=None):
+                if self._kwargs.get("proxy") == "http://translate-proxy:7890":
+                    raise RuntimeError("proxy httpx token refresh failed")
+                return FakeResponse()
+
+        monkeypatch.setattr("vat.llm.client._vertex_token_cache", {}, raising=False)
+        monkeypatch.setattr("vat.llm.client._resolve_vertex_credentials_path", lambda _path="": "/tmp/fake-sa-fallback.json")
+        monkeypatch.setattr(
+            "vat.llm.client.service_account.Credentials.from_service_account_file",
+            lambda path, scopes: FakeCredentials(),
+        )
+        monkeypatch.setattr("vat.llm.client.httpx.Client", FakeClient)
+        monkeypatch.setattr("vat.llm.client.logger.warning", lambda msg: warnings.append(msg))
+        monkeypatch.setattr("vat.llm.client.time.sleep", lambda seconds: sleeps.append(seconds))
+
+        token = _get_vertex_access_token("/tmp/fake-sa-fallback.json", proxy="http://translate-proxy:7890")
+
+        assert token == "fallback-httpx-token"
+        assert sleeps == [1, 2]
+        assert attempts[-1].get("trust_env") is False
+        assert "proxy" not in attempts[-1]
+        assert any("retry without proxy" in msg for msg in warnings)
+
     def test_get_vertex_access_token_uses_proxy_session_for_refresh(self, monkeypatch):
         captured = {}
 

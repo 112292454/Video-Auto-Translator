@@ -9,7 +9,7 @@ from concurrent.futures import as_completed
 import json_repair
 import openai
 
-from vat.llm import call_llm
+from vat.llm import call_llm, prewarm_vertex_access_token
 from vat.llm.prompts import get_prompt
 from vat.translator.base import BaseTranslator, SubtitleProcessData, logger
 from vat.translator.types import TargetLanguage
@@ -99,6 +99,8 @@ class LLMTranslator(BaseTranslator):
     def translate_subtitle(self, subtitle_data: ASRData) -> ASRData:
         """翻译字幕文件（集成可选的优化前置步骤）"""
         try:
+            prewarm_vertex_access_token(base_url=self.base_url, proxy=self.proxy)
+
             # 1. 可选：字幕优化（内部方法）
             if self.enable_optimize:
                 logger.info("开始字幕优化（LLM Translator 内部）...")
