@@ -53,7 +53,7 @@
 - Modify: `vat/web/app.py`
 - Test: `tests/test_web_app_lifespan.py`
 
-- [ ] **Step 1: 写/改测试，锁定 `app.py` 不再暴露重复 JSON API**
+- [x] **Step 1: 写/改测试，锁定 `app.py` 不再暴露重复 JSON API**
 
 补充测试，直接读取 `FastAPI` 路由表，确认以下旧入口不再注册：
 - `/api/videos`
@@ -68,7 +68,7 @@ pytest tests/test_web_app_lifespan.py -q
 Expected:
 - 先失败，显示路由仍存在或当前断言不满足
 
-- [ ] **Step 2: 修改 `vat/web/app.py`，删除重复 JSON API**
+- [x] **Step 2: 修改 `vat/web/app.py`，删除重复 JSON API**
 
 删除或迁移以下函数：
 - `api_list_videos`
@@ -81,7 +81,7 @@ Expected:
 - `/api/videos/upload-file`
 - `/database`
 
-- [ ] **Step 3: 运行测试验证通过**
+- [x] **Step 3: 运行测试验证通过**
 
 Run:
 ```bash
@@ -97,7 +97,7 @@ Expected:
 - Modify: `vat/web/app.py`
 - Test: `tests/test_web_app_lifespan.py`
 
-- [ ] **Step 1: 改测试，确认 lifespan 不再自动启动同步线程**
+- [x] **Step 1: 改测试，确认 lifespan 不再自动启动同步线程**
 
 把当前仅检查 `_start_auto_sync_thread()` 被调用一次的测试，改为验证：
 - app lifespan 启动时不再调用自动同步线程入口
@@ -110,7 +110,7 @@ pytest tests/test_web_app_lifespan.py -q
 Expected:
 - 先失败，因为当前仍会启动线程
 
-- [ ] **Step 2: 修改 `vat/web/app.py`，移除 `_start_auto_sync_thread()` 调用**
+- [x] **Step 2: 修改 `vat/web/app.py`，移除 `_start_auto_sync_thread()` 调用**
 
 做法：
 - `app_lifespan()` 只保留真正的应用生命周期管理
@@ -120,7 +120,7 @@ Expected:
 - 不在本阶段替代为新的后台机制
 - 先收掉“启动即执行业务副作用”
 
-- [ ] **Step 3: 运行测试验证通过**
+- [x] **Step 3: 运行测试验证通过**
 
 Run:
 ```bash
@@ -140,7 +140,7 @@ Expected:
 - Modify: `vat/web/app.py`
 - Modify: `vat/web/routes/tasks.py`
 
-- [ ] **Step 1: 梳理 `vat/web/app.py` 中直接构造 `JobManager(...)` 的位置**
+- [x] **Step 1: 梳理 `vat/web/app.py` 中直接构造 `JobManager(...)` 的位置**
 
 检查至少这些页面路径：
 - `/video/{video_id}`
@@ -149,13 +149,13 @@ Expected:
 
 记录后续替换点。
 
-- [ ] **Step 2: 将 `vat/web/app.py` 页面层改为复用 `vat.web.routes.tasks.get_job_manager()`**
+- [x] **Step 2: 将 `vat/web/app.py` 页面层改为复用 `vat.web.routes.tasks.get_job_manager()`**
 
 目标：
 - 页面层不再手写 `load_config() + log_dir + JobManager(...)`
 - `JobManager` 构造逻辑在 Web 层只保留一份
 
-- [ ] **Step 3: 回归 `tasks` / `task detail` / `video detail` 相关 API/页面测试**
+- [x] **Step 3: 回归 `tasks` / `task detail` / `video detail` 相关 API/页面测试**
 
 Run:
 ```bash
@@ -202,7 +202,7 @@ Expected:
 - Modify: `vat/web/jobs.py`
 - Test: `tests/test_playlists_api.py`
 
-- [ ] **Step 1: 先写测试，描述目标行为**
+- [x] **Step 1: 先写测试，描述目标行为**
 
 新增/调整测试，确认：
 - `sync-status`
@@ -218,7 +218,7 @@ pytest tests/test_playlists_api.py -q
 Expected:
 - 先失败，暴露当前内存状态依赖
 
-- [ ] **Step 2: 在 `jobs.py` 增加按 `task_type + task_params` 查最近任务的 helper**
+- [x] **Step 2: 在 `jobs.py` 增加按 `task_type + task_params` 查最近任务的 helper**
 
 建议新增能力：
 - 按 playlist scope 查询最近 `sync-playlist`
@@ -228,13 +228,13 @@ Expected:
 注意：
 - 本阶段先用 `task_params` 做 scope，不急着上新表/新字段
 
-- [ ] **Step 3: 替换 `playlists.py` 的 `_sync_status/_refresh_status` 真值路径**
+- [x] **Step 3: 替换 `playlists.py` 的 `_sync_status/_refresh_status` 真值路径**
 
 目标：
 - route 每次现查 job
 - 不再依赖进程内字典保存状态
 
-- [ ] **Step 4: 运行回归**
+- [x] **Step 4: 运行回归**
 
 Run:
 ```bash
@@ -335,4 +335,14 @@ pytest tests/test_database_api.py -q
 
 ---
 
-Plan complete and saved to `docs/superpowers/plans/2026-03-24-phase-a-web-boundary-implementation-plan.md`. Ready to execute.
+## 当前进度
+
+- [x] 清理 `app.py` 中重复的旧 JSON API
+- [x] 移除 Web 启动自动同步线程
+- [x] 页面层统一复用 `get_job_manager()`
+- [x] `playlists.py` 的同步/刷新状态查询已优先走 `web_jobs`
+- [x] `watch.py` 的 `JobManager` 构造逻辑已统一入口
+- [ ] `bilibili.py` 的内存状态真值仍待收口
+- [ ] `Database(...)` 直接构造路径仍未全部收口
+
+Plan saved to `docs/superpowers/plans/2026-03-24-phase-a-web-boundary-implementation-plan.md` and partially executed.

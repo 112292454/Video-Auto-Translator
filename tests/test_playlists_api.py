@@ -27,11 +27,11 @@ def client(app):
     return httpx.AsyncClient(transport=transport, base_url="http://testserver")
 
 
-def _make_job(job_id, status=JobStatus.RUNNING, error=None):
+def _make_job(job_id, status=JobStatus.RUNNING, error=None, task_type="sync-playlist", task_params=None):
     return WebJob(
         job_id=job_id,
         video_ids=[],
-        steps=["sync-playlist"],
+        steps=[task_type],
         gpu_device="auto",
         force=False,
         status=status,
@@ -42,8 +42,8 @@ def _make_job(job_id, status=JobStatus.RUNNING, error=None):
         created_at=datetime(2026, 3, 14, 12, 0, 0),
         started_at=None,
         finished_at=None,
-        task_type="sync-playlist",
-        task_params={},
+        task_type=task_type,
+        task_params=task_params or {},
         cancel_requested=False,
     )
 
@@ -67,6 +67,19 @@ class _FakeJobManager:
 
     def get_log_content(self, job_id, tail_lines=3):
         return self.log_lines.get(job_id, [])
+
+    def find_latest_job(self, task_type, task_params_subset=None, statuses=None, limit=200):
+        expected = task_params_subset or {}
+        allowed = set(statuses or [])
+        for job in self.jobs.values():
+            if job.task_type != task_type:
+                continue
+            if allowed and job.status not in allowed:
+                continue
+            params = job.task_params or {}
+            if all(params.get(key) == value for key, value in expected.items()):
+                return job
+        return None
 
 
 class _FakeDb:
@@ -168,7 +181,11 @@ class TestPlaylistJobRoutes:
     async def test_add_playlist_does_not_resubmit_running_sync_job(self, app, client, monkeypatch):
         fake_db = _FakeDb()
         job_manager = _FakeJobManager()
-        job_manager.jobs["job-running"] = _make_job("job-running", status=JobStatus.RUNNING)
+        job_manager.jobs["job-running"] = _make_job(
+            "job-running",
+            status=JobStatus.RUNNING,
+            task_params={"playlist_id": "UC123-videos"},
+        )
         fake_config = SimpleNamespace(
             downloader=SimpleNamespace(
                 youtube=SimpleNamespace(
@@ -234,7 +251,11 @@ class TestPlaylistJobRoutes:
         fake_db = _FakeDb()
         fake_db.playlists["PL1"] = _make_playlist("PL1")
         job_manager = _FakeJobManager()
-        job_manager.jobs["job-running"] = _make_job("job-running", status=JobStatus.RUNNING)
+        job_manager.jobs["job-running"] = _make_job(
+            "job-running",
+            status=JobStatus.RUNNING,
+            task_params={"playlist_id": "PL1"},
+        )
 
         app.include_router(router)
         app.dependency_overrides[get_db] = lambda: fake_db
@@ -252,7 +273,12 @@ class TestPlaylistJobRoutes:
     @pytest.mark.anyio
     async def test_get_sync_status_maps_running_job_and_prefers_job_error(self, app, client, monkeypatch):
         job_manager = _FakeJobManager()
-        job_manager.jobs["job-1"] = _make_job("job-1", status=JobStatus.FAILED, error="job failed")
+        job_manager.jobs["job-1"] = _make_job(
+            "job-1",
+            status=JobStatus.FAILED,
+            error="job failed",
+            task_params={"playlist_id": "PL1"},
+        )
         job_manager.log_lines["job-1"] = ["older", "latest log line"]
 
         app.include_router(router)
@@ -269,6 +295,27 @@ class TestPlaylistJobRoutes:
             "job_id": "job-1",
         }
         assert job_manager.update_calls == ["job-1"]
+
+    @pytest.mark.anyio
+    async def test_get_sync_status_can_resolve_job_without_legacy_memory_state(self, app, client, monkeypatch):
+        job_manager = _FakeJobManager()
+        job_manager.jobs["job-2"] = _make_job(
+            "job-2",
+            status=JobStatus.RUNNING,
+            task_params={"playlist_id": "PL2"},
+        )
+
+        app.include_router(router)
+        monkeypatch.setattr("vat.web.routes.playlists._get_job_manager", lambda: job_manager)
+        monkeypatch.setattr("vat.web.routes.playlists._sync_status", {})
+
+        async with client as ac:
+            response = await ac.get("/api/playlists/PL2/sync-status")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "syncing"
+        assert response.json()["job_id"] == "job-2"
+        assert job_manager.update_calls == ["job-2"]
 
     @pytest.mark.anyio
     async def test_refresh_playlist_passes_force_flags_to_job_manager(self, app, client, monkeypatch):
@@ -303,7 +350,12 @@ class TestPlaylistJobRoutes:
     @pytest.mark.anyio
     async def test_refresh_status_remaps_syncing_to_refreshing(self, app, client, monkeypatch):
         job_manager = _FakeJobManager()
-        job_manager.jobs["job-refresh"] = _make_job("job-refresh", status=JobStatus.RUNNING)
+        job_manager.jobs["job-refresh"] = _make_job(
+            "job-refresh",
+            status=JobStatus.RUNNING,
+            task_type="refresh-playlist",
+            task_params={"playlist_id": "PL1"},
+        )
 
         app.include_router(router)
         monkeypatch.setattr("vat.web.routes.playlists._get_job_manager", lambda: job_manager)

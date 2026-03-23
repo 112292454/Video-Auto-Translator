@@ -490,6 +490,34 @@ class JobManager:
             """, (limit,))
             
             return [self._row_to_job(row) for row in cursor.fetchall()]
+
+    def find_latest_job(
+        self,
+        task_type: str,
+        task_params_subset: Optional[Dict] = None,
+        statuses: Optional[List[JobStatus]] = None,
+        limit: int = 200,
+    ) -> Optional[WebJob]:
+        """
+        按 task_type + task_params 子集查找最近的任务。
+
+        用于 Web 路由按业务 scope（如 playlist_id）反查后台任务，
+        逐步替代进程内状态字典。
+        """
+        expected_params = task_params_subset or {}
+        allowed_statuses = set(statuses or [])
+
+        for job in self.list_jobs(limit=limit):
+            if job.task_type != task_type:
+                continue
+            if allowed_statuses and job.status not in allowed_statuses:
+                continue
+
+            actual_params = job.task_params or {}
+            if all(actual_params.get(key) == value for key, value in expected_params.items()):
+                return job
+
+        return None
     
     def cancel_job(self, job_id: str) -> bool:
         """发起取消请求，不在调用线程中阻塞等待子进程退出。"""

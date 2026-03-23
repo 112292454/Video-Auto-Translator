@@ -23,6 +23,7 @@ from vat.web.jobs import JobStatus
 
 # 导入路由
 from vat.web.routes import videos_router, playlists_router, tasks_router, files_router, prompts_router, bilibili_router, watch_router, database_router
+from vat.web.routes.tasks import get_job_manager
 
 
 def _start_auto_sync_thread() -> None:
@@ -34,7 +35,6 @@ def _start_auto_sync_thread() -> None:
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
     """FastAPI lifespan 钩子：替代已弃用的 on_event('startup')"""
-    _start_auto_sync_thread()
     yield
 
 
@@ -376,10 +376,7 @@ async def video_detail(request: Request, video_id: str, from_playlist: Optional[
     # 查找正在处理该视频的活跃 job（复用与 get_job_manager 相同的路径）
     active_job_id = None
     try:
-        from vat.web.jobs import JobManager
-        config = load_config()
-        log_dir = Path(config.storage.database_path).parent / "job_logs"
-        job_mgr = JobManager(config.storage.database_path, str(log_dir))
+        job_mgr = get_job_manager()
         active_job = job_mgr.get_running_job_for_video(video_id)
         if active_job:
             active_job_id = active_job.job_id
@@ -592,13 +589,7 @@ async def playlist_detail_page(
 @app.get("/tasks", response_class=HTMLResponse)
 async def tasks_page(request: Request):
     """任务列表页"""
-    from vat.web.jobs import JobManager
-    from vat.config import load_config
-    from pathlib import Path
-    
-    config = load_config()
-    log_dir = Path(config.storage.database_path).parent / "job_logs"
-    job_manager = JobManager(config.storage.database_path, str(log_dir))
+    job_manager = get_job_manager()
     
     # 先更新所有 running 状态 job 的实际状态（含孤儿 task 清理）
     jobs = job_manager.list_jobs(limit=50)
@@ -728,13 +719,7 @@ async def task_new_page_post(request: Request):
 @app.get("/tasks/{task_id}", response_class=HTMLResponse)
 async def task_detail_page(request: Request, task_id: str):
     """任务详情页"""
-    from vat.web.jobs import JobManager
-    from vat.config import load_config
-    from pathlib import Path
-    
-    config = load_config()
-    log_dir = Path(config.storage.database_path).parent / "job_logs"
-    job_manager = JobManager(config.storage.database_path, str(log_dir))
+    job_manager = get_job_manager()
     
     # 更新任务状态
     job_manager.update_job_status(task_id)
@@ -760,48 +745,6 @@ async def task_detail_page(request: Request, task_id: str):
         "request": request,
         "task": task_dict
     })
-
-
-# ==================== API 路由 ====================
-
-@app.get("/api/videos")
-async def api_list_videos():
-    """API: 获取视频列表"""
-    db = get_db()
-    videos = db.list_videos()
-    return [{"id": v.id, "title": v.title, "source_type": v.source_type.value} for v in videos]
-
-
-@app.get("/api/video/{video_id}")
-async def api_get_video(video_id: str):
-    """API: 获取视频详情"""
-    db = get_db()
-    video = db.get_video(video_id)
-    if not video:
-        return JSONResponse({"error": "Video not found"}, status_code=404)
-    
-    tasks = db.get_tasks(video_id)
-    return {
-        "id": video.id,
-        "title": video.title,
-        "source_type": video.source_type.value,
-        "source_url": video.source_url,
-        "metadata": video.metadata,
-        "tasks": [
-            {
-                "step": t.step.value,
-                "status": t.status.value,
-                "error_message": t.error_message
-            } for t in tasks
-        ]
-    }
-
-
-@app.get("/api/stats")
-async def api_stats():
-    """API: 获取统计信息"""
-    db = get_db()
-    return db.get_statistics()
 
 
 @app.get("/prompts", response_class=HTMLResponse)

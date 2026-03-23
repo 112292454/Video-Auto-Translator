@@ -52,6 +52,8 @@ class SyncResultResponse(BaseModel):
     total_videos: int
 
 # 全局同步状态存储
+# 兼容保留：历史上用内存字典记录最近 job_id。
+# 当前路由已优先通过 web_jobs 反查任务，后续可彻底删除。
 _sync_status = {}  # playlist_id -> {status, message, result}
 
 
@@ -119,14 +121,33 @@ def _get_job_manager():
     return get_job_manager()
 
 
-def _query_job_status(status_dict: dict, playlist_id: str) -> dict:
-    """通用的 job 状态查询（从 status_dict 中查找 job_id 并查询 JobManager）"""
-    entry = status_dict.get(playlist_id)
-    if not entry or 'job_id' not in entry:
-        return {"status": "idle", "message": ""}
-    
+def _find_latest_playlist_job(task_type: str, playlist_id: str):
+    """按 playlist_id 反查最近的后台任务。"""
     jm = _get_job_manager()
-    job_id = entry['job_id']
+    job = jm.find_latest_job(
+        task_type=task_type,
+        task_params_subset={"playlist_id": playlist_id},
+    )
+    if job:
+        return job
+
+    # 兼容旧的进程内状态字典（过渡期保留）
+    legacy_status_maps = (_sync_status, _refresh_status, _retranslate_status)
+    for status_map in legacy_status_maps:
+        entry = status_map.get(playlist_id)
+        if entry and 'job_id' in entry:
+            return jm.get_job(entry['job_id'])
+    return None
+
+
+def _query_job_status(task_type: str, playlist_id: str) -> dict:
+    """通用的 job 状态查询（优先通过 web_jobs 反查）。"""
+    jm = _get_job_manager()
+    job = _find_latest_playlist_job(task_type, playlist_id)
+    if not job:
+        return {"status": "idle", "message": ""}
+
+    job_id = job.job_id
     jm.update_job_status(job_id)
     job = jm.get_job(job_id)
     
@@ -154,7 +175,7 @@ def _query_job_status(status_dict: dict, playlist_id: str) -> dict:
 @router.get("/{playlist_id}/sync-status")
 async def get_sync_status(playlist_id: str):
     """获取同步状态（通过 JobManager 查询）"""
-    return _query_job_status(_sync_status, playlist_id)
+    return _query_job_status("sync-playlist", playlist_id)
 
 
 @router.post("", response_model=SyncResponse)
@@ -184,11 +205,11 @@ async def add_playlist(
         playlist_id = resolve_playlist_id(request.url, playlist_info['id'])
         
         # 检查是否已有 running job
-        existing = _sync_status.get(playlist_id, {})
-        if existing.get('job_id'):
+        existing_job = _find_latest_playlist_job("sync-playlist", playlist_id)
+        if existing_job:
             jm = _get_job_manager()
-            jm.update_job_status(existing['job_id'])
-            ej = jm.get_job(existing['job_id'])
+            jm.update_job_status(existing_job.job_id)
+            ej = jm.get_job(existing_job.job_id)
             if ej and ej.status.value == 'running':
                 return SyncResponse(
                     playlist_id=playlist_id,
@@ -229,11 +250,11 @@ async def sync_playlist(
         raise HTTPException(404, "Playlist not found")
     
     # 检查是否已有 running job
-    existing = _sync_status.get(playlist_id, {})
-    if existing.get('job_id'):
+    existing_job = _find_latest_playlist_job("sync-playlist", playlist_id)
+    if existing_job:
         jm = _get_job_manager()
-        jm.update_job_status(existing['job_id'])
-        ej = jm.get_job(existing['job_id'])
+        jm.update_job_status(existing_job.job_id)
+        ej = jm.get_job(existing_job.job_id)
         if ej and ej.status.value == 'running':
             return SyncResponse(
                 playlist_id=playlist_id,
@@ -311,11 +332,11 @@ async def refresh_playlist_videos(
         raise HTTPException(404, "Playlist not found")
     
     # 检查是否已有 running job
-    existing = _refresh_status.get(playlist_id, {})
-    if existing.get('job_id'):
+    existing_job = _find_latest_playlist_job("refresh-playlist", playlist_id)
+    if existing_job:
         jm = _get_job_manager()
-        jm.update_job_status(existing['job_id'])
-        ej = jm.get_job(existing['job_id'])
+        jm.update_job_status(existing_job.job_id)
+        ej = jm.get_job(existing_job.job_id)
         if ej and ej.status.value == 'running':
             return {"status": "refreshing", "message": "刷新已在进行中"}
     
@@ -341,7 +362,7 @@ async def refresh_playlist_videos(
 @router.get("/{playlist_id}/refresh-status")
 async def get_refresh_status(playlist_id: str):
     """获取刷新状态（通过 JobManager 查询）"""
-    result = _query_job_status(_refresh_status, playlist_id)
+    result = _query_job_status("refresh-playlist", playlist_id)
     # 兼容原有的 refreshing 状态名
     if result.get('status') == 'syncing':
         result['status'] = 'refreshing'
