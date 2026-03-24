@@ -383,4 +383,90 @@
 当前判断：
 
 - 这是一刀比较安全的切口，因为它只是在把已有局部状态收成显式 helper。
-- 后续下一刀更可能落在“fetch results -> prune unavailable -> 回写 DB”之间，而不是一开始就去动翻译提交和索引分配。
+- 随后又继续拆出了：
+  - `_prune_sync_candidates_after_fetch()`
+  - `_collect_fetch_results()`
+- 现在 `sync_playlist()` 的前三段已经开始显式化：
+  1. 候选集规划
+  2. fetch 结果收集
+  3. fetch 后裁剪
+- 后续下一刀更可能落在“最终落库 -> 下游翻译/索引分配”之间，而不是再回头把前面重新揉回主流程。
+
+## 19. sync_playlist 功能需求与边界基线
+
+进入 `playlist_service.sync_playlist()` 的后续重构前，需要先把我们真正想保住的功能表现写清楚。下面这些不是“当前代码恰好这样”，而是当前应被视为需求基线的行为。
+
+### 19.1 主功能目标
+
+`sync_playlist()` 的目标不是“重建整个 playlist”，而是：
+
+- 以增量方式同步 playlist 成员
+- 保持已有 video 记录尽量稳定
+- 对需要补抓信息的成员补全 metadata
+- 对永久不可用成员做保守清理
+- 最终让 playlist 的成员、日期、顺序索引和后续翻译触发保持一致
+
+### 19.2 应保持的核心行为
+
+1. **增量优先，不做激进删除**
+   - 新视频应新增到 DB/playlist 关联中
+   - 已存在视频不应因为普通 sync 被重建或重复插入
+
+2. **playlist_index 可以更新，但 video 身份不能漂**
+   - 已存在成员的 `playlist_index` 可以按本次 playlist 顺序更新
+   - 但 video 记录本身应复用原记录
+
+3. **新视频与旧视频的处理策略不同**
+   - 新视频：允许创建 video 记录和 playlist 关联
+   - 已存在视频：重点是更新关联、补抓 metadata、必要时清理残留半状态
+
+4. **metadata 补抓必须区分永久失败和暂时失败**
+   - `unavailable`：可以标记不可用，并参与清理/跳过逻辑
+   - `error`：只能做插值/保守回退，不能直接当成永久不可用
+
+5. **永久不可用的新成员不能进入稳定真值**
+   - 新发现但已判定永久不可用的视频，不应作为有效新成员落库
+
+6. **中断残留必须能被识别和清理**
+   - 已存在但 `upload_order_index=0`、又被判定永久不可用的残留成员，应视为“上次 sync 半状态遗留”
+   - 清理时要保守：如果该 video 还属于其他 playlist，只移除当前 playlist 关联，不删全局 video
+
+7. **日期插值只是保守回退，不是真实日期**
+   - 插值日期用于维持排序和后续流程可继续推进
+   - 一旦后续拿到真实 `upload_date`，必须覆盖插值值并清掉 `upload_date_interpolated`
+
+8. **翻译触发属于成功 metadata 获取后的下游动作**
+   - 只有拿到成功 video_info 后才提交异步翻译
+   - 不应把翻译逻辑混进候选规划或 unavailable 清理阶段
+
+9. **upload_order_index 的分配是增量式的**
+   - 只给本轮真正需要分配的新成员分配
+   - 不应因为一次 sync 就全量重排已有稳定索引
+
+### 19.3 当前明确要覆盖的边界情况
+
+- playlist info 获取失败：直接报错，不进入部分写入
+- entry 为 `None` 或缺 `id`：跳过，不污染候选计划
+- 已存在 video 但属于新 playlist：允许只新增关联，不重建 video
+- 已存在 video 需要补抓 metadata：进入补抓计划，而不是当作普通 existing 直接跳过
+- 永久不可用的新成员：禁止进入稳定成员集合
+- 永久不可用的 stale zero-index 成员：只清理当前 playlist 残留，必要时保留全局 video
+- 暂时性获取失败：保留成员，插值日期，不标记 `unavailable`
+- 真实 metadata 回补成功：清除 `unavailable` / `unavailable_reason` / `upload_date_interpolated`
+- 显式 `target_playlist_id`：优先于 yt-dlp 返回值
+
+### 19.4 当前重构边界
+
+后续对 `sync_playlist()` 的重构应按下面顺序推进：
+
+1. 候选规划
+2. fetch 结果收集
+3. unavailable/stale 成员裁剪
+4. 最终落库
+5. 下游翻译与索引分配
+
+要求：
+
+- 每一步都应能用测试单独描述
+- 不允许为了“函数更短”而把这些语义重新混在一起
+- 不允许把“暂时失败”和“永久不可用”重新混淆

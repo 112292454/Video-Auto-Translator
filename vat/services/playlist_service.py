@@ -211,38 +211,11 @@ class PlaylistService:
         if fetch_upload_dates and videos_to_fetch:
             max_workers = 10  # 并行获取数量（测试可用 5-10 个）
             callback(f"开始并行获取视频信息（共 {len(videos_to_fetch)} 个，{max_workers} 个并发）...")
-            
-            # 收集所有视频的获取结果，用于后续插值和状态更新
-            fetch_results = []  # [(video_id, VideoInfoResult)]
-            completed_count = 0
-            results_lock = threading.Lock()
-            
-            def fetch_video_info(vid: str) -> tuple:
-                """获取单个视频的信息，返回结构化结果"""
-                nonlocal completed_count
-                
-                result = self.downloader.get_video_info(f"https://www.youtube.com/watch?v={vid}")
-                
-                with results_lock:
-                    completed_count += 1
-                    if completed_count % 5 == 0 or completed_count == len(videos_to_fetch):
-                        callback(f"已获取 {completed_count}/{len(videos_to_fetch)} 个视频信息...")
-                
-                return (vid, result)
-            
-            # 使用线程池并行获取
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(fetch_video_info, vid): vid for vid in videos_to_fetch}
-                for future in futures:
-                    try:
-                        vid, result = future.result(timeout=60)
-                        fetch_results.append((vid, result))
-                    except Exception as e:
-                        vid = futures[future]
-                        logger.warning(f"获取视频 {vid} 超时或异常: {e}")
-                        fetch_results.append((vid, VideoInfoResult(
-                            status='error', error_message=str(e)
-                        )))
+            fetch_results = self._collect_fetch_results(
+                video_ids=videos_to_fetch,
+                callback=callback,
+                max_workers=max_workers,
+            )
             
             pruned_new_videos, pruned_stale_existing_videos = self._classify_pruned_unavailable_videos(
                 new_video_ids=set(new_videos),
@@ -250,22 +223,23 @@ class PlaylistService:
                 fetch_results=fetch_results,
                 callback=callback,
             )
-            pruned_videos = pruned_new_videos | pruned_stale_existing_videos
-            if pruned_videos:
-                new_videos = [vid for vid in new_videos if vid not in pruned_new_videos]
-                existing_videos = [vid for vid in existing_videos if vid not in pruned_stale_existing_videos]
-                fetch_results = [
-                    (vid, result)
-                    for vid, result in fetch_results
-                    if vid not in pruned_videos
-                ]
-                existing_playlist_updates = [
-                    (vid, index)
-                    for vid, index in existing_playlist_updates
-                    if vid not in pruned_stale_existing_videos
-                ]
-                for vid in pruned_new_videos:
-                    new_video_candidates.pop(vid, None)
+            adjusted = self._prune_sync_candidates_after_fetch(
+                new_videos=new_videos,
+                existing_videos=existing_videos,
+                new_video_candidates=new_video_candidates,
+                existing_playlist_updates=existing_playlist_updates,
+                stale_zero_index_existing_videos=stale_zero_index_existing_videos,
+                fetch_results=fetch_results,
+                pruned_new_videos=pruned_new_videos,
+                pruned_stale_existing_videos=pruned_stale_existing_videos,
+            )
+            new_videos = adjusted['new_videos']
+            existing_videos = adjusted['existing_videos']
+            new_video_candidates = adjusted['new_video_candidates']
+            existing_playlist_updates = adjusted['existing_playlist_updates']
+            fetch_results = adjusted['fetch_results']
+            pruned_new_videos = adjusted['pruned_new_videos']
+            pruned_stale_existing_videos = adjusted['pruned_stale_existing_videos']
 
         # 到这里才真正落库：先判定可用性，再写入新增视频，避免中断留下半成品
         for vid, index in existing_playlist_updates:
@@ -403,6 +377,100 @@ class PlaylistService:
             'stale_zero_index_existing_videos': stale_zero_index_existing_videos,
             'videos_to_fetch': new_videos + videos_needing_refresh,
         }
+
+    def _prune_sync_candidates_after_fetch(
+        self,
+        *,
+        new_videos: List[str],
+        existing_videos: List[str],
+        new_video_candidates: Dict[str, Dict[str, Any]],
+        existing_playlist_updates: List[tuple[str, int]],
+        stale_zero_index_existing_videos: Set[str],
+        fetch_results: List[tuple],
+        pruned_new_videos: Optional[Set[str]] = None,
+        pruned_stale_existing_videos: Optional[Set[str]] = None,
+    ) -> Dict[str, Any]:
+        """根据 fetch 结果裁剪新成员、旧成员和待落库计划。"""
+        if pruned_new_videos is None or pruned_stale_existing_videos is None:
+            pruned_new_videos, pruned_stale_existing_videos = self._classify_pruned_unavailable_videos(
+                new_video_ids=set(new_videos),
+                stale_zero_index_existing_videos=stale_zero_index_existing_videos,
+                fetch_results=fetch_results,
+                callback=lambda _msg: None,
+            )
+
+        pruned_videos = pruned_new_videos | pruned_stale_existing_videos
+        if not pruned_videos:
+            return {
+                'new_videos': new_videos,
+                'existing_videos': existing_videos,
+                'new_video_candidates': new_video_candidates,
+                'existing_playlist_updates': existing_playlist_updates,
+                'fetch_results': fetch_results,
+                'pruned_new_videos': pruned_new_videos,
+                'pruned_stale_existing_videos': pruned_stale_existing_videos,
+            }
+
+        adjusted_new_candidates = dict(new_video_candidates)
+        for vid in pruned_new_videos:
+            adjusted_new_candidates.pop(vid, None)
+
+        return {
+            'new_videos': [vid for vid in new_videos if vid not in pruned_new_videos],
+            'existing_videos': [vid for vid in existing_videos if vid not in pruned_stale_existing_videos],
+            'new_video_candidates': adjusted_new_candidates,
+            'existing_playlist_updates': [
+                (vid, index)
+                for vid, index in existing_playlist_updates
+                if vid not in pruned_stale_existing_videos
+            ],
+            'fetch_results': [
+                (vid, result)
+                for vid, result in fetch_results
+                if vid not in pruned_videos
+            ],
+            'pruned_new_videos': pruned_new_videos,
+            'pruned_stale_existing_videos': pruned_stale_existing_videos,
+        }
+
+    def _collect_fetch_results(
+        self,
+        *,
+        video_ids: List[str],
+        callback: Callable[[str], None],
+        max_workers: int = 10,
+    ) -> List[tuple[str, VideoInfoResult]]:
+        """并行收集视频详细信息，并把 worker 异常折叠为 error 结果。"""
+        fetch_results = []
+        completed_count = 0
+        results_lock = threading.Lock()
+
+        def fetch_video_info(vid: str) -> tuple[str, VideoInfoResult]:
+            nonlocal completed_count
+
+            result = self.downloader.get_video_info(f"https://www.youtube.com/watch?v={vid}")
+
+            with results_lock:
+                completed_count += 1
+                if completed_count % 5 == 0 or completed_count == len(video_ids):
+                    callback(f"已获取 {completed_count}/{len(video_ids)} 个视频信息...")
+
+            return (vid, result)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(fetch_video_info, vid): vid for vid in video_ids}
+            for future in futures:
+                try:
+                    vid, result = future.result(timeout=60)
+                    fetch_results.append((vid, result))
+                except Exception as e:
+                    vid = futures[future]
+                    logger.warning(f"获取视频 {vid} 超时或异常: {e}")
+                    fetch_results.append((vid, VideoInfoResult(
+                        status='error', error_message=str(e)
+                    )))
+
+        return fetch_results
 
     def _build_entry_metadata(self, entry: Dict[str, Any], channel: str) -> Dict[str, Any]:
         """将 playlist flat entry 转为视频初始 metadata"""

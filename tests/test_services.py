@@ -223,6 +223,90 @@ class TestSyncPlaylistContracts:
         assert plan["new_video_candidates"]["vid_new"]["playlist_index"] == 2
         assert plan["new_video_candidates"]["vid_new"]["existing_video"] is None
 
+    def test_prune_sync_candidates_removes_unavailable_new_and_stale_existing(self, db):
+        service = PlaylistService(db)
+
+        adjusted = service._prune_sync_candidates_after_fetch(
+            new_videos=["vid_new_ok", "vid_new_unavailable"],
+            existing_videos=["vid_existing_ok", "vid_existing_stale"],
+            new_video_candidates={
+                "vid_new_ok": {"playlist_index": 1},
+                "vid_new_unavailable": {"playlist_index": 2},
+            },
+            existing_playlist_updates=[
+                ("vid_existing_ok", 3),
+                ("vid_existing_stale", 4),
+            ],
+            stale_zero_index_existing_videos={"vid_existing_stale"},
+            fetch_results=[
+                ("vid_new_ok", VideoInfoResult(status="ok", info={"upload_date": "20250101"})),
+                ("vid_new_unavailable", VideoInfoResult(status="unavailable", error_message="members-only")),
+                ("vid_existing_ok", VideoInfoResult(status="ok", info={"upload_date": "20250102"})),
+                ("vid_existing_stale", VideoInfoResult(status="unavailable", error_message="members-only")),
+            ],
+        )
+
+        assert adjusted["new_videos"] == ["vid_new_ok"]
+        assert adjusted["existing_videos"] == ["vid_existing_ok"]
+        assert adjusted["pruned_new_videos"] == {"vid_new_unavailable"}
+        assert adjusted["pruned_stale_existing_videos"] == {"vid_existing_stale"}
+        assert adjusted["existing_playlist_updates"] == [("vid_existing_ok", 3)]
+        assert list(adjusted["new_video_candidates"].keys()) == ["vid_new_ok"]
+        assert [vid for vid, _result in adjusted["fetch_results"]] == ["vid_new_ok", "vid_existing_ok"]
+
+    def test_collect_fetch_results_wraps_worker_exceptions_as_error_results(self, db, monkeypatch):
+        service = PlaylistService(db)
+        service._downloader = type(
+            "FakeDownloader",
+            (),
+            {
+                "get_video_info": lambda _self, url: VideoInfoResult(
+                    status="ok",
+                    info={"id": url.rsplit("=", 1)[-1], "upload_date": "20250101"},
+                ),
+            },
+        )()
+
+        class _FutureOK:
+            def __init__(self, value):
+                self._value = value
+
+            def result(self, timeout=None):
+                return self._value
+
+        class _FutureBoom:
+            def result(self, timeout=None):
+                raise TimeoutError("boom")
+
+        class _Executor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def submit(self, fn, vid):
+                if vid == "vid_boom":
+                    return _FutureBoom()
+                return _FutureOK(fn(vid))
+
+        monkeypatch.setattr("vat.services.playlist_service.ThreadPoolExecutor", _Executor)
+
+        messages = []
+        fetch_results = service._collect_fetch_results(
+            video_ids=["vid_ok", "vid_boom"],
+            callback=messages.append,
+            max_workers=2,
+        )
+
+        assert [vid for vid, _result in fetch_results] == ["vid_ok", "vid_boom"]
+        assert fetch_results[0][1].ok is True
+        assert fetch_results[1][1].status == "error"
+        assert "boom" in (fetch_results[1][1].error_message or "")
+
     def test_sync_playlist_raises_when_playlist_info_unavailable(self, db):
         service = PlaylistService(db)
         service._downloader = type(
