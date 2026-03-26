@@ -761,30 +761,12 @@ class PlaylistService:
         except Exception:
             return datetime.now().strftime('%Y%m%d')
     
-    def _assign_indices_to_new_videos(
-        self,
-        playlist_id: str,
-        callback: Callable[[str], None]
-    ) -> None:
-        """
-        为新视频分配 upload_order_index（增量式，不做全量重排）
-        
-        只处理 upload_order_index=0 的新视频，从当前最大索引+1 开始，
-        按 upload_date 排序分配。已有索引的视频不变。
-        
-        注意：YouTube 的 playlist_index 是 1=最新（每次 sync 都变），
-        而 upload_order_index 是 1=最旧（稳定的时间顺序，只增不改）。
-        两者语义相反，不可混用。
-        
-        Args:
-            playlist_id: Playlist ID
-            callback: 进度回调
-        """
+    def _plan_upload_order_index_updates(self, playlist_id: str) -> List[tuple[str, int]]:
+        """规划需要补齐 upload_order_index 的视频及其新索引。"""
         all_videos = self.get_playlist_videos(playlist_id, order_by="upload_date")
         if not all_videos:
-            return
-        
-        # 找出需要分配索引的新视频和当前最大索引
+            return []
+
         max_index = 0
         new_videos = []
         for video in all_videos:
@@ -794,23 +776,50 @@ class PlaylistService:
                 max_index = max(max_index, current_index)
             else:
                 new_videos.append(video)
-        
+
         if not new_videos:
-            return
-        
-        # 新视频按 upload_date 排序后，从 max_index+1 开始分配
-        def get_upload_date(v):
-            date_str = v.metadata.get('upload_date', '') if v.metadata else ''
+            return []
+
+        def get_upload_date(video: Video) -> str:
+            date_str = video.metadata.get('upload_date', '') if video.metadata else ''
             return date_str if date_str else '99999999'
+
         new_videos.sort(key=get_upload_date)
-        
-        for i, video in enumerate(new_videos, max_index + 1):
-            self.db.update_playlist_video_order_index(playlist_id, video.id, i)
-        
-        callback(f"为 {len(new_videos)} 个新视频分配索引 ({max_index + 1}-{max_index + len(new_videos)})")
+        return [
+            (video.id, index)
+            for index, video in enumerate(new_videos, start=max_index + 1)
+        ]
+
+    def _assign_indices_to_new_videos(
+        self,
+        playlist_id: str,
+        callback: Callable[[str], None]
+    ) -> None:
+        """
+        为新视频分配 upload_order_index（增量式，不做全量重排）
+
+        只处理 upload_order_index=0 的新视频，从当前最大索引+1 开始，
+        按 upload_date 排序分配。已有索引的视频不变。
+
+        注意：YouTube 的 playlist_index 是 1=最新（每次 sync 都变），
+        而 upload_order_index 是 1=最旧（稳定的时间顺序，只增不改）。
+        两者语义相反，不可混用。
+
+        Args:
+            playlist_id: Playlist ID
+            callback: 进度回调
+        """
+        assignments = self._plan_upload_order_index_updates(playlist_id)
+        if not assignments:
+            return
+
+        for video_id, index in assignments:
+            self.db.update_playlist_video_order_index(playlist_id, video_id, index)
+
+        callback(f"为 {len(assignments)} 个新视频分配索引 ({assignments[0][1]}-{assignments[-1][1]})")
         logger.info(
-            f"Playlist {playlist_id}: 分配 upload_order_index 给 {len(new_videos)} 个新视频, "
-            f"范围 {max_index + 1}-{max_index + len(new_videos)}"
+            f"Playlist {playlist_id}: 分配 upload_order_index 给 {len(assignments)} 个新视频, "
+            f"范围 {assignments[0][1]}-{assignments[-1][1]}"
         )
     
     def _submit_translate_task(self, video_id: str, video_info: Dict[str, Any], force: bool = False) -> None:

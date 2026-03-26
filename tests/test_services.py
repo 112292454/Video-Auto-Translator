@@ -1060,6 +1060,41 @@ class TestPlaylistRecoveryHelpers:
 
         assert date == "20250109"
 
+    def test_plan_upload_order_index_updates_starts_after_max_existing_index(self, db):
+        _setup_playlist(db, "PL_ORDER_PLAN")
+        _add_pl_video(db, "vid_existing", playlist_id="PL_ORDER_PLAN", index=1)
+        _add_pl_video(db, "vid_oldest_new", playlist_id="PL_ORDER_PLAN", index=2)
+        _add_pl_video(db, "vid_newer_new", playlist_id="PL_ORDER_PLAN", index=3)
+        db.update_video("vid_existing", metadata={"upload_date": "20240101"})
+        db.update_video("vid_oldest_new", metadata={"upload_date": "20240102"})
+        db.update_video("vid_newer_new", metadata={"upload_date": "20240103"})
+        db.update_playlist_video_order_index("PL_ORDER_PLAN", "vid_existing", 5)
+
+        service = PlaylistService(db)
+
+        assignments = service._plan_upload_order_index_updates("PL_ORDER_PLAN")
+
+        assert assignments == [
+            ("vid_oldest_new", 6),
+            ("vid_newer_new", 7),
+        ]
+
+    def test_plan_upload_order_index_updates_places_missing_dates_last(self, db):
+        _setup_playlist(db, "PL_ORDER_MISSING")
+        _add_pl_video(db, "vid_has_date", playlist_id="PL_ORDER_MISSING", index=1)
+        _add_pl_video(db, "vid_no_date", playlist_id="PL_ORDER_MISSING", index=2)
+        db.update_video("vid_has_date", metadata={"upload_date": "20240102"})
+        db.update_video("vid_no_date", metadata={})
+
+        service = PlaylistService(db)
+
+        assignments = service._plan_upload_order_index_updates("PL_ORDER_MISSING")
+
+        assert assignments == [
+            ("vid_has_date", 1),
+            ("vid_no_date", 2),
+        ]
+
     def test_process_failed_fetches_marks_unavailable_with_interpolated_date(self, db):
         _setup_playlist(db, "PL_FAIL")
         _add_pl_video(db, "v_known_newer", playlist_id="PL_FAIL", index=1)
