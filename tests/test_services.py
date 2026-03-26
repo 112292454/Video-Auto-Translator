@@ -550,6 +550,72 @@ class TestSyncPlaylistContracts:
         assert result.existing_videos == ["vid_old"]
         assert result.total_videos == 3
 
+    def test_bootstrap_sync_playlist_creates_playlist_and_returns_context(self, db):
+        service = PlaylistService(db)
+        entries = [{"id": "vid_boot", "title": "Boot Video"}]
+        service._downloader = type(
+            "FakeDownloader",
+            (),
+            {
+                "get_playlist_info": lambda _self, _url: {
+                    "id": "UC_raw",
+                    "title": "Channel Videos",
+                    "uploader": "Uploader",
+                    "uploader_id": "channel-1",
+                    "entries": entries,
+                }
+            },
+        )()
+        messages = []
+
+        result = service._bootstrap_sync_playlist(
+            "https://www.youtube.com/@demo/videos",
+            target_playlist_id="UC_raw-videos",
+            callback=messages.append,
+        )
+
+        assert result["playlist_id"] == "UC_raw-videos"
+        assert result["playlist_title"] == "Channel Videos"
+        assert result["channel"] == "Uploader"
+        assert result["entries"] == entries
+        assert db.get_playlist("UC_raw-videos") is not None
+        assert messages == [
+            "Playlist: Channel Videos (yt_id=UC_raw, db_id=UC_raw-videos)",
+            "创建新 Playlist",
+        ]
+
+    def test_bootstrap_sync_playlist_reuses_existing_playlist(self, db):
+        _setup_playlist(db, "PL_BOOT")
+        service = PlaylistService(db)
+        service._downloader = type(
+            "FakeDownloader",
+            (),
+            {
+                "get_playlist_info": lambda _self, _url: {
+                    "id": "PL_BOOT",
+                    "title": "Bootstrap Playlist",
+                    "uploader": "Uploader",
+                    "uploader_id": "channel-1",
+                    "entries": [],
+                }
+            },
+        )()
+        messages = []
+
+        result = service._bootstrap_sync_playlist(
+            "https://youtube.com/playlist?list=PL_BOOT",
+            target_playlist_id=None,
+            callback=messages.append,
+        )
+
+        assert result["playlist_id"] == "PL_BOOT"
+        assert result["playlist_title"] == "Bootstrap Playlist"
+        assert messages == [
+            "Playlist: Bootstrap Playlist (yt_id=PL_BOOT, db_id=PL_BOOT)",
+            "更新已存在的 Playlist",
+        ]
+        assert db.get_playlist("PL_BOOT") is not None
+
     def test_sync_playlist_raises_when_playlist_info_unavailable(self, db):
         service = PlaylistService(db)
         service._downloader = type(

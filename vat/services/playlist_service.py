@@ -159,38 +159,15 @@ class PlaylistService:
         
         callback(f"开始同步 Playlist: {playlist_url}")
         
-        # 获取 Playlist 信息
-        playlist_info = self.downloader.get_playlist_info(playlist_url)
-        if not playlist_info:
-            raise ValueError(f"无法获取 Playlist 信息: {playlist_url}")
-        
-        yt_playlist_id = playlist_info['id']
-        playlist_title = playlist_info.get('title', 'Unknown Playlist')
-        channel = playlist_info.get('uploader', '')
-        channel_id = playlist_info.get('uploader_id', '')
-        
-        # 使用显式指定的 playlist_id，或从 URL 推断 tab 后缀后回退到 yt-dlp ID
-        # （防止 channel tab URL 创建裸 channel ID 的 playlist）
-        playlist_id = target_playlist_id or resolve_playlist_id(playlist_url, yt_playlist_id)
-        
-        callback(f"Playlist: {playlist_title} (yt_id={yt_playlist_id}, db_id={playlist_id})")
-        
-        # 获取或创建 Playlist 记录
-        existing_playlist = self.db.get_playlist(playlist_id)
-        if existing_playlist:
-            callback(f"更新已存在的 Playlist")
-        else:
-            callback(f"创建新 Playlist")
-            existing_playlist = Playlist(
-                id=playlist_id,
-                title=playlist_title,
-                source_url=playlist_url,
-                channel=channel,
-                channel_id=channel_id
-            )
-            self.db.add_playlist(existing_playlist)
-        
-        entries = playlist_info.get('entries', [])
+        bootstrap = self._bootstrap_sync_playlist(
+            playlist_url,
+            target_playlist_id=target_playlist_id,
+            callback=callback,
+        )
+        playlist_id = bootstrap['playlist_id']
+        playlist_title = bootstrap['playlist_title']
+        channel = bootstrap['channel']
+        entries = bootstrap['entries']
         sync_plan = self._plan_sync_candidates(
             playlist_id=playlist_id,
             entries=entries,
@@ -254,6 +231,48 @@ class PlaylistService:
             existing_videos=existing_videos,
             callback=callback,
         )
+
+    def _bootstrap_sync_playlist(
+        self,
+        playlist_url: str,
+        *,
+        target_playlist_id: Optional[str],
+        callback: Callable[[str], None],
+    ) -> Dict[str, Any]:
+        """拉取 playlist 基础信息，并初始化/复用对应的 DB 记录。"""
+        playlist_info = self.downloader.get_playlist_info(playlist_url)
+        if not playlist_info:
+            raise ValueError(f"无法获取 Playlist 信息: {playlist_url}")
+
+        yt_playlist_id = playlist_info['id']
+        playlist_title = playlist_info.get('title', 'Unknown Playlist')
+        channel = playlist_info.get('uploader', '')
+        channel_id = playlist_info.get('uploader_id', '')
+        playlist_id = target_playlist_id or resolve_playlist_id(playlist_url, yt_playlist_id)
+
+        callback(f"Playlist: {playlist_title} (yt_id={yt_playlist_id}, db_id={playlist_id})")
+
+        existing_playlist = self.db.get_playlist(playlist_id)
+        if existing_playlist:
+            callback("更新已存在的 Playlist")
+        else:
+            callback("创建新 Playlist")
+            self.db.add_playlist(
+                Playlist(
+                    id=playlist_id,
+                    title=playlist_title,
+                    source_url=playlist_url,
+                    channel=channel,
+                    channel_id=channel_id,
+                )
+            )
+
+        return {
+            'playlist_id': playlist_id,
+            'playlist_title': playlist_title,
+            'channel': channel,
+            'entries': playlist_info.get('entries', []),
+        }
 
     def _plan_sync_candidates(
         self,
