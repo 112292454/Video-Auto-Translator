@@ -585,7 +585,119 @@ class TestFFmpegWrapperHardEmbedPlanning:
         assert wrapped_ass.exists() is False
         assert processed_ass.exists() is True
 
-    def test_prepare_hard_embed_nvenc_session_acquires_slot_and_checks_support(self, monkeypatch):
+    def test_finalize_hard_embed_resources_releases_nvenc_session_and_cleans_temp_files(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        temp_ass = tmp_path / "temp.ass"
+        wrapped_ass = tmp_path / "wrapped.ass"
+        temp_ass.write_text("temp", encoding="utf-8")
+        wrapped_ass.write_text("wrapped", encoding="utf-8")
+        released = []
+
+        monkeypatch.setattr(
+            "vat.embedder.ffmpeg_wrapper._nvenc_manager.release",
+            lambda gpu_id: released.append(gpu_id),
+        )
+
+        wrapper._finalize_hard_embed_resources(
+            gpu_id=3,
+            temp_files_to_cleanup=[str(temp_ass), str(wrapped_ass)],
+        )
+
+        assert released == [3]
+        assert temp_ass.exists() is False
+        assert wrapped_ass.exists() is False
+
+    def test_finalize_hard_embed_resources_ignores_temp_file_cleanup_errors(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        temp_ass = tmp_path / "temp.ass"
+        released = []
+        attempted = []
+
+        monkeypatch.setattr(
+            "vat.embedder.ffmpeg_wrapper._nvenc_manager.release",
+            lambda gpu_id: released.append(gpu_id),
+        )
+        monkeypatch.setattr(
+            Path,
+            "unlink",
+            lambda self, missing_ok=True: attempted.append((str(self), missing_ok)) or (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        wrapper._finalize_hard_embed_resources(
+            gpu_id=4,
+            temp_files_to_cleanup=[str(temp_ass)],
+        )
+
+        assert released == [4]
+        assert attempted == [(str(temp_ass), True)]
+
+    def test_embed_subtitle_hard_delegates_finalize_cleanup_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.ass"
+        out = tmp_path / "out.mp4"
+        processed_ass = tmp_path / "processed.ass"
+        temp_ass = tmp_path / "temp.ass"
+        wrapped_ass = tmp_path / "wrapped.ass"
+        video.write_bytes(b"00")
+        sub.write_text("dummy", encoding="utf-8")
+        finalized = []
+
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.init", lambda max_per_gpu=5: None)
+        monkeypatch.setattr(
+            "vat.embedder.ffmpeg_wrapper._nvenc_manager.release",
+            lambda gpu_id: pytest.fail("unexpected inline release"),
+        )
+        monkeypatch.setattr(
+            Path,
+            "unlink",
+            lambda self, missing_ok=True: pytest.fail("unexpected inline cleanup"),
+        )
+        monkeypatch.setattr(wrapper, "_resolve_hard_embed_gpu_device", lambda gpu_device: 0, raising=False)
+        monkeypatch.setattr(wrapper, "_prepare_hard_embed_nvenc_session", lambda **kwargs: None, raising=False)
+        monkeypatch.setattr(
+            wrapper,
+            "_prepare_hard_embed_ass_subtitle",
+            lambda **kwargs: (processed_ass, [str(temp_ass), str(wrapped_ass)]),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_build_hard_embed_subtitle_filter",
+            lambda **kwargs: "ass='planned'",
+            raising=False,
+        )
+        monkeypatch.setattr(wrapper, "_probe_hard_embed_original_bitrate", lambda video_path: 1000, raising=False)
+        monkeypatch.setattr(wrapper, "_build_hard_embed_ffmpeg_command", lambda **kwargs: ["ffmpeg", "planned"], raising=False)
+        monkeypatch.setattr(wrapper, "_run_ffmpeg_embed_process", lambda **kwargs: True, raising=False)
+        monkeypatch.setattr(
+            wrapper,
+            "_finalize_hard_embed_resources",
+            lambda **kwargs: finalized.append(kwargs),
+            raising=False,
+        )
+
+        result = wrapper.embed_subtitle_hard(
+            video,
+            sub,
+            out,
+            gpu_device="auto",
+            subtitle_style="named-style",
+            style_dir="/styles",
+            fonts_dir="/fonts",
+            reference_height=900,
+        )
+
+        assert result is True
+        assert finalized == [{
+            "gpu_id": 0,
+            "temp_files_to_cleanup": [str(temp_ass), str(wrapped_ass)],
+        }]
+
+
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
         wrapper = FFmpegWrapper()
         acquired = []

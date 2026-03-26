@@ -454,14 +454,24 @@ class FFmpegWrapper:
                 progress_callback=progress_callback,
             )
         finally:
-            # 释放 NVENC 会话槽位
-            _nvenc_manager.release(gpu_id)
-            # 清理临时文件
-            for temp_file in temp_files_to_cleanup:
-                try:
-                    Path(temp_file).unlink(missing_ok=True)
-                except Exception:
-                    pass
+            self._finalize_hard_embed_resources(
+                gpu_id=gpu_id,
+                temp_files_to_cleanup=temp_files_to_cleanup,
+            )
+
+    def _finalize_hard_embed_resources(
+        self,
+        *,
+        gpu_id: int,
+        temp_files_to_cleanup: list[str],
+    ) -> None:
+        """释放硬字幕合成阶段占用的资源。"""
+        _nvenc_manager.release(gpu_id)
+        for temp_file in temp_files_to_cleanup:
+            try:
+                Path(temp_file).unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def _resolve_hard_embed_gpu_device(self, gpu_device: str) -> int:
         """解析硬字幕合成使用的 GPU 设备。"""
