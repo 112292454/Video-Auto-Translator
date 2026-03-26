@@ -844,37 +844,33 @@ def fix_violation_with_recovery(
     masked_path = result.get("masked_path")
     source = result.get("source")
     upload_duration = result.get("upload_duration")
+    explicit_state = result.get("state")
+    explicit_last_successful_state = result.get("last_successful_state")
 
     if result.get("success"):
-        if dry_run:
-            _persist(
-                "masked_video_ready",
-                last_successful_state="masked_video_ready",
-                all_ranges=all_ranges,
-                masked_path=masked_path,
-                source=source,
-            )
-        else:
-            _persist(
-                "replacement_submitted",
-                last_successful_state="replacement_submitted",
-                all_ranges=all_ranges,
-                masked_path=masked_path,
-                source=source,
-                upload_duration=upload_duration,
-            )
+        success_state = explicit_state or ("masked_video_ready" if dry_run else "replacement_submitted")
+        success_last_successful_state = explicit_last_successful_state or success_state
+        _persist(
+            success_state,
+            last_successful_state=success_last_successful_state,
+            all_ranges=all_ranges,
+            masked_path=masked_path,
+            source=source,
+            upload_duration=upload_duration,
+        )
         return result
 
-    last_successful_state = None
-    if masked_path:
-        last_successful_state = "masked_video_ready"
-    elif all_ranges:
-        last_successful_state = "ranges_merged"
-    elif result.get("new_ranges"):
-        last_successful_state = "violation_info_loaded"
+    last_successful_state = explicit_last_successful_state
+    if last_successful_state is None:
+        if masked_path:
+            last_successful_state = "masked_video_ready"
+        elif all_ranges:
+            last_successful_state = "ranges_merged"
+        elif result.get("new_ranges"):
+            last_successful_state = "violation_info_loaded"
 
     _persist(
-        "failed",
+        explicit_state or "failed",
         last_successful_state=last_successful_state,
         last_error=result.get("message", "fix_violation 失败"),
         all_ranges=all_ranges,
@@ -883,3 +879,4 @@ def fix_violation_with_recovery(
         upload_duration=upload_duration,
     )
     return result
+

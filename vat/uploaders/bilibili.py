@@ -1769,10 +1769,11 @@ class BilibiliUploader(BaseUploader):
             if callback:
                 callback(msg)
             logger.info(msg)
-        
+
         result = {
             'success': False, 'new_ranges': [], 'all_ranges': [],
             'masked_path': None, 'source': 'local', 'message': '',
+            'state': 'pending', 'last_successful_state': None,
         }
         
         try:
@@ -1786,6 +1787,8 @@ class BilibiliUploader(BaseUploader):
             return result
 
         result['new_ranges'] = violation_ctx['new_ranges']
+        result['state'] = 'violation_info_loaded'
+        result['last_successful_state'] = 'violation_info_loaded'
 
         try:
             source_ctx = self._resolve_violation_source_video(
@@ -1817,35 +1820,30 @@ class BilibiliUploader(BaseUploader):
         masked_path = mask_ctx['masked_path']
         result['all_ranges'] = mask_ctx['all_ranges']
         result['masked_path'] = str(masked_path)
+        result['state'] = 'masked_video_ready'
+        result['last_successful_state'] = 'masked_video_ready'
         
         # Step 5: 上传替换（除非 dry_run）
         if dry_run:
             _cb(f"  dry-run 模式，跳过上传。遮罩文件: {masked_path}")
             result['success'] = True
             result['message'] = 'dry-run 完成'
+            if tmp_download and tmp_download.exists():
+                tmp_download.unlink(missing_ok=True)
             return result
-        
-        _cb("上传替换...")
-        import time as _time
-        _upload_start = _time.monotonic()
-        replace_ok = self.replace_video(aid, masked_path)
-        result['upload_duration'] = _time.monotonic() - _upload_start
-        
-        if replace_ok:
-            result['success'] = True
-            result['message'] = '修复完成，已重新提交审核'
-            _cb(f"  ✅ av{aid} 修复完成")
+
+        submit_result = self._submit_violation_replacement(aid, masked_path, callback=_cb)
+        result.update(submit_result)
+
+        if result['success']:
             # 清理遮罩临时文件
             masked_path.unlink(missing_ok=True)
             result['masked_path'] = None
-        else:
-            result['message'] = '上传替换失败，遮罩文件已保留'
-            _cb(f"  ❌ 上传替换失败")
-        
+
         # 清理下载的临时文件
         if tmp_download and tmp_download.exists():
             tmp_download.unlink(missing_ok=True)
-        
+
         return result
 
     def _load_violation_context(
@@ -1858,7 +1856,8 @@ class BilibiliUploader(BaseUploader):
         def _cb(msg):
             if callback:
                 callback(msg)
-            logger.info(msg)
+            else:
+                logger.info(msg)
 
         _cb(f"获取 av{aid} 审核退回信息...")
         rejected = self.get_rejected_videos()
@@ -1902,8 +1901,10 @@ class BilibiliUploader(BaseUploader):
         def _cb(msg):
             if callback:
                 callback(msg)
-            logger.info(msg)
+            else:
+                logger.info(msg)
 
+        import shutil
         import tempfile
 
         if video_path and Path(video_path).exists():
@@ -1920,6 +1921,7 @@ class BilibiliUploader(BaseUploader):
         tmp_download = tmp_dir / f"av{aid}_source.mp4"
 
         if not self.download_video(aid, tmp_download):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
             raise RuntimeError("从 B站下载视频失败")
 
         _cb(f"  B站下载完成: {tmp_download.stat().st_size / 1024 / 1024:.0f}MB")
@@ -1929,9 +1931,47 @@ class BilibiliUploader(BaseUploader):
             'tmp_download': tmp_download,
         }
 
+    def _submit_violation_replacement(
+        self,
+        aid: int,
+        masked_path: Path,
+        callback: Optional[callable] = None,
+    ) -> Dict[str, Any]:
+        """提交违规修复后的替换视频，并返回显式阶段结果。"""
+        def _cb(msg):
+            if callback:
+                callback(msg)
+            else:
+                logger.info(msg)
+
+        _cb("上传替换...")
+        import time as _time
+
+        upload_start = _time.monotonic()
+        replace_ok = self.replace_video(aid, masked_path)
+        upload_duration = _time.monotonic() - upload_start
+
+        if replace_ok:
+            _cb(f"  ✅ av{aid} 修复完成")
+            return {
+                'success': True,
+                'state': 'replacement_submitted',
+                'last_successful_state': 'replacement_submitted',
+                'message': '修复完成，已重新提交审核',
+                'upload_duration': upload_duration,
+            }
+
+        _cb("  ❌ 上传替换失败")
+        return {
+            'success': False,
+            'state': 'failed',
+            'last_successful_state': 'masked_video_ready',
+            'message': '上传替换失败，遮罩文件已保留',
+            'upload_duration': upload_duration,
+        }
+
     def _render_violation_mask(
         self,
-        *,
         source_video: Path,
         all_ranges: List[tuple],
         mask_text: str,
@@ -1944,7 +1984,8 @@ class BilibiliUploader(BaseUploader):
         def _cb(msg):
             if callback:
                 callback(msg)
-            logger.info(msg)
+            else:
+                logger.info(msg)
 
         _cb("开始遮罩处理...")
         ffmpeg = FFmpegWrapper()

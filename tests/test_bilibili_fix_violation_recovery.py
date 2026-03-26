@@ -52,6 +52,50 @@ class TestFixViolationRecovery:
         assert result["success"] is True
         assert list(tmp_path.iterdir()) == []
 
+    def test_records_replacement_submitted_on_success(self, tmp_path):
+        db, db_path = _make_db()
+        try:
+            video = Video(
+                id="vid-fix-ok",
+                source_type=SourceType.YOUTUBE,
+                source_url="https://youtube.com/watch?v=fix-ok",
+                title="Video",
+                metadata={"bilibili_aid": 24680},
+            )
+            db.add_video(video)
+
+            uploader = _FakeUploader(
+                {
+                    "success": True,
+                    "new_ranges": [(100, 110)],
+                    "all_ranges": [(100, 110), (200, 210)],
+                    "masked_path": None,
+                    "source": "local",
+                    "message": "修复完成，已重新提交审核",
+                    "upload_duration": 8.5,
+                }
+            )
+
+            result = fix_violation_with_recovery(
+                db,
+                uploader,
+                aid=24680,
+                video_path=tmp_path / "source.mp4",
+                dry_run=False,
+            )
+
+            assert result["success"] is True
+            refreshed = db.get_video("vid-fix-ok")
+            op = refreshed.metadata["bilibili_ops"]["fix_violation"]
+            assert op["state"] == "replacement_submitted"
+            assert op["last_successful_state"] == "replacement_submitted"
+            assert op["all_ranges"] == [[100, 110], [200, 210]]
+            assert op["masked_path"] is None
+            assert op["source"] == "local"
+            assert op["upload_duration"] == 8.5
+        finally:
+            os.unlink(db_path)
+
     def test_records_masked_stage_when_upload_replace_fails(self, tmp_path):
         db, db_path = _make_db()
         try:
@@ -93,44 +137,44 @@ class TestFixViolationRecovery:
         finally:
             os.unlink(db_path)
 
-    def test_records_replacement_submitted_on_success(self, tmp_path):
+    def test_prefers_explicit_stage_fields_from_uploader_result(self, tmp_path):
         db, db_path = _make_db()
         try:
             video = Video(
-                id="vid-fix-ok",
+                id="vid-fix-explicit",
                 source_type=SourceType.YOUTUBE,
-                source_url="https://youtube.com/watch?v=fix-ok",
+                source_url="https://youtube.com/watch?v=fix-explicit",
                 title="Video",
-                metadata={"bilibili_aid": 54321},
+                metadata={"bilibili_aid": 67890},
             )
             db.add_video(video)
 
             uploader = _FakeUploader(
                 {
-                    "success": True,
+                    "success": False,
+                    "state": "failed",
+                    "last_successful_state": "violation_info_loaded",
                     "new_ranges": [(100, 110)],
-                    "all_ranges": [(100, 110)],
-                    "masked_path": None,
+                    "all_ranges": [(100, 110), (200, 210)],
+                    "masked_path": str(tmp_path / "masked.mp4"),
                     "source": "local",
-                    "message": "修复完成，已重新提交审核",
-                    "upload_duration": 321,
+                    "message": "阶段显式失败",
                 }
             )
 
             result = fix_violation_with_recovery(
                 db,
                 uploader,
-                aid=54321,
+                aid=67890,
                 video_path=tmp_path / "source.mp4",
                 dry_run=False,
             )
 
-            assert result["success"] is True
-            refreshed = db.get_video("vid-fix-ok")
+            assert result["success"] is False
+            refreshed = db.get_video("vid-fix-explicit")
             op = refreshed.metadata["bilibili_ops"]["fix_violation"]
-            assert op["state"] == "replacement_submitted"
-            assert op["last_successful_state"] == "replacement_submitted"
-            assert op["all_ranges"] == [[100, 110]]
-            assert op["upload_duration"] == 321
+            assert op["state"] == "failed"
+            assert op["last_successful_state"] == "violation_info_loaded"
+            assert op["all_ranges"] == [[100, 110], [200, 210]]
         finally:
             os.unlink(db_path)

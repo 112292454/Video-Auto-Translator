@@ -8,7 +8,7 @@ B站审核违规处理功能测试
 4. get_rejected_videos: 退回稿件数据结构解析
 """
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 from pathlib import Path
 
 from vat.uploaders.bilibili import BilibiliUploader
@@ -314,15 +314,59 @@ class TestFixViolation:
         assert result['success'] is True
         assert result['source'] == 'local'
         assert result['new_ranges'] == [(600, 605)]
+        assert result['state'] == 'replacement_submitted'
+        assert result['last_successful_state'] == 'replacement_submitted'
         # mask_violation_segments 应收到合并的 ranges（旧+新）
         call_args = mock_ffmpeg.mask_violation_segments.call_args
         assert (100, 110) in call_args.kwargs['violation_ranges']
         assert (600, 605) in call_args.kwargs['violation_ranges']
     
+    @patch.object(BilibiliUploader, 'replace_video', return_value=False)
+    @patch('vat.embedder.ffmpeg_wrapper.FFmpegWrapper')
+    @patch.object(BilibiliUploader, 'get_rejected_videos')
+    @patch.object(BilibiliUploader, '_load_cookie')
+    def test_fix_returns_explicit_failed_stage_after_replace_failure(self, mock_load, mock_rejected, mock_ffmpeg_cls, mock_replace, tmp_path):
+        """上传替换失败时，返回显式失败阶段字段。"""
+        mock_rejected.return_value = [{
+            'aid': 12345, 'bvid': 'BV1xx', 'title': '测试', 'state': -2,
+            'problems': [{
+                'reason': '违规', 'violation_time': 'P1(00:10:00-00:10:05)',
+                'violation_position': '', 'modify_advise': '',
+                'is_full_video': False, 'time_ranges': [(600, 605)],
+            }],
+        }]
+
+        mock_ffmpeg = MagicMock()
+        mock_ffmpeg_cls.return_value = mock_ffmpeg
+        mock_ffmpeg.mask_violation_segments.return_value = True
+        mock_ffmpeg._merge_ranges.return_value = [(599, 606)]
+        mock_ffmpeg.get_video_info.return_value = {'duration': 3600}
+
+        local_video = tmp_path / "video.mp4"
+        local_video.write_bytes(b'\x00' * 1024)
+        masked = tmp_path / "video_masked.mp4"
+        masked.write_bytes(b'\x00' * 1024)
+
+        uploader = BilibiliUploader.__new__(BilibiliUploader)
+        uploader._cookie_loaded = True
+        uploader.cookie_data = {}
+
+        result = uploader.fix_violation(
+            aid=12345,
+            video_path=local_video,
+            previous_ranges=[(100, 110)],
+            dry_run=False,
+        )
+
+        assert result['success'] is False
+        assert result['state'] == 'failed'
+        assert result['last_successful_state'] == 'masked_video_ready'
+        assert result['masked_path'] is not None
+
     @patch.object(BilibiliUploader, 'get_rejected_videos')
     @patch.object(BilibiliUploader, '_load_cookie')
     def test_fix_full_video_violation(self, mock_load, mock_rejected):
-        """全片违规应返回失败"""
+        """全片违规应直接返回失败。"""
         mock_rejected.return_value = [{
             'aid': 99999, 'bvid': 'BV2yy', 'title': '全片违规', 'state': -2,
             'problems': [{
@@ -331,13 +375,13 @@ class TestFixViolation:
                 'is_full_video': True, 'time_ranges': [],
             }],
         }]
-        
+
         uploader = BilibiliUploader.__new__(BilibiliUploader)
         uploader._cookie_loaded = True
         uploader.cookie_data = {}
-        
+
         result = uploader.fix_violation(aid=99999)
-        
+
         assert result['success'] is False
         assert '全片违规' in result['message']
     
@@ -416,6 +460,56 @@ class TestFixViolation:
         assert result['masked_path'] is not None
         assert 'dry-run' in result['message']
     
+    @patch('vat.embedder.ffmpeg_wrapper.FFmpegWrapper')
+    @patch.object(BilibiliUploader, 'download_video')
+    @patch.object(BilibiliUploader, 'get_rejected_videos')
+    @patch.object(BilibiliUploader, '_load_cookie')
+    def test_fix_dry_run_cleans_downloaded_source(self, mock_load, mock_rejected, mock_download, mock_ffmpeg_cls, tmp_path, monkeypatch):
+        """dry-run 下载回退时应清理下载的源文件。"""
+        mock_rejected.return_value = [{
+            'aid': 12345, 'bvid': 'BV1xx', 'title': '测试', 'state': -2,
+            'problems': [{
+                'reason': '违规', 'violation_time': 'P1(00:10:00-00:10:05)',
+                'violation_position': '', 'modify_advise': '',
+                'is_full_video': False, 'time_ranges': [(600, 605)],
+            }],
+        }]
+
+        mock_ffmpeg = MagicMock()
+        mock_ffmpeg_cls.return_value = mock_ffmpeg
+        mock_ffmpeg._merge_ranges.return_value = [(599, 606)]
+        mock_ffmpeg.get_video_info.return_value = {'duration': 3600}
+
+        def fake_mask(video_path, output_path, **kwargs):
+            output_path.write_bytes(b'\x00' * 2048)
+            return True
+
+        mock_ffmpeg.mask_violation_segments.side_effect = fake_mask
+
+        temp_dir = tmp_path / "bili_fix_12345"
+        monkeypatch.setattr('tempfile.mkdtemp', lambda prefix: str(temp_dir))
+
+        downloaded_source = temp_dir / 'av12345_source.mp4'
+
+        def fake_download(aid, output_path):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b'\x00' * 1024)
+            return True
+
+        mock_download.side_effect = fake_download
+
+        uploader = BilibiliUploader.__new__(BilibiliUploader)
+        uploader._cookie_loaded = True
+        uploader.cookie_data = {}
+
+        with patch.object(uploader, 'replace_video') as mock_replace:
+            result = uploader.fix_violation(aid=12345, video_path=None, dry_run=True)
+            mock_replace.assert_not_called()
+
+        assert result['success'] is True
+        assert result['source'] == 'bilibili'
+        assert not downloaded_source.exists()
+
     @patch.object(BilibiliUploader, 'download_video', return_value=False)
     @patch.object(BilibiliUploader, 'get_rejected_videos')
     @patch.object(BilibiliUploader, '_load_cookie')
@@ -438,9 +532,97 @@ class TestFixViolation:
         
         assert result['success'] is False
         assert '下载' in result['message']
+    @patch('vat.uploaders.bilibili.logger.info')
+    @patch('vat.embedder.ffmpeg_wrapper.FFmpegWrapper')
+    @patch.object(BilibiliUploader, 'get_rejected_videos')
+    @patch.object(BilibiliUploader, '_load_cookie')
+    def test_fix_violation_does_not_duplicate_helper_logs(self, mock_load, mock_rejected, mock_ffmpeg_cls, mock_logger_info, tmp_path):
+        mock_rejected.return_value = [{
+            'aid': 12345, 'bvid': 'BV1xx', 'title': '测试', 'state': -2,
+            'problems': [{
+                'reason': '违规', 'violation_time': 'P1(00:10:00-00:10:05)',
+                'violation_position': '', 'modify_advise': '',
+                'is_full_video': False, 'time_ranges': [(600, 605)],
+            }],
+        }]
+
+        mock_ffmpeg = MagicMock()
+        mock_ffmpeg_cls.return_value = mock_ffmpeg
+        mock_ffmpeg._merge_ranges.return_value = [(599, 606)]
+        mock_ffmpeg.get_video_info.return_value = {'duration': 3600}
+
+        def fake_mask(video_path, output_path, **kwargs):
+            output_path.write_bytes(b'\x00' * 2048)
+            return True
+
+        mock_ffmpeg.mask_violation_segments.side_effect = fake_mask
+
+        local_video = tmp_path / "video.mp4"
+        local_video.write_bytes(b'\x00' * 1024)
+
+        uploader = BilibiliUploader.__new__(BilibiliUploader)
+        uploader._cookie_loaded = True
+        uploader.cookie_data = {}
+
+        with patch.object(uploader, 'replace_video') as mock_replace:
+            result = uploader.fix_violation(aid=12345, video_path=local_video, dry_run=True)
+            mock_replace.assert_not_called()
+
+        assert result['success'] is True
+        assert mock_logger_info.call_args_list.count(call('开始遮罩处理...')) == 1
+        assert mock_logger_info.call_args_list.count(call(f'  遮罩完成: {Path(result["masked_path"]).name} (0MB)')) == 1
+        assert mock_logger_info.call_args_list.count(call(f'  dry-run 模式，跳过上传。遮罩文件: {result["masked_path"]}')) == 1
+
+    @patch('vat.uploaders.bilibili.logger.info')
+    @patch('vat.embedder.ffmpeg_wrapper.FFmpegWrapper')
+    @patch.object(BilibiliUploader, 'get_rejected_videos')
+    @patch.object(BilibiliUploader, '_load_cookie')
+    def test_fix_violation_keeps_logger_when_callback_provided(self, mock_load, mock_rejected, mock_ffmpeg_cls, mock_logger_info, tmp_path):
+        mock_rejected.return_value = [{
+            'aid': 12345, 'bvid': 'BV1xx', 'title': '测试', 'state': -2,
+            'problems': [{
+                'reason': '违规', 'violation_time': 'P1(00:10:00-00:10:05)',
+                'violation_position': '', 'modify_advise': '',
+                'is_full_video': False, 'time_ranges': [(600, 605)],
+            }],
+        }]
+
+        mock_ffmpeg = MagicMock()
+        mock_ffmpeg_cls.return_value = mock_ffmpeg
+        mock_ffmpeg._merge_ranges.return_value = [(599, 606)]
+        mock_ffmpeg.get_video_info.return_value = {'duration': 3600}
+
+        def fake_mask(video_path, output_path, **kwargs):
+            output_path.write_bytes(b'\x00' * 2048)
+            return True
+
+        mock_ffmpeg.mask_violation_segments.side_effect = fake_mask
+
+        local_video = tmp_path / "video.mp4"
+        local_video.write_bytes(b'\x00' * 1024)
+
+        uploader = BilibiliUploader.__new__(BilibiliUploader)
+        uploader._cookie_loaded = True
+        uploader.cookie_data = {}
+        progress = MagicMock()
+
+        with patch.object(uploader, 'replace_video') as mock_replace:
+            result = uploader.fix_violation(
+                aid=12345,
+                video_path=local_video,
+                dry_run=True,
+                callback=progress,
+            )
+            mock_replace.assert_not_called()
+
+        assert result['success'] is True
+        assert progress.called
+        assert mock_logger_info.call_args_list.count(call('开始遮罩处理...')) == 1
 
 
 class TestFixViolationHelpers:
+    """测试 fix_violation 内部 helper。"""
+
     def test_load_violation_context_collects_new_and_all_ranges(self):
         uploader = BilibiliUploader.__new__(BilibiliUploader)
         uploader._cookie_loaded = True
@@ -476,31 +658,101 @@ class TestFixViolationHelpers:
         assert ctx['tmp_download'] is None
         uploader.download_video.assert_not_called()
 
+    def test_resolve_violation_source_video_cleans_temp_dir_when_download_fails(self, tmp_path, monkeypatch):
+        uploader = BilibiliUploader.__new__(BilibiliUploader)
+        uploader._cookie_loaded = True
+        uploader.cookie_data = {}
+
+        temp_dir = tmp_path / "bili_fix_12345"
+        temp_dir.mkdir()
+        monkeypatch.setattr('tempfile.mkdtemp', lambda prefix: str(temp_dir))
+        uploader.download_video = MagicMock(return_value=False)
+
+        with pytest.raises(RuntimeError, match='从 B站下载视频失败'):
+            uploader._resolve_violation_source_video(12345, None)
+
+        assert not temp_dir.exists()
+
     @patch('vat.embedder.ffmpeg_wrapper.FFmpegWrapper')
     def test_render_violation_mask_returns_storage_ranges(self, mock_ffmpeg_cls, tmp_path):
-        mock_ffmpeg = MagicMock()
-        mock_ffmpeg_cls.return_value = mock_ffmpeg
-        mock_ffmpeg.mask_violation_segments.side_effect = lambda **kwargs: kwargs['output_path'].write_bytes(b'\x00' * 1024) or True
-        mock_ffmpeg._merge_ranges.return_value = [(100, 110), (200, 210)]
-        mock_ffmpeg.get_video_info.return_value = {'duration': 3600}
-
         uploader = BilibiliUploader.__new__(BilibiliUploader)
         uploader._cookie_loaded = True
         uploader.cookie_data = {}
 
         source_video = tmp_path / "video.mp4"
         source_video.write_bytes(b'\x00' * 1024)
+        masked_path = tmp_path / "video_masked.mp4"
+        masked_path.write_bytes(b'\x00' * 2048)
 
-        ctx = uploader._render_violation_mask(
+        mock_ffmpeg = MagicMock()
+        mock_ffmpeg_cls.return_value = mock_ffmpeg
+        mock_ffmpeg.mask_violation_segments.return_value = True
+        mock_ffmpeg.get_video_info.return_value = {'duration': 3600}
+        mock_ffmpeg._merge_ranges.return_value = [(100, 110), (599, 606)]
+
+        result = uploader._render_violation_mask(
             source_video=source_video,
-            all_ranges=[(100, 110), (200, 210)],
-            mask_text='遮罩',
-            margin_sec=1.0,
+            all_ranges=[(100, 110), (600, 605)],
+            mask_text="此处内容因平台合规要求已被遮罩",
+            margin_sec=2.0,
         )
 
-        assert ctx['masked_path'] == source_video.parent / "video_masked.mp4"
-        assert ctx['all_ranges'] == [(100, 110), (200, 210)]
-        mock_ffmpeg.mask_violation_segments.assert_called_once()
+        assert result['masked_path'] == masked_path
+        assert result['all_ranges'] == [(100, 110), (599, 606)]
+        mock_ffmpeg.mask_violation_segments.assert_called_once_with(
+            video_path=source_video,
+            output_path=masked_path,
+            violation_ranges=[(100, 110), (600, 605)],
+            mask_text="此处内容因平台合规要求已被遮罩",
+            margin_sec=2.0,
+        )
+    @patch.object(BilibiliUploader, 'get_rejected_videos')
+    def test_fix_violation_uses_submit_helper(self, mock_rejected, tmp_path):
+        uploader = BilibiliUploader.__new__(BilibiliUploader)
+        uploader._cookie_loaded = True
+        uploader.cookie_data = {}
+
+        mock_rejected.return_value = [{
+            'aid': 12345, 'bvid': 'BV1xx', 'title': '测试', 'state': -2,
+            'problems': [{
+                'reason': '违规', 'violation_time': 'P1(00:10:00-00:10:05)',
+                'violation_position': '', 'modify_advise': '',
+                'is_full_video': False, 'time_ranges': [(600, 605)],
+            }],
+        }]
+
+        local_video = tmp_path / "video.mp4"
+        local_video.write_bytes(b'\x00' * 1024)
+        masked_path = tmp_path / "video_masked.mp4"
+        masked_path.write_bytes(b'\x00' * 2048)
+
+        uploader._render_violation_mask = MagicMock(return_value={
+            'masked_path': masked_path,
+            'all_ranges': [(100, 110), (599, 606)],
+        })
+        uploader._submit_violation_replacement = MagicMock(return_value={
+            'success': True,
+            'state': 'replacement_submitted',
+            'last_successful_state': 'replacement_submitted',
+            'message': '修复完成，已重新提交审核',
+            'upload_duration': 8.5,
+        })
+        uploader.replace_video = MagicMock(return_value=True)
+
+        result = uploader.fix_violation(
+            aid=12345,
+            video_path=local_video,
+            previous_ranges=[(100, 110)],
+            dry_run=False,
+        )
+
+        assert result['success'] is True
+        assert result['upload_duration'] == pytest.approx(8.5)
+        uploader._submit_violation_replacement.assert_called_once()
+        call = uploader._submit_violation_replacement.call_args
+        assert call.args == (12345, masked_path)
+        assert callable(call.kwargs['callback'])
+
 
 
 class TestDownloadVideo:
