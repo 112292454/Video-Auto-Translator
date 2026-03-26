@@ -344,11 +344,43 @@ class PlaylistService:
         callback: Callable[[str], None],
     ) -> Dict[str, Any]:
         """扫描 playlist entries，生成本轮 sync 的候选计划。"""
-        existing_video_ids = self.db.get_playlist_video_ids(playlist_id)
-        callback(f"已有 {len(existing_video_ids)} 个视频")
+        membership_plan = self._plan_sync_membership_candidates(
+            playlist_id=playlist_id,
+            entries=entries,
+            auto_add_videos=auto_add_videos,
+        )
+        callback(f"已有 {len(self.db.get_playlist_video_ids(playlist_id))} 个视频")
+        callback(f"Playlist 共 {membership_plan['total_videos']} 个视频")
 
+        refresh_plan = {'videos_needing_refresh': [], 'stale_zero_index_existing_videos': set()}
+        if fetch_upload_dates and membership_plan['existing_videos']:
+            refresh_plan = self._plan_existing_video_refreshes(
+                playlist_id=playlist_id,
+                existing_videos=membership_plan['existing_videos'],
+                callback=callback,
+            )
+
+        return {
+            'total_videos': membership_plan['total_videos'],
+            'new_videos': membership_plan['new_videos'],
+            'existing_videos': membership_plan['existing_videos'],
+            'new_video_candidates': membership_plan['new_video_candidates'],
+            'existing_playlist_updates': membership_plan['existing_playlist_updates'],
+            'videos_needing_refresh': refresh_plan['videos_needing_refresh'],
+            'stale_zero_index_existing_videos': refresh_plan['stale_zero_index_existing_videos'],
+            'videos_to_fetch': membership_plan['new_videos'] + refresh_plan['videos_needing_refresh'],
+        }
+
+    def _plan_sync_membership_candidates(
+        self,
+        *,
+        playlist_id: str,
+        entries: List[Optional[Dict[str, Any]]],
+        auto_add_videos: bool,
+    ) -> Dict[str, Any]:
+        """规划 playlist entries 对应的新成员、已存在成员与待落库候选。"""
+        existing_video_ids = self.db.get_playlist_video_ids(playlist_id)
         total_videos = len(entries)
-        callback(f"Playlist 共 {total_videos} 个视频")
 
         new_videos = []
         existing_videos = []
@@ -375,23 +407,12 @@ class PlaylistService:
                 'existing_video': self.db.get_video(video_id) if auto_add_videos else None,
             }
 
-        refresh_plan = {'videos_needing_refresh': [], 'stale_zero_index_existing_videos': set()}
-        if fetch_upload_dates and existing_videos:
-            refresh_plan = self._plan_existing_video_refreshes(
-                playlist_id=playlist_id,
-                existing_videos=existing_videos,
-                callback=callback,
-            )
-
         return {
             'total_videos': total_videos,
             'new_videos': new_videos,
             'existing_videos': existing_videos,
             'new_video_candidates': new_video_candidates,
             'existing_playlist_updates': existing_playlist_updates,
-            'videos_needing_refresh': refresh_plan['videos_needing_refresh'],
-            'stale_zero_index_existing_videos': refresh_plan['stale_zero_index_existing_videos'],
-            'videos_to_fetch': new_videos + refresh_plan['videos_needing_refresh'],
         }
 
     def _plan_existing_video_refreshes(

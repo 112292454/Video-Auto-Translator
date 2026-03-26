@@ -223,6 +223,73 @@ class TestSyncPlaylistContracts:
         assert plan["new_video_candidates"]["vid_new"]["playlist_index"] == 2
         assert plan["new_video_candidates"]["vid_new"]["existing_video"] is None
 
+    def test_plan_sync_membership_candidates_separates_existing_and_new_entries(self, db):
+        _setup_playlist(db, "PL_MEMBER_PLAN")
+        _add_pl_video(db, "vid_existing", playlist_id="PL_MEMBER_PLAN", index=7)
+        reused_video = Video(
+            id="vid_reused",
+            source_type=SourceType.YOUTUBE,
+            source_url="https://www.youtube.com/watch?v=vid_reused",
+            title="Reused Video",
+            metadata={},
+        )
+        db.add_video(reused_video)
+
+        service = PlaylistService(db)
+
+        planned = service._plan_sync_membership_candidates(
+            playlist_id="PL_MEMBER_PLAN",
+            entries=[
+                {"id": "vid_existing", "title": "Existing"},
+                None,
+                {"title": "No ID"},
+                {"id": "vid_reused", "title": "Reused"},
+                {"id": "vid_new", "title": "New"},
+            ],
+            auto_add_videos=True,
+        )
+
+        assert planned == {
+            "total_videos": 5,
+            "new_videos": ["vid_reused", "vid_new"],
+            "existing_videos": ["vid_existing"],
+            "new_video_candidates": {
+                "vid_reused": {
+                    "entry": {"id": "vid_reused", "title": "Reused"},
+                    "playlist_index": 4,
+                    "existing_video": reused_video,
+                },
+                "vid_new": {
+                    "entry": {"id": "vid_new", "title": "New"},
+                    "playlist_index": 5,
+                    "existing_video": None,
+                },
+            },
+            "existing_playlist_updates": [("vid_existing", 1)],
+        }
+
+    def test_plan_sync_membership_candidates_skips_db_lookup_when_auto_add_disabled(self, db):
+        _setup_playlist(db, "PL_MEMBER_NOADD")
+        reused_video = Video(
+            id="vid_reused",
+            source_type=SourceType.YOUTUBE,
+            source_url="https://www.youtube.com/watch?v=vid_reused",
+            title="Reused Video",
+            metadata={},
+        )
+        db.add_video(reused_video)
+
+        service = PlaylistService(db)
+
+        planned = service._plan_sync_membership_candidates(
+            playlist_id="PL_MEMBER_NOADD",
+            entries=[{"id": "vid_reused", "title": "Reused"}],
+            auto_add_videos=False,
+        )
+
+        assert planned["new_videos"] == ["vid_reused"]
+        assert planned["new_video_candidates"]["vid_reused"]["existing_video"] is None
+
     def test_plan_existing_video_refreshes_collects_refresh_targets_and_stale_indices(self, db):
         _setup_playlist(db, "PL_REFRESH_PLAN")
         _add_pl_video(db, "vid_refresh", playlist_id="PL_REFRESH_PLAN", index=1)
