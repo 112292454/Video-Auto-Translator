@@ -152,6 +152,74 @@ class TestFFmpegWrapperSoftEmbedContracts:
 
 
 class TestFFmpegWrapperHardEmbedPlanning:
+    def test_build_hard_embed_subtitle_filter_uses_ass_and_fontsdir_with_escaped_paths(self, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+
+        vf = wrapper._build_hard_embed_subtitle_filter(
+            subtitle_ext=".ass",
+            processed_subtitle=Path("/tmp/C:/subs/demo.ass"),
+            fonts_dir="/tmp/C:/fonts/demo",
+        )
+
+        assert vf == "ass='/tmp/C\\:/subs/demo.ass':fontsdir='/tmp/C\\:/fonts/demo'"
+
+    def test_build_hard_embed_subtitle_filter_uses_subtitles_filter_for_non_ass(self, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+
+        vf = wrapper._build_hard_embed_subtitle_filter(
+            subtitle_ext=".srt",
+            processed_subtitle=Path("/tmp/C:/subs/demo.srt"),
+            fonts_dir="/tmp/C:/fonts/demo",
+        )
+
+        assert vf == "subtitles='/tmp/C\\:/subs/demo.srt'"
+
+    def test_embed_subtitle_hard_delegates_subtitle_filter_planning_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.ass"
+        out = tmp_path / "out.mp4"
+        video.write_bytes(b"00")
+        sub.write_text("dummy", encoding="utf-8")
+        planned = []
+
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.init", lambda max_per_gpu=5: None)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.select_gpu", lambda: 0)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.acquire", lambda gpu_id, timeout=600: True)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.release", lambda gpu_id: None)
+        monkeypatch.setattr(wrapper, "_check_nvenc_support", lambda: True)
+        monkeypatch.setattr(wrapper, "get_video_info", lambda _path: {"bit_rate": 1000})
+        monkeypatch.setattr(
+            wrapper,
+            "_build_hard_embed_subtitle_filter",
+            lambda **kwargs: planned.append(kwargs) or "ass='planned'",
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_build_hard_embed_ffmpeg_command",
+            lambda **kwargs: ["ffmpeg", kwargs["vf"]],
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_run_ffmpeg_embed_process",
+            lambda **kwargs: True,
+            raising=False,
+        )
+
+        result = wrapper.embed_subtitle_hard(video, sub, out, gpu_device="auto", fonts_dir="/fonts")
+
+        assert result is True
+        assert planned == [{
+            "subtitle_ext": ".ass",
+            "processed_subtitle": sub,
+            "fonts_dir": "/fonts",
+        }]
+
     def test_build_hard_embed_ffmpeg_command_uses_hevc_nvenc_and_vbr_bitrate(self, monkeypatch, tmp_path):
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
         wrapper = FFmpegWrapper()

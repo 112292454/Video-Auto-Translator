@@ -452,23 +452,16 @@ class FFmpegWrapper:
                 logger.warning(f"ASS 预处理失败，使用原始文件: {e}")
                 processed_subtitle = subtitle_path
         
-        # 转义字幕路径（Windows路径处理）
-        subtitle_path_escaped = Path(processed_subtitle).as_posix().replace(":", r"\:")
-        
-        # 根据字幕格式选择滤镜
-        if subtitle_ext == '.ass':
-            vf = f"ass='{subtitle_path_escaped}'"
-            # 添加字体目录支持
-            if fonts_dir:
-                fonts_dir_escaped = Path(fonts_dir).as_posix().replace(":", r"\:")
-                vf += f":fontsdir='{fonts_dir_escaped}'"
-        else:
-            vf = f"subtitles='{subtitle_path_escaped}'"
-        
+        vf = self._build_hard_embed_subtitle_filter(
+            subtitle_ext=subtitle_ext,
+            processed_subtitle=processed_subtitle,
+            fonts_dir=fonts_dir,
+        )
+
         # ========== 阶段 2: 获取 NVENC 会话 + 构建 ffmpeg 命令 ==========
         # 预处理完成后才获取 GPU session，最大化 session 利用率。
         # ================================================================
-        
+
         # GPU 选择：通过 session manager 均衡分配
         if gpu_device == "auto":
             gpu_id = _nvenc_manager.select_gpu()
@@ -479,14 +472,14 @@ class FFmpegWrapper:
                 gpu_id = int(gpu_device.split(":")[1])
             except (IndexError, ValueError):
                 raise ValueError(f"无效的 GPU 设备格式: {gpu_device}")
-        
+
         # 获取 NVENC 会话槽位（阻塞等待，最多 10 分钟）
         if not _nvenc_manager.acquire(gpu_id, timeout=600):
             raise RuntimeError(
                 f"NVENC 会话获取超时: GPU {gpu_id}，"
                 f"所有 {max_nvenc_sessions} 个槽位已满且 10 分钟内未释放"
             )
-        
+
         # 检查是否支持 NVENC
         if not self._check_nvenc_support():
             _nvenc_manager.release(gpu_id)
@@ -525,6 +518,25 @@ class FFmpegWrapper:
                     Path(temp_file).unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    def _build_hard_embed_subtitle_filter(
+        self,
+        *,
+        subtitle_ext: str,
+        processed_subtitle: Path,
+        fonts_dir: Optional[str],
+    ) -> str:
+        """构建硬字幕合成使用的字幕滤镜。"""
+        subtitle_path_escaped = Path(processed_subtitle).as_posix().replace(":", r"\:")
+
+        if subtitle_ext == '.ass':
+            vf = f"ass='{subtitle_path_escaped}'"
+            if fonts_dir:
+                fonts_dir_escaped = Path(fonts_dir).as_posix().replace(":", r"\:")
+                vf += f":fontsdir='{fonts_dir_escaped}'"
+            return vf
+
+        return f"subtitles='{subtitle_path_escaped}'"
 
     def _build_hard_embed_ffmpeg_command(
         self,
