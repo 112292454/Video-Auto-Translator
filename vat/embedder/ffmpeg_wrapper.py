@@ -1002,6 +1002,49 @@ class FFmpegWrapper:
         merged = self._merge_ranges(violation_ranges, margin_sec, duration)
         return video_info, width, height, merged
 
+    def _plan_mask_violation_filters(
+        self,
+        *,
+        width: int,
+        height: int,
+        merged: List[tuple],
+        mask_text: str,
+    ) -> tuple[str, str]:
+        """规划违规遮罩所需的音视频滤镜。"""
+        vf_parts = []
+        af_parts = []
+
+        escaped_text = mask_text.replace("'", "\\'").replace(":", "\\:")
+        fontsize = max(24, height // 30)
+        cjk_font = self._find_cjk_font()
+        if cjk_font:
+            escaped_font = cjk_font.replace(":", "\\:").replace("'", "\\'")
+            font_param = f":fontfile='{escaped_font}'"
+            logger.info(f"使用 CJK 字体: {cjk_font}")
+        else:
+            logger.warning("未找到 CJK 字体，中文文字可能无法正常显示")
+            font_param = ""
+
+        for start, end in merged:
+            vf_parts.append(
+                f"drawbox=x=0:y=0:w={width}:h={height}:color=black:t=fill"
+                f":enable='between(t,{start},{end})'"
+            )
+            vf_parts.append(
+                f"drawtext=text='{escaped_text}'"
+                f"{font_param}"
+                f":fontsize={fontsize}:fontcolor=white"
+                f":x=(w-text_w)/2:y=(h-text_h)/2"
+                f":enable='between(t,{start},{end})'"
+            )
+            af_parts.append(
+                f"volume=enable='between(t,{start},{end})':volume=0"
+            )
+
+        vf = ",".join(vf_parts)
+        af = ",".join(af_parts) if af_parts else "anull"
+        return vf, af
+
     def mask_violation_segments(
         self,
         video_path: Path,
@@ -1038,52 +1081,18 @@ class FFmpegWrapper:
             return False
 
         video_info, width, height, merged = context
-        
+
         logger.info(f"遮罩 {len(merged)} 个违规片段（含 {margin_sec}s 安全边距）:")
         for start, end in merged:
             logger.info(f"  {_format_time(start)} - {_format_time(end)} ({end - start:.1f}s)")
-        
-        # 构建 ffmpeg 复合滤镜
-        # 策略：对每个违规区间，用 drawbox 覆盖整个画面（黑色），再叠加说明文字
-        # 同时用 volume 滤镜将对应区间的音频静音
-        
-        # 视频滤镜：黑屏 + 文字
-        vf_parts = []
-        af_parts = []
-        
-        # 查找 CJK 字体（只查一次）
-        escaped_text = mask_text.replace("'", "\\'").replace(":", "\\:")
-        fontsize = max(24, height // 30)
-        cjk_font = self._find_cjk_font()
-        if cjk_font:
-            escaped_font = cjk_font.replace(":", "\\:").replace("'", "\\'")
-            font_param = f":fontfile='{escaped_font}'"
-            logger.info(f"使用 CJK 字体: {cjk_font}")
-        else:
-            logger.warning("未找到 CJK 字体，中文文字可能无法正常显示")
-            font_param = ""
-        
-        for start, end in merged:
-            # drawbox 覆盖整个画面为黑色
-            vf_parts.append(
-                f"drawbox=x=0:y=0:w={width}:h={height}:color=black:t=fill"
-                f":enable='between(t,{start},{end})'"
-            )
-            vf_parts.append(
-                f"drawtext=text='{escaped_text}'"
-                f"{font_param}"
-                f":fontsize={fontsize}:fontcolor=white"
-                f":x=(w-text_w)/2:y=(h-text_h)/2"
-                f":enable='between(t,{start},{end})'"
-            )
-            # 音频静音
-            af_parts.append(
-                f"volume=enable='between(t,{start},{end})':volume=0"
-            )
-        
-        vf = ",".join(vf_parts)
-        af = ",".join(af_parts) if af_parts else "anull"
-        
+
+        vf, af = self._plan_mask_violation_filters(
+            width=width,
+            height=height,
+            merged=merged,
+            mask_text=mask_text,
+        )
+
         # GPU 编码选择
         _nvenc_manager.init()
         

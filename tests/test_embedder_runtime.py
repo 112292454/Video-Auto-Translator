@@ -1745,6 +1745,93 @@ class TestFFmpegWrapperMaskViolationPlanning:
         assert merge_calls == [([(10.0, 12.0)], 1.5, 120.0)]
         assert out.parent.exists() is True
 
+    def test_plan_mask_violation_filters_builds_expected_vf_and_af_with_cjk_font(self, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+
+        monkeypatch.setattr(
+            wrapper,
+            "_find_cjk_font",
+            lambda: "/fonts/Noto CJK:Bold's.otf",
+            raising=False,
+        )
+
+        vf, af = wrapper._plan_mask_violation_filters(
+            width=1280,
+            height=720,
+            merged=[(8.5, 13.5), (20.0, 25.0)],
+            mask_text="违规:'片段':说明",
+        )
+
+        assert vf == (
+            "drawbox=x=0:y=0:w=1280:h=720:color=black:t=fill:enable='between(t,8.5,13.5)',"
+            "drawtext=text='违规\\:\\'片段\\'\\:说明':fontfile='/fonts/Noto CJK\\:Bold\\'s.otf':fontsize=24:fontcolor=white"
+            ":x=(w-text_w)/2:y=(h-text_h)/2:enable='between(t,8.5,13.5)',"
+            "drawbox=x=0:y=0:w=1280:h=720:color=black:t=fill:enable='between(t,20.0,25.0)',"
+            "drawtext=text='违规\\:\\'片段\\'\\:说明':fontfile='/fonts/Noto CJK\\:Bold\\'s.otf':fontsize=24:fontcolor=white"
+            ":x=(w-text_w)/2:y=(h-text_h)/2:enable='between(t,20.0,25.0)'"
+        )
+        assert af == (
+            "volume=enable='between(t,8.5,13.5)':volume=0,"
+            "volume=enable='between(t,20.0,25.0)':volume=0"
+        )
+
+    def test_mask_violation_segments_delegates_filter_planning_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        out = tmp_path / "masked.mp4"
+        video.write_bytes(b"00")
+        delegated = []
+
+        monkeypatch.setattr(
+            wrapper,
+            "_prepare_mask_violation_context",
+            lambda **kwargs: (
+                {"duration": 120.0, "video": {"width": 1280, "height": 720}, "bit_rate": 2468},
+                1280,
+                720,
+                [(8.5, 13.5)],
+            ),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_plan_mask_violation_filters",
+            lambda **kwargs: delegated.append(kwargs) or ("vf=planned", "af=planned"),
+            raising=False,
+        )
+        monkeypatch.setattr(wrapper, "_find_cjk_font", lambda: pytest.fail("unexpected inline font lookup"), raising=False)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.init", lambda max_per_gpu=5: None)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.select_gpu", lambda: 0)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.acquire", lambda gpu_id, timeout=300: True)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.release", lambda gpu_id: None)
+
+        def fake_run(cmd, capture_output, text, timeout):
+            assert cmd[cmd.index("-vf") + 1] == "vf=planned"
+            assert cmd[cmd.index("-af") + 1] == "af=planned"
+            out.write_bytes(b"ok")
+            return SimpleNamespace(returncode=0, stderr="")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        result = wrapper.mask_violation_segments(
+            video_path=video,
+            output_path=out,
+            violation_ranges=[(10.0, 12.0)],
+            mask_text="此处内容因平台合规要求已被遮罩",
+            gpu_device="auto",
+            margin_sec=1.5,
+        )
+
+        assert result is True
+        assert delegated == [{
+            "width": 1280,
+            "height": 720,
+            "merged": [(8.5, 13.5)],
+            "mask_text": "此处内容因平台合规要求已被遮罩",
+        }]
+
     def test_mask_violation_segments_delegates_context_stage(self, monkeypatch, tmp_path):
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
         wrapper = FFmpegWrapper()
