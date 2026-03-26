@@ -406,52 +406,14 @@ class FFmpegWrapper:
         # 避免在字体渲染/自动换行期间空耗 GPU 会话槽位。
         # ============================================================================
         if subtitle_ext == '.ass' and subtitle_style:
-            try:
-                from vat.asr import ASRData
-                from vat.asr.subtitle import get_subtitle_style, auto_wrap_ass_file, compute_subtitle_scale_factor
-                
-                # Step 1: 获取视频分辨率，用于样式缩放
-                width, height = self._get_video_resolution(video_path)
-                
-                # Step 2: 加载并缩放样式
-                style_str = get_subtitle_style(subtitle_style, style_dir=style_dir)
-                if not style_str:
-                    logger.warning(f"无法加载样式 '{subtitle_style}'，使用默认样式")
-                    style_str = get_subtitle_style("default", style_dir=style_dir) or ""
-                
-                scale_factor = compute_subtitle_scale_factor(width, height, reference_height)
-                style_str = self._scale_ass_style(
-                    style_str, scale_factor,
-                    video_width=width, video_height=height,
-                )
-                
-                # Step 3: 加载字幕数据并重新生成 ASS
-                asr_data = ASRData.from_subtitle_file(str(subtitle_path))
-                
-                # 生成临时 ASS 文件（布局固定：原文在上，译文在下）
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".ass", delete=False, encoding="utf-8"
-                ) as temp_file:
-                    ass_content = asr_data.to_ass(
-                        style_str=style_str,
-                        video_width=width,
-                        video_height=height,
-                    )
-                    temp_file.write(ass_content)
-                    temp_ass_path = temp_file.name
-                    temp_files_to_cleanup.append(temp_ass_path)
-                
-                # Step 4: 自动换行处理（CPU 密集：逐行字体渲染测量宽度）
-                processed_subtitle_path = auto_wrap_ass_file(temp_ass_path, fonts_dir=fonts_dir)
-                processed_subtitle = Path(processed_subtitle_path)
-                # 如果换行处理生成了新文件，也需要清理
-                if processed_subtitle_path != temp_ass_path:
-                    temp_files_to_cleanup.append(processed_subtitle_path)
-                
-            except Exception as e:
-                logger.warning(f"ASS 预处理失败，使用原始文件: {e}")
-                processed_subtitle = subtitle_path
-        
+            processed_subtitle, temp_files_to_cleanup = self._prepare_hard_embed_ass_subtitle(
+                video_path=video_path,
+                subtitle_path=subtitle_path,
+                subtitle_style=subtitle_style,
+                style_dir=style_dir,
+                fonts_dir=fonts_dir,
+                reference_height=reference_height,
+            )
         vf = self._build_hard_embed_subtitle_filter(
             subtitle_ext=subtitle_ext,
             processed_subtitle=processed_subtitle,
@@ -512,6 +474,63 @@ class FFmpegWrapper:
             return int(gpu_device.split(":")[1])
         except (IndexError, ValueError):
             raise ValueError(f"无效的 GPU 设备格式: {gpu_device}")
+
+    def _prepare_hard_embed_ass_subtitle(
+        self,
+        *,
+        video_path: Path,
+        subtitle_path: Path,
+        subtitle_style: str,
+        style_dir: Optional[str],
+        fonts_dir: Optional[str],
+        reference_height: int,
+    ) -> tuple[Path, list[str]]:
+        """为硬字幕合成预处理 ASS 字幕输入。"""
+        processed_subtitle = subtitle_path
+        temp_files_to_cleanup: list[str] = []
+
+        try:
+            from vat.asr import ASRData
+            from vat.asr.subtitle import get_subtitle_style, auto_wrap_ass_file, compute_subtitle_scale_factor
+
+            width, height = self._get_video_resolution(video_path)
+
+            style_str = get_subtitle_style(subtitle_style, style_dir=style_dir)
+            if not style_str:
+                logger.warning(f"无法加载样式 '{subtitle_style}'，使用默认样式")
+                style_str = get_subtitle_style("default", style_dir=style_dir) or ""
+
+            scale_factor = compute_subtitle_scale_factor(width, height, reference_height)
+            style_str = self._scale_ass_style(
+                style_str,
+                scale_factor,
+                video_width=width,
+                video_height=height,
+            )
+
+            asr_data = ASRData.from_subtitle_file(str(subtitle_path))
+
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".ass", delete=False, encoding="utf-8"
+            ) as temp_file:
+                ass_content = asr_data.to_ass(
+                    style_str=style_str,
+                    video_width=width,
+                    video_height=height,
+                )
+                temp_file.write(ass_content)
+                temp_ass_path = temp_file.name
+                temp_files_to_cleanup.append(temp_ass_path)
+
+            processed_subtitle_path = auto_wrap_ass_file(temp_ass_path, fonts_dir=fonts_dir)
+            processed_subtitle = Path(processed_subtitle_path)
+            if processed_subtitle_path != temp_ass_path:
+                temp_files_to_cleanup.append(processed_subtitle_path)
+        except Exception as e:
+            logger.warning(f"ASS 预处理失败，使用原始文件: {e}")
+            processed_subtitle = subtitle_path
+
+        return processed_subtitle, temp_files_to_cleanup
 
     def _build_hard_embed_subtitle_filter(
         self,

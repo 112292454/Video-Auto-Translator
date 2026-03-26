@@ -2,6 +2,9 @@
 
 import json
 import subprocess
+import sys
+import tempfile
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -267,6 +270,320 @@ class TestFFmpegWrapperHardEmbedPlanning:
             "processed_subtitle": sub,
             "fonts_dir": "/fonts",
         }]
+
+    def test_prepare_hard_embed_ass_subtitle_uses_named_style_wraps_and_tracks_temp_files(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.ass"
+        video.write_bytes(b"00")
+        sub.write_text("dummy", encoding="utf-8")
+        temp_ass = tmp_path / "temp.ass"
+        wrapped_ass = tmp_path / "wrapped.ass"
+        style_calls = []
+        scale_calls = []
+        from_calls = []
+        to_ass_calls = []
+        auto_wrap_calls = []
+
+        class _FakeSubtitleData:
+            def to_ass(self, **kwargs):
+                to_ass_calls.append(kwargs)
+                return "ass-content"
+
+        class _FakeASRData:
+            @staticmethod
+            def from_subtitle_file(path):
+                from_calls.append(path)
+                return _FakeSubtitleData()
+
+        class _FakeTempFile:
+            def __init__(self, path):
+                self.name = str(path)
+                self._path = path
+
+            def write(self, content):
+                self._path.write_text(content, encoding="utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        fake_asr_module = types.ModuleType("vat.asr")
+        fake_asr_module.ASRData = _FakeASRData
+        fake_subtitle_module = types.ModuleType("vat.asr.subtitle")
+
+        def _fake_get_subtitle_style(name, style_dir=None):
+            style_calls.append((name, style_dir))
+            return "named-style"
+
+        def _fake_compute_subtitle_scale_factor(width, height, reference_height):
+            return 1.25
+
+        def _fake_auto_wrap_ass_file(path, fonts_dir=None):
+            auto_wrap_calls.append((path, fonts_dir))
+            return str(wrapped_ass)
+
+        fake_subtitle_module.get_subtitle_style = _fake_get_subtitle_style
+        fake_subtitle_module.compute_subtitle_scale_factor = _fake_compute_subtitle_scale_factor
+        fake_subtitle_module.auto_wrap_ass_file = _fake_auto_wrap_ass_file
+
+        monkeypatch.setitem(sys.modules, "vat.asr", fake_asr_module)
+        monkeypatch.setitem(sys.modules, "vat.asr.subtitle", fake_subtitle_module)
+        monkeypatch.setattr(wrapper, "_get_video_resolution", lambda path: (1920, 1080))
+        monkeypatch.setattr(
+            wrapper,
+            "_scale_ass_style",
+            lambda style_str, scale_factor, video_width, video_height: scale_calls.append(
+                (style_str, scale_factor, video_width, video_height)
+            ) or "scaled-style",
+        )
+        monkeypatch.setattr(tempfile, "NamedTemporaryFile", lambda **kwargs: _FakeTempFile(temp_ass))
+
+        processed_subtitle, temp_files_to_cleanup = wrapper._prepare_hard_embed_ass_subtitle(
+            video_path=video,
+            subtitle_path=sub,
+            subtitle_style="named-style",
+            style_dir="/styles",
+            fonts_dir="/fonts",
+            reference_height=720,
+        )
+
+        assert processed_subtitle == wrapped_ass
+        assert temp_files_to_cleanup == [str(temp_ass), str(wrapped_ass)]
+        assert style_calls == [("named-style", "/styles")]
+        assert scale_calls == [("named-style", 1.25, 1920, 1080)]
+        assert from_calls == [str(sub)]
+        assert to_ass_calls == [{"style_str": "scaled-style", "video_width": 1920, "video_height": 1080}]
+        assert auto_wrap_calls == [(str(temp_ass), "/fonts")]
+        assert temp_ass.read_text(encoding="utf-8") == "ass-content"
+
+    def test_prepare_hard_embed_ass_subtitle_falls_back_to_original_when_style_lookup_raises(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.ass"
+        video.write_bytes(b"00")
+        sub.write_text("dummy", encoding="utf-8")
+        style_calls = []
+
+        class _FakeASRData:
+            @staticmethod
+            def from_subtitle_file(path):
+                pytest.fail("unexpected ass conversion")
+
+        fake_asr_module = types.ModuleType("vat.asr")
+        fake_asr_module.ASRData = _FakeASRData
+        fake_subtitle_module = types.ModuleType("vat.asr.subtitle")
+
+        def _fake_get_subtitle_style(name, style_dir=None):
+            style_calls.append((name, style_dir))
+            raise AssertionError(f"样式文件不存在: {style_dir}/{name}.txt")
+
+        fake_subtitle_module.get_subtitle_style = _fake_get_subtitle_style
+        fake_subtitle_module.compute_subtitle_scale_factor = (
+            lambda width, height, reference_height: pytest.fail("unexpected scale computation")
+        )
+        fake_subtitle_module.auto_wrap_ass_file = lambda path, fonts_dir=None: pytest.fail("unexpected auto wrap")
+
+        monkeypatch.setitem(sys.modules, "vat.asr", fake_asr_module)
+        monkeypatch.setitem(sys.modules, "vat.asr.subtitle", fake_subtitle_module)
+        monkeypatch.setattr(wrapper, "_get_video_resolution", lambda path: (1920, 1080))
+        monkeypatch.setattr(
+            wrapper,
+            "_scale_ass_style",
+            lambda style_str, scale_factor, video_width, video_height: pytest.fail("unexpected style scaling"),
+        )
+        monkeypatch.setattr(
+            tempfile,
+            "NamedTemporaryFile",
+            lambda **kwargs: pytest.fail("unexpected temp file creation"),
+        )
+
+        processed_subtitle, temp_files_to_cleanup = wrapper._prepare_hard_embed_ass_subtitle(
+            video_path=video,
+            subtitle_path=sub,
+            subtitle_style="missing-style",
+            style_dir="/styles",
+            fonts_dir="/fonts",
+            reference_height=720,
+        )
+
+        assert processed_subtitle == sub
+        assert temp_files_to_cleanup == []
+        assert style_calls == [("missing-style", "/styles")]
+
+    def test_prepare_hard_embed_ass_subtitle_falls_back_to_original_and_keeps_temp_file_on_wrap_failure(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.ass"
+        video.write_bytes(b"00")
+        sub.write_text("dummy", encoding="utf-8")
+        temp_ass = tmp_path / "temp.ass"
+
+        class _FakeSubtitleData:
+            def to_ass(self, **kwargs):
+                return "ass-content"
+
+        class _FakeASRData:
+            @staticmethod
+            def from_subtitle_file(path):
+                return _FakeSubtitleData()
+
+        class _FakeTempFile:
+            def __init__(self, path):
+                self.name = str(path)
+                self._path = path
+
+            def write(self, content):
+                self._path.write_text(content, encoding="utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        fake_asr_module = types.ModuleType("vat.asr")
+        fake_asr_module.ASRData = _FakeASRData
+        fake_subtitle_module = types.ModuleType("vat.asr.subtitle")
+        fake_subtitle_module.get_subtitle_style = lambda name, style_dir=None: "named-style"
+        fake_subtitle_module.compute_subtitle_scale_factor = lambda width, height, reference_height: 1.0
+        fake_subtitle_module.auto_wrap_ass_file = lambda path, fonts_dir=None: (_ for _ in ()).throw(RuntimeError("wrap failed"))
+
+        monkeypatch.setitem(sys.modules, "vat.asr", fake_asr_module)
+        monkeypatch.setitem(sys.modules, "vat.asr.subtitle", fake_subtitle_module)
+        monkeypatch.setattr(wrapper, "_get_video_resolution", lambda path: (1280, 720))
+        monkeypatch.setattr(
+            wrapper,
+            "_scale_ass_style",
+            lambda style_str, scale_factor, video_width, video_height: "scaled-style",
+        )
+        monkeypatch.setattr(tempfile, "NamedTemporaryFile", lambda **kwargs: _FakeTempFile(temp_ass))
+
+        processed_subtitle, temp_files_to_cleanup = wrapper._prepare_hard_embed_ass_subtitle(
+            video_path=video,
+            subtitle_path=sub,
+            subtitle_style="named-style",
+            style_dir="/styles",
+            fonts_dir="/fonts",
+            reference_height=720,
+        )
+
+        assert processed_subtitle == sub
+        assert temp_files_to_cleanup == [str(temp_ass)]
+        assert temp_ass.read_text(encoding="utf-8") == "ass-content"
+
+    def test_embed_subtitle_hard_delegates_ass_preprocess_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.ass"
+        out = tmp_path / "out.mp4"
+        processed_ass = tmp_path / "processed.ass"
+        video.write_bytes(b"00")
+        sub.write_text("dummy", encoding="utf-8")
+        prepared = []
+        planned = []
+
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.init", lambda max_per_gpu=5: None)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.release", lambda gpu_id: None)
+        monkeypatch.setattr(wrapper, "_resolve_hard_embed_gpu_device", lambda gpu_device: 0, raising=False)
+        monkeypatch.setattr(wrapper, "_prepare_hard_embed_nvenc_session", lambda **kwargs: None, raising=False)
+        monkeypatch.setattr(wrapper, "_get_video_resolution", lambda path: pytest.fail("unexpected inline ass preprocess"))
+        monkeypatch.setattr(
+            wrapper,
+            "_prepare_hard_embed_ass_subtitle",
+            lambda **kwargs: prepared.append(kwargs) or (processed_ass, [str(tmp_path / "temp.ass")]),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_build_hard_embed_subtitle_filter",
+            lambda **kwargs: planned.append(kwargs) or "ass='planned'",
+            raising=False,
+        )
+        monkeypatch.setattr(wrapper, "_probe_hard_embed_original_bitrate", lambda video_path: 1000, raising=False)
+        monkeypatch.setattr(wrapper, "_build_hard_embed_ffmpeg_command", lambda **kwargs: ["ffmpeg", "planned"], raising=False)
+        monkeypatch.setattr(wrapper, "_run_ffmpeg_embed_process", lambda **kwargs: True, raising=False)
+
+        result = wrapper.embed_subtitle_hard(
+            video,
+            sub,
+            out,
+            gpu_device="auto",
+            subtitle_style="named-style",
+            style_dir="/styles",
+            fonts_dir="/fonts",
+            reference_height=900,
+        )
+
+        assert result is True
+        assert prepared == [{
+            "video_path": video,
+            "subtitle_path": sub,
+            "subtitle_style": "named-style",
+            "style_dir": "/styles",
+            "fonts_dir": "/fonts",
+            "reference_height": 900,
+        }]
+        assert planned and planned[0]["processed_subtitle"] == processed_ass
+
+    def test_embed_subtitle_hard_cleans_up_ass_temp_files_from_prepare_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.ass"
+        out = tmp_path / "out.mp4"
+        processed_ass = tmp_path / "processed.ass"
+        temp_ass = tmp_path / "temp.ass"
+        wrapped_ass = tmp_path / "wrapped.ass"
+        video.write_bytes(b"00")
+        sub.write_text("dummy", encoding="utf-8")
+        processed_ass.write_text("processed", encoding="utf-8")
+        temp_ass.write_text("temp", encoding="utf-8")
+        wrapped_ass.write_text("wrapped", encoding="utf-8")
+        released = []
+
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.init", lambda max_per_gpu=5: None)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.release", lambda gpu_id: released.append(gpu_id))
+        monkeypatch.setattr(wrapper, "_resolve_hard_embed_gpu_device", lambda gpu_device: 0, raising=False)
+        monkeypatch.setattr(wrapper, "_prepare_hard_embed_nvenc_session", lambda **kwargs: None, raising=False)
+        monkeypatch.setattr(
+            wrapper,
+            "_prepare_hard_embed_ass_subtitle",
+            lambda **kwargs: (processed_ass, [str(temp_ass), str(wrapped_ass)]),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_build_hard_embed_subtitle_filter",
+            lambda **kwargs: "ass='planned'" if kwargs["processed_subtitle"] == processed_ass else pytest.fail("unexpected processed subtitle"),
+            raising=False,
+        )
+        monkeypatch.setattr(wrapper, "_probe_hard_embed_original_bitrate", lambda video_path: 1000, raising=False)
+        monkeypatch.setattr(wrapper, "_build_hard_embed_ffmpeg_command", lambda **kwargs: ["ffmpeg", "planned"], raising=False)
+        monkeypatch.setattr(wrapper, "_run_ffmpeg_embed_process", lambda **kwargs: True, raising=False)
+
+        result = wrapper.embed_subtitle_hard(
+            video,
+            sub,
+            out,
+            gpu_device="auto",
+            subtitle_style="named-style",
+            style_dir="/styles",
+            fonts_dir="/fonts",
+            reference_height=900,
+        )
+
+        assert result is True
+        assert released == [0]
+        assert temp_ass.exists() is False
+        assert wrapped_ass.exists() is False
+        assert processed_ass.exists() is True
 
     def test_prepare_hard_embed_nvenc_session_acquires_slot_and_checks_support(self, monkeypatch):
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
