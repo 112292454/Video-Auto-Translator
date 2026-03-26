@@ -1689,3 +1689,112 @@ class TestFFmpegWrapperHardEmbedContracts:
             wrapper.embed_subtitle_hard(video, sub, out, gpu_device="auto")
 
         assert released == [2]
+
+
+class TestFFmpegWrapperMaskViolationPlanning:
+    def test_prepare_mask_violation_context_returns_none_when_video_missing(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        missing_video = tmp_path / "missing.mp4"
+        out = tmp_path / "nested" / "masked.mp4"
+
+        monkeypatch.setattr(wrapper, "get_video_info", lambda path: pytest.fail("unexpected video info fetch"))
+
+        context = wrapper._prepare_mask_violation_context(
+            video_path=missing_video,
+            output_path=out,
+            violation_ranges=[(10.0, 12.0)],
+            margin_sec=1.5,
+        )
+
+        assert context is None
+        assert out.parent.exists() is False
+
+    def test_prepare_mask_violation_context_reads_video_info_and_merges_ranges(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        out = tmp_path / "nested" / "masked.mp4"
+        video.write_bytes(b"00")
+        video_info = {
+            "duration": 120.0,
+            "video": {"width": 1280, "height": 720},
+            "bit_rate": 2468,
+        }
+        merge_calls = []
+
+        monkeypatch.setattr(wrapper, "get_video_info", lambda path: video_info)
+        monkeypatch.setattr(
+            wrapper,
+            "_merge_ranges",
+            lambda ranges, margin, max_duration: merge_calls.append((ranges, margin, max_duration)) or [(8.5, 13.5)],
+            raising=False,
+        )
+
+        resolved_video_info, width, height, merged = wrapper._prepare_mask_violation_context(
+            video_path=video,
+            output_path=out,
+            violation_ranges=[(10.0, 12.0)],
+            margin_sec=1.5,
+        )
+
+        assert resolved_video_info == video_info
+        assert width == 1280
+        assert height == 720
+        assert merged == [(8.5, 13.5)]
+        assert merge_calls == [([(10.0, 12.0)], 1.5, 120.0)]
+        assert out.parent.exists() is True
+
+    def test_mask_violation_segments_delegates_context_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        out = tmp_path / "masked.mp4"
+        video.write_bytes(b"00")
+        delegated = []
+
+        monkeypatch.setattr(
+            wrapper,
+            "_prepare_mask_violation_context",
+            lambda **kwargs: delegated.append(kwargs) or (
+                {"duration": 120.0, "video": {"width": 1280, "height": 720}, "bit_rate": 2468},
+                1280,
+                720,
+                [(8.5, 13.5)],
+            ),
+            raising=False,
+        )
+        monkeypatch.setattr(wrapper, "get_video_info", lambda path: pytest.fail("unexpected inline video info fetch"))
+        monkeypatch.setattr(wrapper, "_merge_ranges", lambda *args, **kwargs: pytest.fail("unexpected inline range merge"), raising=False)
+        monkeypatch.setattr(
+            Path,
+            "mkdir",
+            lambda self, parents=False, exist_ok=False: pytest.fail("unexpected inline output dir setup"),
+        )
+        monkeypatch.setattr(wrapper, "_find_cjk_font", lambda: None, raising=False)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.init", lambda max_per_gpu=5: None)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.select_gpu", lambda: 0)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.acquire", lambda gpu_id, timeout=300: True)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.release", lambda gpu_id: None)
+
+        def fake_run(cmd, capture_output, text, timeout):
+            out.write_bytes(b"ok")
+            return SimpleNamespace(returncode=0, stderr="")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        result = wrapper.mask_violation_segments(
+            video_path=video,
+            output_path=out,
+            violation_ranges=[(10.0, 12.0)],
+            gpu_device="auto",
+            margin_sec=1.5,
+        )
+
+        assert result is True
+        assert delegated == [{
+            "video_path": video,
+            "output_path": out,
+            "violation_ranges": [(10.0, 12.0)],
+            "margin_sec": 1.5,
+        }]

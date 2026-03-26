@@ -972,6 +972,36 @@ class FFmpegWrapper:
         
         return None
 
+    def _prepare_mask_violation_context(
+        self,
+        *,
+        video_path: Path,
+        output_path: Path,
+        violation_ranges: List[tuple],
+        margin_sec: float,
+    ) -> Optional[tuple[Dict[str, Any], int, int, List[tuple]]]:
+        """准备违规遮罩前置上下文。"""
+        if not video_path.exists():
+            logger.error(f"输入视频不存在: {video_path}")
+            return None
+
+        if not violation_ranges:
+            logger.warning("无违规时间段，无需处理")
+            return None
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        video_info = self.get_video_info(video_path)
+        if not video_info:
+            logger.error("无法获取视频信息")
+            return None
+
+        duration = video_info.get('duration', 0)
+        width = video_info.get('video', {}).get('width', 1920) if video_info.get('video') else 1920
+        height = video_info.get('video', {}).get('height', 1080) if video_info.get('video') else 1080
+        merged = self._merge_ranges(violation_ranges, margin_sec, duration)
+        return video_info, width, height, merged
+
     def mask_violation_segments(
         self,
         video_path: Path,
@@ -998,28 +1028,16 @@ class FFmpegWrapper:
         Returns:
             是否成功
         """
-        if not video_path.exists():
-            logger.error(f"输入视频不存在: {video_path}")
+        context = self._prepare_mask_violation_context(
+            video_path=video_path,
+            output_path=output_path,
+            violation_ranges=violation_ranges,
+            margin_sec=margin_sec,
+        )
+        if context is None:
             return False
-        
-        if not violation_ranges:
-            logger.warning("无违规时间段，无需处理")
-            return False
-        
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # 获取视频信息
-        video_info = self.get_video_info(video_path)
-        if not video_info:
-            logger.error("无法获取视频信息")
-            return False
-        
-        duration = video_info.get('duration', 0)
-        width = video_info.get('video', {}).get('width', 1920) if video_info.get('video') else 1920
-        height = video_info.get('video', {}).get('height', 1080) if video_info.get('video') else 1080
-        
-        # 合并重叠的违规区间并添加安全边距
-        merged = self._merge_ranges(violation_ranges, margin_sec, duration)
+
+        video_info, width, height, merged = context
         
         logger.info(f"遮罩 {len(merged)} 个违规片段（含 {margin_sec}s 安全边距）:")
         for start, end in merged:
