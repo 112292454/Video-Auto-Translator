@@ -72,6 +72,19 @@ _translate_executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="tra
 
 
 @dataclass
+class SyncPlaylistPreparedState:
+    """prepare 阶段产出的 commit 载体。"""
+    total_videos: int
+    new_videos: List[str]
+    existing_videos: List[str]
+    new_video_candidates: Dict[str, Dict[str, Any]]
+    existing_playlist_updates: List[tuple[str, int]]
+    should_apply_fetch_results: bool = False
+    pruned_stale_existing_videos: Set[str] = field(default_factory=set)
+    fetch_results: List[tuple[str, VideoInfoResult]] = field(default_factory=list)
+
+
+@dataclass
 class SyncResult:
     """同步结果"""
     playlist_id: str
@@ -179,16 +192,9 @@ class PlaylistService:
         return self._commit_sync_playlist_flow(
             playlist_id=playlist_id,
             playlist_title=playlist_title,
-            total_videos=prepared['total_videos'],
             channel=channel,
             auto_add_videos=auto_add_videos,
-            existing_playlist_updates=prepared['existing_playlist_updates'],
-            new_videos=prepared['new_videos'],
-            new_video_candidates=prepared['new_video_candidates'],
-            existing_videos=prepared['existing_videos'],
-            should_apply_fetch_results=prepared['should_apply_fetch_results'],
-            pruned_stale_existing_videos=prepared['pruned_stale_existing_videos'],
-            fetch_results=prepared['fetch_results'],
+            prepared=prepared,
             callback=callback,
         )
 
@@ -200,7 +206,7 @@ class PlaylistService:
         auto_add_videos: bool,
         fetch_upload_dates: bool,
         callback: Callable[[str], None],
-    ) -> Dict[str, Any]:
+    ) -> SyncPlaylistPreparedState:
         """为 sync_playlist 准备执行计划，并在需要时应用 fetch/prune 调整。"""
         sync_plan = self._plan_sync_candidates(
             playlist_id=playlist_id,
@@ -210,38 +216,34 @@ class PlaylistService:
             callback=callback,
         )
 
-        prepared = {
-            'total_videos': sync_plan['total_videos'],
-            'new_videos': sync_plan['new_videos'],
-            'existing_videos': sync_plan['existing_videos'],
-            'new_video_candidates': sync_plan['new_video_candidates'],
-            'existing_playlist_updates': sync_plan['existing_playlist_updates'],
-            'should_apply_fetch_results': False,
-            'pruned_stale_existing_videos': set(),
-            'fetch_results': [],
-        }
+        prepared = SyncPlaylistPreparedState(
+            total_videos=sync_plan['total_videos'],
+            new_videos=sync_plan['new_videos'],
+            existing_videos=sync_plan['existing_videos'],
+            new_video_candidates=sync_plan['new_video_candidates'],
+            existing_playlist_updates=sync_plan['existing_playlist_updates'],
+        )
 
         videos_to_fetch = sync_plan['videos_to_fetch']
         if fetch_upload_dates and videos_to_fetch:
             adjusted = self._fetch_and_prune_sync_candidates(
-                new_videos=prepared['new_videos'],
-                existing_videos=prepared['existing_videos'],
-                new_video_candidates=prepared['new_video_candidates'],
-                existing_playlist_updates=prepared['existing_playlist_updates'],
+                new_videos=prepared.new_videos,
+                existing_videos=prepared.existing_videos,
+                new_video_candidates=prepared.new_video_candidates,
+                existing_playlist_updates=prepared.existing_playlist_updates,
                 stale_zero_index_existing_videos=sync_plan['stale_zero_index_existing_videos'],
                 videos_to_fetch=videos_to_fetch,
                 callback=callback,
             )
-            prepared.update(
-                {
-                    'new_videos': adjusted['new_videos'],
-                    'existing_videos': adjusted['existing_videos'],
-                    'new_video_candidates': adjusted['new_video_candidates'],
-                    'existing_playlist_updates': adjusted['existing_playlist_updates'],
-                    'should_apply_fetch_results': True,
-                    'pruned_stale_existing_videos': adjusted['pruned_stale_existing_videos'],
-                    'fetch_results': adjusted['fetch_results'],
-                }
+            prepared = SyncPlaylistPreparedState(
+                total_videos=prepared.total_videos,
+                new_videos=adjusted['new_videos'],
+                existing_videos=adjusted['existing_videos'],
+                new_video_candidates=adjusted['new_video_candidates'],
+                existing_playlist_updates=adjusted['existing_playlist_updates'],
+                should_apply_fetch_results=True,
+                pruned_stale_existing_videos=adjusted['pruned_stale_existing_videos'],
+                fetch_results=adjusted['fetch_results'],
             )
 
         return prepared
@@ -251,44 +253,37 @@ class PlaylistService:
         *,
         playlist_id: str,
         playlist_title: str,
-        total_videos: int,
         channel: str,
         auto_add_videos: bool,
-        existing_playlist_updates: List[tuple[str, int]],
-        new_videos: List[str],
-        new_video_candidates: Dict[str, Dict[str, Any]],
-        existing_videos: List[str],
-        should_apply_fetch_results: bool,
-        pruned_stale_existing_videos: Set[str],
-        fetch_results: List[tuple[str, VideoInfoResult]],
+        prepared: SyncPlaylistPreparedState,
         callback: Callable[[str], None],
     ) -> SyncResult:
         """提交 sync_playlist 规划结果：落库、应用 fetch 结果并 finalize。"""
         self._persist_sync_members(
             playlist_id=playlist_id,
-            total_videos=total_videos,
+            total_videos=prepared.total_videos,
             channel=channel,
             auto_add_videos=auto_add_videos,
-            existing_playlist_updates=existing_playlist_updates,
-            new_videos=new_videos,
-            new_video_candidates=new_video_candidates,
+            existing_playlist_updates=prepared.existing_playlist_updates,
+            new_videos=prepared.new_videos,
+            new_video_candidates=prepared.new_video_candidates,
             callback=callback,
         )
 
-        if should_apply_fetch_results:
+        if prepared.should_apply_fetch_results:
             self._apply_fetch_results(
                 playlist_id=playlist_id,
-                pruned_stale_existing_videos=pruned_stale_existing_videos,
-                fetch_results=fetch_results,
+                pruned_stale_existing_videos=prepared.pruned_stale_existing_videos,
+                fetch_results=prepared.fetch_results,
                 callback=callback,
             )
 
         return self._finalize_sync_playlist(
             playlist_id=playlist_id,
             playlist_title=playlist_title,
-            total_videos=total_videos,
-            new_videos=new_videos,
-            existing_videos=existing_videos,
+            total_videos=prepared.total_videos,
+            new_videos=prepared.new_videos,
+            existing_videos=prepared.existing_videos,
             callback=callback,
         )
 

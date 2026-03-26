@@ -13,6 +13,7 @@ from vat.models import (
     DEFAULT_STAGE_SEQUENCE,
 )
 from vat.services import PlaylistService
+from vat.services.playlist_service import SyncPlaylistPreparedState
 from vat.downloaders import VideoInfoResult
 
 
@@ -541,16 +542,16 @@ class TestSyncPlaylistContracts:
             callback=lambda _msg: None,
         )
 
-        assert result == {
-            "total_videos": 3,
-            "new_videos": ["vid_new"],
-            "existing_videos": ["vid_existing"],
-            "new_video_candidates": {"vid_new": {"playlist_index": 2}},
-            "existing_playlist_updates": [("vid_existing", 1)],
-            "should_apply_fetch_results": False,
-            "pruned_stale_existing_videos": set(),
-            "fetch_results": [],
-        }
+        assert result == SyncPlaylistPreparedState(
+            total_videos=3,
+            new_videos=["vid_new"],
+            existing_videos=["vid_existing"],
+            new_video_candidates={"vid_new": {"playlist_index": 2}},
+            existing_playlist_updates=[("vid_existing", 1)],
+            should_apply_fetch_results=False,
+            pruned_stale_existing_videos=set(),
+            fetch_results=[],
+        )
         assert [name for name, _kwargs in calls] == ["plan"]
 
     def test_prepare_sync_playlist_flow_fetches_and_returns_adjusted_plan(self, db, monkeypatch):
@@ -597,16 +598,16 @@ class TestSyncPlaylistContracts:
             callback=lambda _msg: None,
         )
 
-        assert result == {
-            "total_videos": 4,
-            "new_videos": ["vid_new_ok"],
-            "existing_videos": ["vid_existing_ok"],
-            "new_video_candidates": {"vid_new_ok": {"playlist_index": 2}},
-            "existing_playlist_updates": [("vid_existing_ok", 1)],
-            "should_apply_fetch_results": True,
-            "pruned_stale_existing_videos": {"vid_existing_stale"},
-            "fetch_results": [("vid_new_ok", VideoInfoResult(status="ok", info={"upload_date": "20250101"}))],
-        }
+        assert result == SyncPlaylistPreparedState(
+            total_videos=4,
+            new_videos=["vid_new_ok"],
+            existing_videos=["vid_existing_ok"],
+            new_video_candidates={"vid_new_ok": {"playlist_index": 2}},
+            existing_playlist_updates=[("vid_existing_ok", 1)],
+            should_apply_fetch_results=True,
+            pruned_stale_existing_videos={"vid_existing_stale"},
+            fetch_results=[("vid_new_ok", VideoInfoResult(status="ok", info={"upload_date": "20250101"}))],
+        )
         assert [name for name, _kwargs in calls] == ["plan", "fetch"]
 
     def test_update_existing_sync_members_updates_playlist_indices(self, db):
@@ -909,6 +910,16 @@ class TestSyncPlaylistContracts:
         service = PlaylistService(db)
         calls = []
         expected_result = object()
+        prepared = SyncPlaylistPreparedState(
+            total_videos=3,
+            new_videos=["vid_new"],
+            existing_videos=["vid_old"],
+            new_video_candidates={"vid_new": {"playlist_index": 2}},
+            existing_playlist_updates=[("vid_old", 1)],
+            should_apply_fetch_results=True,
+            pruned_stale_existing_videos={"vid_stale"},
+            fetch_results=[("vid_new", VideoInfoResult(status="ok", info={"upload_date": "20250101"}))],
+        )
 
         monkeypatch.setattr(
             service,
@@ -929,16 +940,9 @@ class TestSyncPlaylistContracts:
         result = service._commit_sync_playlist_flow(
             playlist_id="PL_COMMIT",
             playlist_title="Commit Playlist",
-            total_videos=3,
             channel="Uploader",
             auto_add_videos=True,
-            existing_playlist_updates=[("vid_old", 1)],
-            new_videos=["vid_new"],
-            new_video_candidates={"vid_new": {"playlist_index": 2}},
-            existing_videos=["vid_old"],
-            should_apply_fetch_results=True,
-            pruned_stale_existing_videos={"vid_stale"},
-            fetch_results=[("vid_new", VideoInfoResult(status="ok", info={"upload_date": "20250101"}))],
+            prepared=prepared,
             callback=lambda _msg: None,
         )
 
@@ -983,6 +987,16 @@ class TestSyncPlaylistContracts:
         service = PlaylistService(db)
         calls = []
         expected_result = object()
+        prepared = SyncPlaylistPreparedState(
+            total_videos=1,
+            new_videos=[],
+            existing_videos=["vid_old"],
+            new_video_candidates={},
+            existing_playlist_updates=[("vid_old", 1)],
+            should_apply_fetch_results=False,
+            pruned_stale_existing_videos=set(),
+            fetch_results=[],
+        )
 
         monkeypatch.setattr(
             service,
@@ -1003,16 +1017,9 @@ class TestSyncPlaylistContracts:
         result = service._commit_sync_playlist_flow(
             playlist_id="PL_COMMIT_SKIP",
             playlist_title="Commit Skip",
-            total_videos=1,
             channel="Uploader",
             auto_add_videos=False,
-            existing_playlist_updates=[("vid_old", 1)],
-            new_videos=[],
-            new_video_candidates={},
-            existing_videos=["vid_old"],
-            should_apply_fetch_results=False,
-            pruned_stale_existing_videos=set(),
-            fetch_results=[],
+            prepared=prepared,
             callback=lambda _msg: None,
         )
 
