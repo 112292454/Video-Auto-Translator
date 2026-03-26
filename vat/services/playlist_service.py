@@ -180,7 +180,6 @@ class PlaylistService:
         existing_videos = sync_plan['existing_videos']
         new_video_candidates = sync_plan['new_video_candidates']
         existing_playlist_updates = sync_plan['existing_playlist_updates']
-        videos_needing_refresh = sync_plan['videos_needing_refresh']
         stale_zero_index_existing_videos = sync_plan['stale_zero_index_existing_videos']
         videos_to_fetch = sync_plan['videos_to_fetch']
         
@@ -203,7 +202,40 @@ class PlaylistService:
             pruned_new_videos = adjusted['pruned_new_videos']
             pruned_stale_existing_videos = adjusted['pruned_stale_existing_videos']
 
-        # 到这里才真正落库：先判定可用性，再写入新增视频，避免中断留下半成品
+        return self._commit_sync_playlist_flow(
+            playlist_id=playlist_id,
+            playlist_title=playlist_title,
+            total_videos=total_videos,
+            channel=channel,
+            auto_add_videos=auto_add_videos,
+            existing_playlist_updates=existing_playlist_updates,
+            new_videos=new_videos,
+            new_video_candidates=new_video_candidates,
+            existing_videos=existing_videos,
+            should_apply_fetch_results=fetch_upload_dates and bool(videos_to_fetch),
+            pruned_stale_existing_videos=pruned_stale_existing_videos if fetch_upload_dates and videos_to_fetch else set(),
+            fetch_results=fetch_results if fetch_upload_dates and videos_to_fetch else [],
+            callback=callback,
+        )
+
+    def _commit_sync_playlist_flow(
+        self,
+        *,
+        playlist_id: str,
+        playlist_title: str,
+        total_videos: int,
+        channel: str,
+        auto_add_videos: bool,
+        existing_playlist_updates: List[tuple[str, int]],
+        new_videos: List[str],
+        new_video_candidates: Dict[str, Dict[str, Any]],
+        existing_videos: List[str],
+        should_apply_fetch_results: bool,
+        pruned_stale_existing_videos: Set[str],
+        fetch_results: List[tuple[str, VideoInfoResult]],
+        callback: Callable[[str], None],
+    ) -> SyncResult:
+        """提交 sync_playlist 规划结果：落库、应用 fetch 结果并 finalize。"""
         self._persist_sync_members(
             playlist_id=playlist_id,
             total_videos=total_videos,
@@ -215,14 +247,14 @@ class PlaylistService:
             callback=callback,
         )
 
-        if fetch_upload_dates and videos_to_fetch:
+        if should_apply_fetch_results:
             self._apply_fetch_results(
                 playlist_id=playlist_id,
                 pruned_stale_existing_videos=pruned_stale_existing_videos,
                 fetch_results=fetch_results,
                 callback=callback,
             )
-        
+
         return self._finalize_sync_playlist(
             playlist_id=playlist_id,
             playlist_title=playlist_title,

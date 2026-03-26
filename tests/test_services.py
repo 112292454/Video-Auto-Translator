@@ -550,6 +550,120 @@ class TestSyncPlaylistContracts:
         assert result.existing_videos == ["vid_old"]
         assert result.total_videos == 3
 
+    def test_commit_sync_playlist_flow_persists_applies_and_finalizes(self, db, monkeypatch):
+        service = PlaylistService(db)
+        calls = []
+        expected_result = object()
+
+        monkeypatch.setattr(
+            service,
+            "_persist_sync_members",
+            lambda **kwargs: calls.append(("persist", kwargs)),
+        )
+        monkeypatch.setattr(
+            service,
+            "_apply_fetch_results",
+            lambda **kwargs: calls.append(("apply", kwargs)),
+        )
+        monkeypatch.setattr(
+            service,
+            "_finalize_sync_playlist",
+            lambda **kwargs: calls.append(("finalize", kwargs)) or expected_result,
+        )
+
+        result = service._commit_sync_playlist_flow(
+            playlist_id="PL_COMMIT",
+            playlist_title="Commit Playlist",
+            total_videos=3,
+            channel="Uploader",
+            auto_add_videos=True,
+            existing_playlist_updates=[("vid_old", 1)],
+            new_videos=["vid_new"],
+            new_video_candidates={"vid_new": {"playlist_index": 2}},
+            existing_videos=["vid_old"],
+            should_apply_fetch_results=True,
+            pruned_stale_existing_videos={"vid_stale"},
+            fetch_results=[("vid_new", VideoInfoResult(status="ok", info={"upload_date": "20250101"}))],
+            callback=lambda _msg: None,
+        )
+
+        assert result is expected_result
+        assert calls == [
+            (
+                "persist",
+                {
+                    "playlist_id": "PL_COMMIT",
+                    "total_videos": 3,
+                    "channel": "Uploader",
+                    "auto_add_videos": True,
+                    "existing_playlist_updates": [("vid_old", 1)],
+                    "new_videos": ["vid_new"],
+                    "new_video_candidates": {"vid_new": {"playlist_index": 2}},
+                    "callback": calls[0][1]["callback"],
+                },
+            ),
+            (
+                "apply",
+                {
+                    "playlist_id": "PL_COMMIT",
+                    "pruned_stale_existing_videos": {"vid_stale"},
+                    "fetch_results": [("vid_new", VideoInfoResult(status="ok", info={"upload_date": "20250101"}))],
+                    "callback": calls[1][1]["callback"],
+                },
+            ),
+            (
+                "finalize",
+                {
+                    "playlist_id": "PL_COMMIT",
+                    "playlist_title": "Commit Playlist",
+                    "total_videos": 3,
+                    "new_videos": ["vid_new"],
+                    "existing_videos": ["vid_old"],
+                    "callback": calls[2][1]["callback"],
+                },
+            ),
+        ]
+
+    def test_commit_sync_playlist_flow_skips_apply_without_fetch_stage(self, db, monkeypatch):
+        service = PlaylistService(db)
+        calls = []
+        expected_result = object()
+
+        monkeypatch.setattr(
+            service,
+            "_persist_sync_members",
+            lambda **kwargs: calls.append(("persist", kwargs)),
+        )
+        monkeypatch.setattr(
+            service,
+            "_apply_fetch_results",
+            lambda **kwargs: calls.append(("apply", kwargs)),
+        )
+        monkeypatch.setattr(
+            service,
+            "_finalize_sync_playlist",
+            lambda **kwargs: calls.append(("finalize", kwargs)) or expected_result,
+        )
+
+        result = service._commit_sync_playlist_flow(
+            playlist_id="PL_COMMIT_SKIP",
+            playlist_title="Commit Skip",
+            total_videos=1,
+            channel="Uploader",
+            auto_add_videos=False,
+            existing_playlist_updates=[("vid_old", 1)],
+            new_videos=[],
+            new_video_candidates={},
+            existing_videos=["vid_old"],
+            should_apply_fetch_results=False,
+            pruned_stale_existing_videos=set(),
+            fetch_results=[],
+            callback=lambda _msg: None,
+        )
+
+        assert result is expected_result
+        assert [name for name, _kwargs in calls] == ["persist", "finalize"]
+
     def test_bootstrap_sync_playlist_creates_playlist_and_returns_context(self, db):
         service = PlaylistService(db)
         entries = [{"id": "vid_boot", "title": "Boot Video"}]
