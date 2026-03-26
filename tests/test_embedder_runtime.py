@@ -268,6 +268,108 @@ class TestFFmpegWrapperHardEmbedPlanning:
             "fonts_dir": "/fonts",
         }]
 
+    def test_prepare_hard_embed_nvenc_session_acquires_slot_and_checks_support(self, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        acquired = []
+        released = []
+        checked = []
+
+        monkeypatch.setattr(
+            "vat.embedder.ffmpeg_wrapper._nvenc_manager.acquire",
+            lambda gpu_id, timeout=600: acquired.append((gpu_id, timeout)) or True,
+        )
+        monkeypatch.setattr(
+            "vat.embedder.ffmpeg_wrapper._nvenc_manager.release",
+            lambda gpu_id: released.append(gpu_id),
+        )
+        monkeypatch.setattr(wrapper, "_check_nvenc_support", lambda: checked.append(True) or True)
+
+        wrapper._prepare_hard_embed_nvenc_session(gpu_id=4, max_nvenc_sessions=5)
+
+        assert acquired == [(4, 600)]
+        assert checked == [True]
+        assert released == []
+
+    def test_prepare_hard_embed_nvenc_session_raises_on_acquire_timeout(self, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        checked = []
+        released = []
+
+        monkeypatch.setattr(
+            "vat.embedder.ffmpeg_wrapper._nvenc_manager.acquire",
+            lambda gpu_id, timeout=600: False,
+        )
+        monkeypatch.setattr(
+            "vat.embedder.ffmpeg_wrapper._nvenc_manager.release",
+            lambda gpu_id: released.append(gpu_id),
+        )
+        monkeypatch.setattr(wrapper, "_check_nvenc_support", lambda: checked.append(True) or True)
+
+        with pytest.raises(RuntimeError, match="NVENC 会话获取超时: GPU 2"):
+            wrapper._prepare_hard_embed_nvenc_session(gpu_id=2, max_nvenc_sessions=5)
+
+        assert checked == []
+        assert released == []
+
+    def test_prepare_hard_embed_nvenc_session_releases_slot_when_nvenc_unsupported(self, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        released = []
+
+        monkeypatch.setattr(
+            "vat.embedder.ffmpeg_wrapper._nvenc_manager.acquire",
+            lambda gpu_id, timeout=600: True,
+        )
+        monkeypatch.setattr(
+            "vat.embedder.ffmpeg_wrapper._nvenc_manager.release",
+            lambda gpu_id: released.append(gpu_id),
+        )
+        monkeypatch.setattr(wrapper, "_check_nvenc_support", lambda: False)
+
+        with pytest.raises(RuntimeError, match="当前环境不支持 NVENC"):
+            wrapper._prepare_hard_embed_nvenc_session(gpu_id=1, max_nvenc_sessions=5)
+
+        assert released == [1]
+
+    def test_embed_subtitle_hard_delegates_nvenc_session_prepare_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.srt"
+        out = tmp_path / "out.mp4"
+        video.write_bytes(b"00")
+        sub.write_text("dummy", encoding="utf-8")
+        delegated = []
+
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.init", lambda max_per_gpu=5: None)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.select_gpu", lambda: 0)
+        monkeypatch.setattr(
+            "vat.embedder.ffmpeg_wrapper._nvenc_manager.acquire",
+            lambda gpu_id, timeout=600: pytest.fail("unexpected inline acquire call"),
+        )
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.release", lambda gpu_id: None)
+        monkeypatch.setattr(
+            wrapper,
+            "_check_nvenc_support",
+            lambda: pytest.fail("unexpected inline nvenc support check"),
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_prepare_hard_embed_nvenc_session",
+            lambda **kwargs: delegated.append(kwargs),
+            raising=False,
+        )
+        monkeypatch.setattr(wrapper, "_probe_hard_embed_original_bitrate", lambda video_path: 1000, raising=False)
+        monkeypatch.setattr(wrapper, "_build_hard_embed_ffmpeg_command", lambda **kwargs: ["ffmpeg", "planned"], raising=False)
+        monkeypatch.setattr(wrapper, "_run_ffmpeg_embed_process", lambda **kwargs: True, raising=False)
+
+        result = wrapper.embed_subtitle_hard(video, sub, out, gpu_device="auto")
+
+        assert result is True
+        assert delegated == [{"gpu_id": 0, "max_nvenc_sessions": 5}]
+
     def test_probe_hard_embed_original_bitrate_returns_bit_rate_from_video_info(self, monkeypatch, tmp_path):
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
         wrapper = FFmpegWrapper()
@@ -590,14 +692,18 @@ class TestFFmpegWrapperHardEmbedContracts:
         out = tmp_path / "out.mp4"
         video.write_bytes(b"00")
         sub.write_text("dummy", encoding="utf-8")
+        released = []
 
         monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.init", lambda max_per_gpu=5: None)
         monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.select_gpu", lambda: 1)
         monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.acquire", lambda gpu_id, timeout=600: False)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.release", lambda gpu_id: released.append(gpu_id))
+        monkeypatch.setattr(wrapper, "_check_nvenc_support", lambda: pytest.fail("unexpected nvenc support check"))
 
         with pytest.raises(RuntimeError, match="获取超时"):
             wrapper.embed_subtitle_hard(video, sub, out, gpu_device="auto")
 
+        assert released == []
     def test_embed_subtitle_hard_releases_session_when_nvenc_not_supported(self, monkeypatch, tmp_path):
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
         wrapper = FFmpegWrapper()

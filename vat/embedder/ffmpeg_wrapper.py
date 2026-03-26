@@ -465,19 +465,10 @@ class FFmpegWrapper:
         # GPU 选择：通过 session manager 均衡分配
         gpu_id = self._resolve_hard_embed_gpu_device(gpu_device)
 
-        # 获取 NVENC 会话槽位（阻塞等待，最多 10 分钟）
-        if not _nvenc_manager.acquire(gpu_id, timeout=600):
-            raise RuntimeError(
-                f"NVENC 会话获取超时: GPU {gpu_id}，"
-                f"所有 {max_nvenc_sessions} 个槽位已满且 10 分钟内未释放"
-            )
-
-        # 检查是否支持 NVENC
-        if not self._check_nvenc_support():
-            _nvenc_manager.release(gpu_id)
-            error_msg = "当前环境不支持 NVENC，按 GPU 原则禁止 CPU 回退"
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
+        self._prepare_hard_embed_nvenc_session(
+            gpu_id=gpu_id,
+            max_nvenc_sessions=max_nvenc_sessions,
+        )
 
         # 优化：获取原视频码率以控制输出体积
         original_bitrate = self._probe_hard_embed_original_bitrate(video_path)
@@ -545,6 +536,20 @@ class FFmpegWrapper:
         """探测硬字幕合成使用的原视频码率。"""
         video_info = self.get_video_info(video_path)
         return video_info.get('bit_rate', 0) if video_info else 0
+
+    def _prepare_hard_embed_nvenc_session(self, *, gpu_id: int, max_nvenc_sessions: int) -> None:
+        """为硬字幕合成获取 NVENC 会话并校验支持情况。"""
+        if not _nvenc_manager.acquire(gpu_id, timeout=600):
+            raise RuntimeError(
+                f"NVENC 会话获取超时: GPU {gpu_id}，"
+                f"所有 {max_nvenc_sessions} 个槽位已满且 10 分钟内未释放"
+            )
+
+        if not self._check_nvenc_support():
+            _nvenc_manager.release(gpu_id)
+            error_msg = "当前环境不支持 NVENC，按 GPU 原则禁止 CPU 回退"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
 
     def _build_hard_embed_ffmpeg_command(
         self,
