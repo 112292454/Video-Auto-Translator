@@ -209,29 +209,14 @@ class PlaylistService:
         
         # 如果需要获取 upload_date，并行获取详细信息
         if fetch_upload_dates and videos_to_fetch:
-            max_workers = 10  # 并行获取数量（测试可用 5-10 个）
-            callback(f"开始并行获取视频信息（共 {len(videos_to_fetch)} 个，{max_workers} 个并发）...")
-            fetch_results = self._collect_fetch_results(
-                video_ids=videos_to_fetch,
-                callback=callback,
-                max_workers=max_workers,
-            )
-            
-            pruned_new_videos, pruned_stale_existing_videos = self._classify_pruned_unavailable_videos(
-                new_video_ids=set(new_videos),
-                stale_zero_index_existing_videos=stale_zero_index_existing_videos,
-                fetch_results=fetch_results,
-                callback=callback,
-            )
-            adjusted = self._prune_sync_candidates_after_fetch(
+            adjusted = self._fetch_and_prune_sync_candidates(
                 new_videos=new_videos,
                 existing_videos=existing_videos,
                 new_video_candidates=new_video_candidates,
                 existing_playlist_updates=existing_playlist_updates,
                 stale_zero_index_existing_videos=stale_zero_index_existing_videos,
-                fetch_results=fetch_results,
-                pruned_new_videos=pruned_new_videos,
-                pruned_stale_existing_videos=pruned_stale_existing_videos,
+                videos_to_fetch=videos_to_fetch,
+                callback=callback,
             )
             new_videos = adjusted['new_videos']
             existing_videos = adjusted['existing_videos']
@@ -393,6 +378,43 @@ class PlaylistService:
             'pruned_new_videos': pruned_new_videos,
             'pruned_stale_existing_videos': pruned_stale_existing_videos,
         }
+
+    def _fetch_and_prune_sync_candidates(
+        self,
+        *,
+        new_videos: List[str],
+        existing_videos: List[str],
+        new_video_candidates: Dict[str, Dict[str, Any]],
+        existing_playlist_updates: List[tuple[str, int]],
+        stale_zero_index_existing_videos: Set[str],
+        videos_to_fetch: List[str],
+        callback: Callable[[str], None],
+        max_workers: int = 10,
+    ) -> Dict[str, Any]:
+        """收集 fetch 结果并裁剪本轮 sync 候选集。"""
+        callback(f"开始并行获取视频信息（共 {len(videos_to_fetch)} 个，{max_workers} 个并发）...")
+        fetch_results = self._collect_fetch_results(
+            video_ids=videos_to_fetch,
+            callback=callback,
+            max_workers=max_workers,
+        )
+
+        pruned_new_videos, pruned_stale_existing_videos = self._classify_pruned_unavailable_videos(
+            new_video_ids=set(new_videos),
+            stale_zero_index_existing_videos=stale_zero_index_existing_videos,
+            fetch_results=fetch_results,
+            callback=callback,
+        )
+        return self._prune_sync_candidates_after_fetch(
+            new_videos=new_videos,
+            existing_videos=existing_videos,
+            new_video_candidates=new_video_candidates,
+            existing_playlist_updates=existing_playlist_updates,
+            stale_zero_index_existing_videos=stale_zero_index_existing_videos,
+            fetch_results=fetch_results,
+            pruned_new_videos=pruned_new_videos,
+            pruned_stale_existing_videos=pruned_stale_existing_videos,
+        )
 
     def _persist_sync_members(
         self,

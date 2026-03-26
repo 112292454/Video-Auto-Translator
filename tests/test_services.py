@@ -307,6 +307,92 @@ class TestSyncPlaylistContracts:
         assert fetch_results[1][1].status == "error"
         assert "boom" in (fetch_results[1][1].error_message or "")
 
+    def test_fetch_and_prune_sync_candidates_collects_classifies_and_returns_adjusted_plan(self, db, monkeypatch):
+        service = PlaylistService(db)
+        messages = []
+        calls = []
+        fetch_results = [
+            ("vid_new_ok", VideoInfoResult(status="ok", info={"upload_date": "20250101"})),
+            ("vid_existing_ok", VideoInfoResult(status="ok", info={"upload_date": "20250102"})),
+        ]
+        adjusted = {
+            "new_videos": ["vid_new_ok"],
+            "existing_videos": ["vid_existing_ok"],
+            "new_video_candidates": {"vid_new_ok": {"playlist_index": 1}},
+            "existing_playlist_updates": [("vid_existing_ok", 3)],
+            "fetch_results": fetch_results,
+            "pruned_new_videos": {"vid_new_skip"},
+            "pruned_stale_existing_videos": {"vid_existing_stale"},
+        }
+
+        def fake_collect(*, video_ids, callback, max_workers):
+            calls.append(("collect", video_ids, max_workers))
+            return fetch_results
+
+        def fake_classify(*, new_video_ids, stale_zero_index_existing_videos, fetch_results, callback):
+            calls.append((
+                "classify",
+                new_video_ids,
+                stale_zero_index_existing_videos,
+                fetch_results,
+            ))
+            return {"vid_new_skip"}, {"vid_existing_stale"}
+
+        def fake_prune(**kwargs):
+            calls.append(("prune", kwargs))
+            return adjusted
+
+        monkeypatch.setattr(service, "_collect_fetch_results", fake_collect)
+        monkeypatch.setattr(service, "_classify_pruned_unavailable_videos", fake_classify)
+        monkeypatch.setattr(service, "_prune_sync_candidates_after_fetch", fake_prune)
+
+        result = service._fetch_and_prune_sync_candidates(
+            new_videos=["vid_new_ok", "vid_new_skip"],
+            existing_videos=["vid_existing_ok", "vid_existing_stale"],
+            new_video_candidates={
+                "vid_new_ok": {"playlist_index": 1},
+                "vid_new_skip": {"playlist_index": 2},
+            },
+            existing_playlist_updates=[
+                ("vid_existing_ok", 3),
+                ("vid_existing_stale", 4),
+            ],
+            stale_zero_index_existing_videos={"vid_existing_stale"},
+            videos_to_fetch=["vid_new_ok", "vid_existing_ok"],
+            callback=messages.append,
+        )
+
+        assert result == adjusted
+        assert calls == [
+            ("collect", ["vid_new_ok", "vid_existing_ok"], 10),
+            (
+                "classify",
+                {"vid_new_ok", "vid_new_skip"},
+                {"vid_existing_stale"},
+                fetch_results,
+            ),
+            (
+                "prune",
+                {
+                    "new_videos": ["vid_new_ok", "vid_new_skip"],
+                    "existing_videos": ["vid_existing_ok", "vid_existing_stale"],
+                    "new_video_candidates": {
+                        "vid_new_ok": {"playlist_index": 1},
+                        "vid_new_skip": {"playlist_index": 2},
+                    },
+                    "existing_playlist_updates": [
+                        ("vid_existing_ok", 3),
+                        ("vid_existing_stale", 4),
+                    ],
+                    "stale_zero_index_existing_videos": {"vid_existing_stale"},
+                    "fetch_results": fetch_results,
+                    "pruned_new_videos": {"vid_new_skip"},
+                    "pruned_stale_existing_videos": {"vid_existing_stale"},
+                },
+            ),
+        ]
+        assert messages == ["开始并行获取视频信息（共 2 个，10 个并发）..."]
+
     def test_persist_sync_members_updates_existing_and_creates_new(self, db):
         _setup_playlist(db, "PL_PERSIST")
         existing_video = Video(
