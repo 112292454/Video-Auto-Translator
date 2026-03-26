@@ -463,15 +463,7 @@ class FFmpegWrapper:
         # ================================================================
 
         # GPU 选择：通过 session manager 均衡分配
-        if gpu_device == "auto":
-            gpu_id = _nvenc_manager.select_gpu()
-            logger.info(f"NVENC 会话均衡分配: 选择 GPU {gpu_id}")
-        else:
-            # gpu_device = "cuda:N"
-            try:
-                gpu_id = int(gpu_device.split(":")[1])
-            except (IndexError, ValueError):
-                raise ValueError(f"无效的 GPU 设备格式: {gpu_device}")
+        gpu_id = self._resolve_hard_embed_gpu_device(gpu_device)
 
         # 获取 NVENC 会话槽位（阻塞等待，最多 10 分钟）
         if not _nvenc_manager.acquire(gpu_id, timeout=600):
@@ -518,6 +510,18 @@ class FFmpegWrapper:
                     Path(temp_file).unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    def _resolve_hard_embed_gpu_device(self, gpu_device: str) -> int:
+        """解析硬字幕合成使用的 GPU 设备。"""
+        if gpu_device == "auto":
+            gpu_id = _nvenc_manager.select_gpu()
+            logger.info(f"NVENC 会话均衡分配: 选择 GPU {gpu_id}")
+            return gpu_id
+
+        try:
+            return int(gpu_device.split(":")[1])
+        except (IndexError, ValueError):
+            raise ValueError(f"无效的 GPU 设备格式: {gpu_device}")
 
     def _build_hard_embed_subtitle_filter(
         self,

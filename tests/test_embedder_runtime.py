@@ -152,6 +152,54 @@ class TestFFmpegWrapperSoftEmbedContracts:
 
 
 class TestFFmpegWrapperHardEmbedPlanning:
+    def test_resolve_hard_embed_gpu_device_parses_explicit_cuda_device(self, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+
+        gpu_id = wrapper._resolve_hard_embed_gpu_device("cuda:7")
+
+        assert gpu_id == 7
+
+    def test_resolve_hard_embed_gpu_device_selects_balanced_gpu_for_auto(self, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.select_gpu", lambda: 3)
+
+        gpu_id = wrapper._resolve_hard_embed_gpu_device("auto")
+
+        assert gpu_id == 3
+
+    def test_resolve_hard_embed_gpu_device_raises_on_invalid_cuda_format(self, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+
+        with pytest.raises(ValueError, match="无效的 GPU 设备格式"):
+            wrapper._resolve_hard_embed_gpu_device("cuda:oops")
+
+    def test_embed_subtitle_hard_delegates_gpu_device_planning_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.srt"
+        out = tmp_path / "out.mp4"
+        video.write_bytes(b"00")
+        sub.write_text("dummy", encoding="utf-8")
+        planned = []
+
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.init", lambda max_per_gpu=5: None)
+        monkeypatch.setattr(wrapper, "_resolve_hard_embed_gpu_device", lambda gpu_device: planned.append(gpu_device) or 5, raising=False)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.acquire", lambda gpu_id, timeout=600: True)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.release", lambda gpu_id: None)
+        monkeypatch.setattr(wrapper, "_check_nvenc_support", lambda: True)
+        monkeypatch.setattr(wrapper, "get_video_info", lambda _path: {"bit_rate": 1000})
+        monkeypatch.setattr(wrapper, "_build_hard_embed_ffmpeg_command", lambda **kwargs: ["ffmpeg", str(kwargs["gpu_id"])], raising=False)
+        monkeypatch.setattr(wrapper, "_run_ffmpeg_embed_process", lambda **kwargs: True, raising=False)
+
+        result = wrapper.embed_subtitle_hard(video, sub, out, gpu_device="cuda:5")
+
+        assert result is True
+        assert planned == ["cuda:5"]
+
     def test_build_hard_embed_subtitle_filter_uses_ass_and_fontsdir_with_escaped_paths(self, monkeypatch):
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
         wrapper = FFmpegWrapper()
