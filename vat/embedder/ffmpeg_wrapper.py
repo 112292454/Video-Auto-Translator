@@ -400,19 +400,7 @@ class FFmpegWrapper:
         # ========== 阶段 2: 获取 NVENC 会话 + 构建 ffmpeg 命令 ==========
         # 预处理完成后才获取 GPU session，最大化 session 利用率。
         # ================================================================
-
-        # GPU 选择：通过 session manager 均衡分配
-        gpu_id = self._resolve_hard_embed_gpu_device(gpu_device)
-
-        self._prepare_hard_embed_nvenc_session(
-            gpu_id=gpu_id,
-            max_nvenc_sessions=max_nvenc_sessions,
-        )
-
-        # 优化：获取原视频码率以控制输出体积
-        original_bitrate = self._probe_hard_embed_original_bitrate(video_path)
-
-        cmd = self._build_hard_embed_ffmpeg_command(
+        gpu_id, cmd = self._plan_hard_embed_execution(
             video_path=video_path,
             output_path=output_path,
             vf=vf,
@@ -420,8 +408,8 @@ class FFmpegWrapper:
             audio_codec=audio_codec,
             crf=crf,
             preset=preset,
-            gpu_id=gpu_id,
-            original_bitrate=original_bitrate,
+            gpu_device=gpu_device,
+            max_nvenc_sessions=max_nvenc_sessions,
         )
 
         try:
@@ -520,6 +508,39 @@ class FFmpegWrapper:
             fonts_dir=fonts_dir,
         )
         return subtitle_ext, processed_subtitle, temp_files_to_cleanup, vf
+
+    def _plan_hard_embed_execution(
+        self,
+        *,
+        video_path: Path,
+        output_path: Path,
+        vf: str,
+        video_codec: str,
+        audio_codec: str,
+        crf: int,
+        preset: str,
+        gpu_device: str,
+        max_nvenc_sessions: int,
+    ) -> tuple[int, List[str]]:
+        """规划硬字幕合成执行阶段所需 GPU 与 ffmpeg 命令。"""
+        gpu_id = self._resolve_hard_embed_gpu_device(gpu_device)
+        self._prepare_hard_embed_nvenc_session(
+            gpu_id=gpu_id,
+            max_nvenc_sessions=max_nvenc_sessions,
+        )
+        original_bitrate = self._probe_hard_embed_original_bitrate(video_path)
+        cmd = self._build_hard_embed_ffmpeg_command(
+            video_path=video_path,
+            output_path=output_path,
+            vf=vf,
+            video_codec=video_codec,
+            audio_codec=audio_codec,
+            crf=crf,
+            preset=preset,
+            gpu_id=gpu_id,
+            original_bitrate=original_bitrate,
+        )
+        return gpu_id, cmd
 
     def _prepare_hard_embed_ass_subtitle(
         self,

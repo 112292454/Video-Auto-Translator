@@ -470,6 +470,172 @@ class TestFFmpegWrapperHardEmbedPlanning:
             "reference_height": 900,
         }]
 
+    def test_plan_hard_embed_execution_resolves_gpu_prepares_session_probes_bitrate_and_builds_command(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        out = tmp_path / "out.mp4"
+        video.write_bytes(b"00")
+        planned = []
+
+        monkeypatch.setattr(
+            wrapper,
+            "_resolve_hard_embed_gpu_device",
+            lambda gpu_device: planned.append(("gpu", gpu_device)) or 4,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_prepare_hard_embed_nvenc_session",
+            lambda **kwargs: planned.append(("session", kwargs)),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_probe_hard_embed_original_bitrate",
+            lambda video_path: planned.append(("bitrate", video_path)) or 4321,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_build_hard_embed_ffmpeg_command",
+            lambda **kwargs: planned.append(("cmd", kwargs)) or ["ffmpeg", "planned"],
+            raising=False,
+        )
+
+        gpu_id, cmd = wrapper._plan_hard_embed_execution(
+            video_path=video,
+            output_path=out,
+            vf="ass='planned'",
+            video_codec="hevc",
+            audio_codec="copy",
+            crf=28,
+            preset="p6",
+            gpu_device="cuda:4",
+            max_nvenc_sessions=7,
+        )
+
+        assert gpu_id == 4
+        assert cmd == ["ffmpeg", "planned"]
+        assert planned == [
+            ("gpu", "cuda:4"),
+            ("session", {"gpu_id": 4, "max_nvenc_sessions": 7}),
+            ("bitrate", video),
+            ("cmd", {
+                "video_path": video,
+                "output_path": out,
+                "vf": "ass='planned'",
+                "video_codec": "hevc",
+                "audio_codec": "copy",
+                "crf": 28,
+                "preset": "p6",
+                "gpu_id": 4,
+                "original_bitrate": 4321,
+            }),
+        ]
+
+    def test_embed_subtitle_hard_delegates_execution_planning_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.ass"
+        out = tmp_path / "out.mp4"
+        processed_ass = tmp_path / "processed.ass"
+        temp_ass = tmp_path / "temp.ass"
+        video.write_bytes(b"00")
+        sub.write_text("dummy", encoding="utf-8")
+        delegated = []
+        ran = []
+        finalized = []
+
+        monkeypatch.setattr(wrapper, "_prepare_hard_embed_preflight", lambda **kwargs: True, raising=False)
+        monkeypatch.setattr(
+            wrapper,
+            "_plan_hard_embed_subtitle_inputs",
+            lambda **kwargs: (".ass", processed_ass, [str(temp_ass)], "ass='planned'"),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_resolve_hard_embed_gpu_device",
+            lambda gpu_device: pytest.fail("unexpected inline gpu resolution"),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_prepare_hard_embed_nvenc_session",
+            lambda **kwargs: pytest.fail("unexpected inline nvenc session prepare"),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_probe_hard_embed_original_bitrate",
+            lambda video_path: pytest.fail("unexpected inline bitrate probe"),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_build_hard_embed_ffmpeg_command",
+            lambda **kwargs: pytest.fail("unexpected inline ffmpeg command build"),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_plan_hard_embed_execution",
+            lambda **kwargs: delegated.append(kwargs) or (4, ["ffmpeg", "planned"]),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_run_ffmpeg_embed_process",
+            lambda **kwargs: ran.append(kwargs) or True,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_finalize_hard_embed_resources",
+            lambda **kwargs: finalized.append(kwargs),
+            raising=False,
+        )
+
+        result = wrapper.embed_subtitle_hard(
+            video,
+            sub,
+            out,
+            video_codec="hevc",
+            audio_codec="aac",
+            crf=23,
+            preset="p6",
+            gpu_device="cuda:4",
+            subtitle_style="named-style",
+            style_dir="/styles",
+            fonts_dir="/fonts",
+            reference_height=900,
+            max_nvenc_sessions=7,
+        )
+
+        assert result is True
+        assert delegated == [{
+            "video_path": video,
+            "output_path": out,
+            "vf": "ass='planned'",
+            "video_codec": "hevc",
+            "audio_codec": "aac",
+            "crf": 23,
+            "preset": "p6",
+            "gpu_device": "cuda:4",
+            "max_nvenc_sessions": 7,
+        }]
+        assert ran == [{
+            "cmd": ["ffmpeg", "planned"],
+            "output_path": out,
+            "progress_callback": None,
+        }]
+        assert finalized == [{
+            "gpu_id": 4,
+            "temp_files_to_cleanup": [str(temp_ass)],
+        }]
+
     def test_build_hard_embed_subtitle_filter_uses_ass_and_fontsdir_with_escaped_paths(self, monkeypatch):
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
         wrapper = FFmpegWrapper()
