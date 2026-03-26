@@ -539,25 +539,27 @@ class PlaylistService:
             pruned_stale_existing_videos=pruned_stale_existing_videos,
         )
 
-    def _persist_sync_members(
+    def _update_existing_sync_members(
+        self,
+        *,
+        playlist_id: str,
+        existing_playlist_updates: List[tuple[str, int]],
+    ) -> None:
+        """回写当前 playlist 中已存在成员的索引。"""
+        for vid, index in existing_playlist_updates:
+            self.db.update_video_playlist_info(vid, playlist_id, index)
+
+    def _persist_new_sync_members(
         self,
         *,
         playlist_id: str,
         total_videos: int,
         channel: str,
-        auto_add_videos: bool,
-        existing_playlist_updates: List[tuple[str, int]],
         new_videos: List[str],
         new_video_candidates: Dict[str, Dict[str, Any]],
         callback: Callable[[str], None],
     ) -> None:
-        """把经过规划和裁剪后的成员计划落库。"""
-        for vid, index in existing_playlist_updates:
-            self.db.update_video_playlist_info(vid, playlist_id, index)
-
-        if not auto_add_videos:
-            return
-
+        """落库本轮新增或复用的 playlist 成员。"""
         for vid in new_videos:
             candidate = new_video_candidates[vid]
             existing_video = candidate['existing_video']
@@ -581,6 +583,36 @@ class PlaylistService:
             self.db.add_video(video)
             self.db.add_video_to_playlist(vid, playlist_id, index)
             callback(f"[{index}/{total_videos}] 新增: {video.title[:50]}...")
+
+    def _persist_sync_members(
+        self,
+        *,
+        playlist_id: str,
+        total_videos: int,
+        channel: str,
+        auto_add_videos: bool,
+        existing_playlist_updates: List[tuple[str, int]],
+        new_videos: List[str],
+        new_video_candidates: Dict[str, Dict[str, Any]],
+        callback: Callable[[str], None],
+    ) -> None:
+        """把经过规划和裁剪后的成员计划落库。"""
+        self._update_existing_sync_members(
+            playlist_id=playlist_id,
+            existing_playlist_updates=existing_playlist_updates,
+        )
+
+        if not auto_add_videos:
+            return
+
+        self._persist_new_sync_members(
+            playlist_id=playlist_id,
+            total_videos=total_videos,
+            channel=channel,
+            new_videos=new_videos,
+            new_video_candidates=new_video_candidates,
+            callback=callback,
+        )
 
     def _apply_fetch_results(
         self,

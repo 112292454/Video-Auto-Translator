@@ -609,6 +609,145 @@ class TestSyncPlaylistContracts:
         }
         assert [name for name, _kwargs in calls] == ["plan", "fetch"]
 
+    def test_update_existing_sync_members_updates_playlist_indices(self, db):
+        _setup_playlist(db, "PL_PERSIST_EXISTING")
+        _add_pl_video(db, "vid_existing", playlist_id="PL_PERSIST_EXISTING", index=9)
+        service = PlaylistService(db)
+
+        service._update_existing_sync_members(
+            playlist_id="PL_PERSIST_EXISTING",
+            existing_playlist_updates=[("vid_existing", 2)],
+        )
+
+        assert db.get_playlist_video_info("PL_PERSIST_EXISTING", "vid_existing")["playlist_index"] == 2
+
+    def test_persist_new_sync_members_reuses_existing_and_creates_new(self, db):
+        _setup_playlist(db, "PL_PERSIST_NEW")
+        service = PlaylistService(db)
+        messages = []
+
+        service._persist_new_sync_members(
+            playlist_id="PL_PERSIST_NEW",
+            total_videos=3,
+            channel="Uploader",
+            new_videos=["vid_new", "vid_reuse_other_playlist"],
+            new_video_candidates={
+                "vid_new": {
+                    "entry": {"id": "vid_new", "title": "New Video"},
+                    "playlist_index": 2,
+                    "existing_video": None,
+                },
+                "vid_reuse_other_playlist": {
+                    "entry": {"id": "vid_reuse_other_playlist", "title": "Existing Elsewhere"},
+                    "playlist_index": 3,
+                    "existing_video": Video(
+                        id="vid_reuse_other_playlist",
+                        source_type=SourceType.YOUTUBE,
+                        source_url="https://www.youtube.com/watch?v=vid_reuse_other_playlist",
+                        title="Existing Elsewhere",
+                        metadata={},
+                    ),
+                },
+            },
+            callback=messages.append,
+        )
+
+        assert db.get_video("vid_new") is not None
+        assert db.get_playlist_video_info("PL_PERSIST_NEW", "vid_new")["playlist_index"] == 2
+        assert db.get_video("vid_reuse_other_playlist") is None
+        assert db.get_playlist_video_info("PL_PERSIST_NEW", "vid_reuse_other_playlist")["playlist_index"] == 3
+        assert messages == [
+            "[2/3] 新增: New Video...",
+            "[3/3] 关联已有视频: Existing Elsewhere...",
+        ]
+
+    def test_persist_sync_members_dispatches_existing_and_new_stages(self, db, monkeypatch):
+        service = PlaylistService(db)
+        calls = []
+
+        monkeypatch.setattr(
+            service,
+            "_update_existing_sync_members",
+            lambda **kwargs: calls.append(("existing", kwargs)),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            service,
+            "_persist_new_sync_members",
+            lambda **kwargs: calls.append(("new", kwargs)),
+            raising=False,
+        )
+
+        service._persist_sync_members(
+            playlist_id="PL_PERSIST_DISPATCH",
+            total_videos=3,
+            channel="Uploader",
+            auto_add_videos=True,
+            existing_playlist_updates=[("vid_old", 1)],
+            new_videos=["vid_new"],
+            new_video_candidates={"vid_new": {"playlist_index": 2}},
+            callback=lambda _msg: None,
+        )
+
+        assert calls == [
+            (
+                "existing",
+                {
+                    "playlist_id": "PL_PERSIST_DISPATCH",
+                    "existing_playlist_updates": [("vid_old", 1)],
+                },
+            ),
+            (
+                "new",
+                {
+                    "playlist_id": "PL_PERSIST_DISPATCH",
+                    "total_videos": 3,
+                    "channel": "Uploader",
+                    "new_videos": ["vid_new"],
+                    "new_video_candidates": {"vid_new": {"playlist_index": 2}},
+                    "callback": calls[1][1]["callback"],
+                },
+            ),
+        ]
+
+    def test_persist_sync_members_skips_new_stage_when_auto_add_disabled(self, db, monkeypatch):
+        service = PlaylistService(db)
+        calls = []
+
+        monkeypatch.setattr(
+            service,
+            "_update_existing_sync_members",
+            lambda **kwargs: calls.append(("existing", kwargs)),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            service,
+            "_persist_new_sync_members",
+            lambda **kwargs: calls.append(("new", kwargs)),
+            raising=False,
+        )
+
+        service._persist_sync_members(
+            playlist_id="PL_PERSIST_NOADD",
+            total_videos=1,
+            channel="Uploader",
+            auto_add_videos=False,
+            existing_playlist_updates=[("vid_old", 1)],
+            new_videos=["vid_skip"],
+            new_video_candidates={"vid_skip": {"playlist_index": 1}},
+            callback=lambda _msg: None,
+        )
+
+        assert calls == [
+            (
+                "existing",
+                {
+                    "playlist_id": "PL_PERSIST_NOADD",
+                    "existing_playlist_updates": [("vid_old", 1)],
+                },
+            ),
+        ]
+
     def test_persist_sync_members_updates_existing_and_creates_new(self, db):
         _setup_playlist(db, "PL_PERSIST")
         existing_video = Video(
