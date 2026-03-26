@@ -375,22 +375,13 @@ class PlaylistService:
                 'existing_video': self.db.get_video(video_id) if auto_add_videos else None,
             }
 
-        videos_needing_refresh = []
-        stale_zero_index_existing_videos: Set[str] = set()
+        refresh_plan = {'videos_needing_refresh': [], 'stale_zero_index_existing_videos': set()}
         if fetch_upload_dates and existing_videos:
-            for vid in existing_videos:
-                video = self.db.get_video(vid)
-                if video is None:
-                    continue
-                if self._should_refresh_existing_video_info(video):
-                    videos_needing_refresh.append(vid)
-                    pv_info = self.db.get_playlist_video_info(playlist_id, vid)
-                    current_index = (pv_info.get('upload_order_index') or 0) if pv_info else 0
-                    if current_index == 0:
-                        stale_zero_index_existing_videos.add(vid)
-
-            if videos_needing_refresh:
-                callback(f"发现 {len(videos_needing_refresh)} 个已存在视频需要补抓元信息，将一并获取")
+            refresh_plan = self._plan_existing_video_refreshes(
+                playlist_id=playlist_id,
+                existing_videos=existing_videos,
+                callback=callback,
+            )
 
         return {
             'total_videos': total_videos,
@@ -398,9 +389,41 @@ class PlaylistService:
             'existing_videos': existing_videos,
             'new_video_candidates': new_video_candidates,
             'existing_playlist_updates': existing_playlist_updates,
+            'videos_needing_refresh': refresh_plan['videos_needing_refresh'],
+            'stale_zero_index_existing_videos': refresh_plan['stale_zero_index_existing_videos'],
+            'videos_to_fetch': new_videos + refresh_plan['videos_needing_refresh'],
+        }
+
+    def _plan_existing_video_refreshes(
+        self,
+        *,
+        playlist_id: str,
+        existing_videos: List[str],
+        callback: Callable[[str], None],
+    ) -> Dict[str, Any]:
+        """规划已存在视频中需要补抓元信息的对象及其 stale 索引成员。"""
+        videos_needing_refresh = []
+        stale_zero_index_existing_videos: Set[str] = set()
+
+        for vid in existing_videos:
+            video = self.db.get_video(vid)
+            if video is None:
+                continue
+            if not self._should_refresh_existing_video_info(video):
+                continue
+
+            videos_needing_refresh.append(vid)
+            pv_info = self.db.get_playlist_video_info(playlist_id, vid)
+            current_index = (pv_info.get('upload_order_index') or 0) if pv_info else 0
+            if current_index == 0:
+                stale_zero_index_existing_videos.add(vid)
+
+        if videos_needing_refresh:
+            callback(f"发现 {len(videos_needing_refresh)} 个已存在视频需要补抓元信息，将一并获取")
+
+        return {
             'videos_needing_refresh': videos_needing_refresh,
             'stale_zero_index_existing_videos': stale_zero_index_existing_videos,
-            'videos_to_fetch': new_videos + videos_needing_refresh,
         }
 
     def _prune_sync_candidates_after_fetch(

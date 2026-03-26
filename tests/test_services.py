@@ -223,6 +223,55 @@ class TestSyncPlaylistContracts:
         assert plan["new_video_candidates"]["vid_new"]["playlist_index"] == 2
         assert plan["new_video_candidates"]["vid_new"]["existing_video"] is None
 
+    def test_plan_existing_video_refreshes_collects_refresh_targets_and_stale_indices(self, db):
+        _setup_playlist(db, "PL_REFRESH_PLAN")
+        _add_pl_video(db, "vid_refresh", playlist_id="PL_REFRESH_PLAN", index=1)
+        _add_pl_video(db, "vid_skip", playlist_id="PL_REFRESH_PLAN", index=2)
+        db.update_video("vid_refresh", metadata={
+            "upload_date": "20250109",
+            "upload_date_interpolated": True,
+        })
+        db.update_video("vid_skip", metadata={
+            "upload_date": "20250108",
+            "thumbnail": "thumb.jpg",
+        })
+
+        service = PlaylistService(db)
+
+        planned = service._plan_existing_video_refreshes(
+            playlist_id="PL_REFRESH_PLAN",
+            existing_videos=["vid_refresh", "vid_skip"],
+            callback=lambda _msg: None,
+        )
+
+        assert planned == {
+            "videos_needing_refresh": ["vid_refresh"],
+            "stale_zero_index_existing_videos": {"vid_refresh"},
+        }
+
+    def test_plan_existing_video_refreshes_skips_missing_records_and_emits_message(self, db):
+        _setup_playlist(db, "PL_REFRESH_MSG")
+        _add_pl_video(db, "vid_present", playlist_id="PL_REFRESH_MSG", index=1)
+        db.update_video("vid_present", metadata={
+            "upload_date": "20250109",
+            "upload_date_interpolated": True,
+        })
+
+        service = PlaylistService(db)
+        messages = []
+
+        planned = service._plan_existing_video_refreshes(
+            playlist_id="PL_REFRESH_MSG",
+            existing_videos=["vid_present", "vid_missing"],
+            callback=messages.append,
+        )
+
+        assert planned == {
+            "videos_needing_refresh": ["vid_present"],
+            "stale_zero_index_existing_videos": {"vid_present"},
+        }
+        assert messages == ["发现 1 个已存在视频需要补抓元信息，将一并获取"]
+
     def test_prune_sync_candidates_removes_unavailable_new_and_stale_existing(self, db):
         service = PlaylistService(db)
 
