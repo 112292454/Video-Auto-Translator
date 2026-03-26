@@ -168,6 +168,40 @@ class PlaylistService:
         playlist_title = bootstrap['playlist_title']
         channel = bootstrap['channel']
         entries = bootstrap['entries']
+        prepared = self._prepare_sync_playlist_flow(
+            playlist_id=playlist_id,
+            entries=entries,
+            auto_add_videos=auto_add_videos,
+            fetch_upload_dates=fetch_upload_dates,
+            callback=callback,
+        )
+
+        return self._commit_sync_playlist_flow(
+            playlist_id=playlist_id,
+            playlist_title=playlist_title,
+            total_videos=prepared['total_videos'],
+            channel=channel,
+            auto_add_videos=auto_add_videos,
+            existing_playlist_updates=prepared['existing_playlist_updates'],
+            new_videos=prepared['new_videos'],
+            new_video_candidates=prepared['new_video_candidates'],
+            existing_videos=prepared['existing_videos'],
+            should_apply_fetch_results=prepared['should_apply_fetch_results'],
+            pruned_stale_existing_videos=prepared['pruned_stale_existing_videos'],
+            fetch_results=prepared['fetch_results'],
+            callback=callback,
+        )
+
+    def _prepare_sync_playlist_flow(
+        self,
+        *,
+        playlist_id: str,
+        entries: List[Optional[Dict[str, Any]]],
+        auto_add_videos: bool,
+        fetch_upload_dates: bool,
+        callback: Callable[[str], None],
+    ) -> Dict[str, Any]:
+        """为 sync_playlist 准备执行计划，并在需要时应用 fetch/prune 调整。"""
         sync_plan = self._plan_sync_candidates(
             playlist_id=playlist_id,
             entries=entries,
@@ -175,48 +209,42 @@ class PlaylistService:
             fetch_upload_dates=fetch_upload_dates,
             callback=callback,
         )
-        total_videos = sync_plan['total_videos']
-        new_videos = sync_plan['new_videos']
-        existing_videos = sync_plan['existing_videos']
-        new_video_candidates = sync_plan['new_video_candidates']
-        existing_playlist_updates = sync_plan['existing_playlist_updates']
-        stale_zero_index_existing_videos = sync_plan['stale_zero_index_existing_videos']
+
+        prepared = {
+            'total_videos': sync_plan['total_videos'],
+            'new_videos': sync_plan['new_videos'],
+            'existing_videos': sync_plan['existing_videos'],
+            'new_video_candidates': sync_plan['new_video_candidates'],
+            'existing_playlist_updates': sync_plan['existing_playlist_updates'],
+            'should_apply_fetch_results': False,
+            'pruned_stale_existing_videos': set(),
+            'fetch_results': [],
+        }
+
         videos_to_fetch = sync_plan['videos_to_fetch']
-        
-        # 如果需要获取 upload_date，并行获取详细信息
         if fetch_upload_dates and videos_to_fetch:
             adjusted = self._fetch_and_prune_sync_candidates(
-                new_videos=new_videos,
-                existing_videos=existing_videos,
-                new_video_candidates=new_video_candidates,
-                existing_playlist_updates=existing_playlist_updates,
-                stale_zero_index_existing_videos=stale_zero_index_existing_videos,
+                new_videos=prepared['new_videos'],
+                existing_videos=prepared['existing_videos'],
+                new_video_candidates=prepared['new_video_candidates'],
+                existing_playlist_updates=prepared['existing_playlist_updates'],
+                stale_zero_index_existing_videos=sync_plan['stale_zero_index_existing_videos'],
                 videos_to_fetch=videos_to_fetch,
                 callback=callback,
             )
-            new_videos = adjusted['new_videos']
-            existing_videos = adjusted['existing_videos']
-            new_video_candidates = adjusted['new_video_candidates']
-            existing_playlist_updates = adjusted['existing_playlist_updates']
-            fetch_results = adjusted['fetch_results']
-            pruned_new_videos = adjusted['pruned_new_videos']
-            pruned_stale_existing_videos = adjusted['pruned_stale_existing_videos']
+            prepared.update(
+                {
+                    'new_videos': adjusted['new_videos'],
+                    'existing_videos': adjusted['existing_videos'],
+                    'new_video_candidates': adjusted['new_video_candidates'],
+                    'existing_playlist_updates': adjusted['existing_playlist_updates'],
+                    'should_apply_fetch_results': True,
+                    'pruned_stale_existing_videos': adjusted['pruned_stale_existing_videos'],
+                    'fetch_results': adjusted['fetch_results'],
+                }
+            )
 
-        return self._commit_sync_playlist_flow(
-            playlist_id=playlist_id,
-            playlist_title=playlist_title,
-            total_videos=total_videos,
-            channel=channel,
-            auto_add_videos=auto_add_videos,
-            existing_playlist_updates=existing_playlist_updates,
-            new_videos=new_videos,
-            new_video_candidates=new_video_candidates,
-            existing_videos=existing_videos,
-            should_apply_fetch_results=fetch_upload_dates and bool(videos_to_fetch),
-            pruned_stale_existing_videos=pruned_stale_existing_videos if fetch_upload_dates and videos_to_fetch else set(),
-            fetch_results=fetch_results if fetch_upload_dates and videos_to_fetch else [],
-            callback=callback,
-        )
+        return prepared
 
     def _commit_sync_playlist_flow(
         self,

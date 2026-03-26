@@ -393,6 +393,106 @@ class TestSyncPlaylistContracts:
         ]
         assert messages == ["开始并行获取视频信息（共 2 个，10 个并发）..."]
 
+    def test_prepare_sync_playlist_flow_returns_plan_when_fetch_stage_not_needed(self, db, monkeypatch):
+        service = PlaylistService(db)
+        calls = []
+        sync_plan = {
+            "total_videos": 3,
+            "new_videos": ["vid_new"],
+            "existing_videos": ["vid_existing"],
+            "new_video_candidates": {"vid_new": {"playlist_index": 2}},
+            "existing_playlist_updates": [("vid_existing", 1)],
+            "stale_zero_index_existing_videos": {"vid_stale"},
+            "videos_to_fetch": [],
+        }
+
+        monkeypatch.setattr(
+            service,
+            "_plan_sync_candidates",
+            lambda **kwargs: calls.append(("plan", kwargs)) or sync_plan,
+        )
+        monkeypatch.setattr(
+            service,
+            "_fetch_and_prune_sync_candidates",
+            lambda **kwargs: calls.append(("fetch", kwargs)),
+        )
+
+        result = service._prepare_sync_playlist_flow(
+            playlist_id="PL_PREPARE",
+            entries=[{"id": "vid_new", "title": "Video New"}],
+            auto_add_videos=True,
+            fetch_upload_dates=True,
+            callback=lambda _msg: None,
+        )
+
+        assert result == {
+            "total_videos": 3,
+            "new_videos": ["vid_new"],
+            "existing_videos": ["vid_existing"],
+            "new_video_candidates": {"vid_new": {"playlist_index": 2}},
+            "existing_playlist_updates": [("vid_existing", 1)],
+            "should_apply_fetch_results": False,
+            "pruned_stale_existing_videos": set(),
+            "fetch_results": [],
+        }
+        assert [name for name, _kwargs in calls] == ["plan"]
+
+    def test_prepare_sync_playlist_flow_fetches_and_returns_adjusted_plan(self, db, monkeypatch):
+        service = PlaylistService(db)
+        calls = []
+        sync_plan = {
+            "total_videos": 4,
+            "new_videos": ["vid_new_ok", "vid_new_skip"],
+            "existing_videos": ["vid_existing_ok", "vid_existing_stale"],
+            "new_video_candidates": {
+                "vid_new_ok": {"playlist_index": 2},
+                "vid_new_skip": {"playlist_index": 3},
+            },
+            "existing_playlist_updates": [("vid_existing_ok", 1), ("vid_existing_stale", 4)],
+            "stale_zero_index_existing_videos": {"vid_existing_stale"},
+            "videos_to_fetch": ["vid_new_ok", "vid_existing_ok"],
+        }
+        adjusted = {
+            "new_videos": ["vid_new_ok"],
+            "existing_videos": ["vid_existing_ok"],
+            "new_video_candidates": {"vid_new_ok": {"playlist_index": 2}},
+            "existing_playlist_updates": [("vid_existing_ok", 1)],
+            "fetch_results": [("vid_new_ok", VideoInfoResult(status="ok", info={"upload_date": "20250101"}))],
+            "pruned_new_videos": {"vid_new_skip"},
+            "pruned_stale_existing_videos": {"vid_existing_stale"},
+        }
+
+        monkeypatch.setattr(
+            service,
+            "_plan_sync_candidates",
+            lambda **kwargs: calls.append(("plan", kwargs)) or sync_plan,
+        )
+        monkeypatch.setattr(
+            service,
+            "_fetch_and_prune_sync_candidates",
+            lambda **kwargs: calls.append(("fetch", kwargs)) or adjusted,
+        )
+
+        result = service._prepare_sync_playlist_flow(
+            playlist_id="PL_PREPARE_FETCH",
+            entries=[{"id": "vid_new_ok", "title": "Video New"}],
+            auto_add_videos=False,
+            fetch_upload_dates=True,
+            callback=lambda _msg: None,
+        )
+
+        assert result == {
+            "total_videos": 4,
+            "new_videos": ["vid_new_ok"],
+            "existing_videos": ["vid_existing_ok"],
+            "new_video_candidates": {"vid_new_ok": {"playlist_index": 2}},
+            "existing_playlist_updates": [("vid_existing_ok", 1)],
+            "should_apply_fetch_results": True,
+            "pruned_stale_existing_videos": {"vid_existing_stale"},
+            "fetch_results": [("vid_new_ok", VideoInfoResult(status="ok", info={"upload_date": "20250101"}))],
+        }
+        assert [name for name, _kwargs in calls] == ["plan", "fetch"]
+
     def test_persist_sync_members_updates_existing_and_creates_new(self, db):
         _setup_playlist(db, "PL_PERSIST")
         existing_video = Video(
