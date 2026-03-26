@@ -268,6 +268,70 @@ class TestFFmpegWrapperHardEmbedPlanning:
             "fonts_dir": "/fonts",
         }]
 
+    def test_probe_hard_embed_original_bitrate_returns_bit_rate_from_video_info(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        video.write_bytes(b"00")
+        monkeypatch.setattr(wrapper, "get_video_info", lambda path: {"bit_rate": 2468})
+
+        bitrate = wrapper._probe_hard_embed_original_bitrate(video)
+
+        assert bitrate == 2468
+
+    def test_probe_hard_embed_original_bitrate_falls_back_to_zero_when_probe_returns_none(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        video.write_bytes(b"00")
+        monkeypatch.setattr(wrapper, "get_video_info", lambda path: None)
+
+        bitrate = wrapper._probe_hard_embed_original_bitrate(video)
+
+        assert bitrate == 0
+
+    def test_embed_subtitle_hard_delegates_bitrate_probe_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.srt"
+        out = tmp_path / "out.mp4"
+        video.write_bytes(b"00")
+        sub.write_text("dummy", encoding="utf-8")
+        delegated = []
+        planned = []
+
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.init", lambda max_per_gpu=5: None)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.select_gpu", lambda: 0)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.acquire", lambda gpu_id, timeout=600: True)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.release", lambda gpu_id: None)
+        monkeypatch.setattr(wrapper, "_check_nvenc_support", lambda: True)
+        monkeypatch.setattr(wrapper, "get_video_info", lambda _path: {"bit_rate": 1000})
+        monkeypatch.setattr(
+            wrapper,
+            "_probe_hard_embed_original_bitrate",
+            lambda video_path: delegated.append(video_path) or 4321,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_build_hard_embed_ffmpeg_command",
+            lambda **kwargs: planned.append(kwargs) or ["ffmpeg", "planned"],
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_run_ffmpeg_embed_process",
+            lambda **kwargs: True,
+            raising=False,
+        )
+
+        result = wrapper.embed_subtitle_hard(video, sub, out, gpu_device="auto")
+
+        assert result is True
+        assert delegated == [video]
+        assert planned and planned[0]["original_bitrate"] == 4321
+
     def test_build_hard_embed_ffmpeg_command_uses_hevc_nvenc_and_vbr_bitrate(self, monkeypatch, tmp_path):
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
         wrapper = FFmpegWrapper()

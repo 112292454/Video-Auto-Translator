@@ -480,8 +480,7 @@ class FFmpegWrapper:
             raise RuntimeError(error_msg)
 
         # 优化：获取原视频码率以控制输出体积
-        video_info = self.get_video_info(video_path)
-        original_bitrate = video_info.get('bit_rate', 0) if video_info else 0
+        original_bitrate = self._probe_hard_embed_original_bitrate(video_path)
 
         cmd = self._build_hard_embed_ffmpeg_command(
             video_path=video_path,
@@ -541,6 +540,11 @@ class FFmpegWrapper:
             return vf
 
         return f"subtitles='{subtitle_path_escaped}'"
+
+    def _probe_hard_embed_original_bitrate(self, video_path: Path) -> int:
+        """探测硬字幕合成使用的原视频码率。"""
+        video_info = self.get_video_info(video_path)
+        return video_info.get('bit_rate', 0) if video_info else 0
 
     def _build_hard_embed_ffmpeg_command(
         self,
