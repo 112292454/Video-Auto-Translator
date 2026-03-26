@@ -494,68 +494,22 @@ class FFmpegWrapper:
             logger.error(error_msg)
             raise RuntimeError(error_msg)
 
-        # 自动选择硬件编码器
-        if video_codec in ['libx265', 'hevc']:
-            actual_codec = 'hevc_nvenc'
-        elif video_codec == 'av1':
-            if self._check_encoder_support('av1_nvenc'):
-                actual_codec = 'av1_nvenc'
-            else:
-                logger.warning("当前环境不支持 av1_nvenc，回退到 hevc_nvenc")
-                actual_codec = 'hevc_nvenc'
-        else:
-            if video_codec != 'h264':
-                logger.info(f"未知编码器 {video_codec}，使用 h264_nvenc")
-            actual_codec = 'h264_nvenc'
-
         # 优化：获取原视频码率以控制输出体积
         video_info = self.get_video_info(video_path)
         original_bitrate = video_info.get('bit_rate', 0) if video_info else 0
 
-        if original_bitrate > 0:
-            # 使用受限码率模式 (VBR)，目标码率设为原视频的 1.1 倍，最大 1.5 倍
-            target_bitrate = int(original_bitrate * 1.1)
-            max_bitrate = int(original_bitrate * 1.5)
-            codec_params = [
-                '-rc', 'vbr',              # 变码率模式
-                '-cq', str(crf),           # 目标质量
-                '-b:v', str(target_bitrate),
-                '-maxrate', str(max_bitrate),
-                '-bufsize', str(max_bitrate * 2),
-                '-preset', preset if preset.startswith('p') else 'p4',
-            ]
-        else:
-            # 如果获取不到码率，回退到质量优先模式
-            codec_params = [
-                '-rc', 'constqp',
-                '-qp', str(crf),
-                '-preset', preset if preset.startswith('p') else 'p4',
-            ]
+        cmd = self._build_hard_embed_ffmpeg_command(
+            video_path=video_path,
+            output_path=output_path,
+            vf=vf,
+            video_codec=video_codec,
+            audio_codec=audio_codec,
+            crf=crf,
+            preset=preset,
+            gpu_id=gpu_id,
+            original_bitrate=original_bitrate,
+        )
 
-        codec_params.extend([
-            '-gpu', str(gpu_id),
-            '-spatial_aq', '1',
-            '-temporal_aq', '1'
-        ])
-        
-        # 构建 ffmpeg 命令
-        # 注意：-vf ass/subtitles 是 CPU 滤镜，帧流为:
-        #   hwaccel 解码(GPU N) → 下载到 CPU → 字幕渲染 → 上传到 GPU N → NVENC 编码
-        # 使用 -hwaccel_device 确保解码与编码在同一张 GPU，避免所有进程挤占 GPU 0。
-        cmd = [
-            'ffmpeg',
-            '-hwaccel', 'cuda',
-            '-hwaccel_device', str(gpu_id),
-            '-i', str(video_path),
-            '-vf', vf,
-            '-c:v', actual_codec,
-            *codec_params,
-            '-c:a', audio_codec,
-            '-movflags', '+faststart',
-            '-y',
-            str(output_path)
-        ]
-        
         try:
             return self._run_ffmpeg_embed_process(
                 cmd=cmd,
@@ -571,6 +525,71 @@ class FFmpegWrapper:
                     Path(temp_file).unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    def _build_hard_embed_ffmpeg_command(
+        self,
+        *,
+        video_path: Path,
+        output_path: Path,
+        vf: str,
+        video_codec: str,
+        audio_codec: str,
+        crf: int,
+        preset: str,
+        gpu_id: int,
+        original_bitrate: int,
+    ) -> List[str]:
+        """构建硬字幕合成使用的 FFmpeg 命令。"""
+        if video_codec in ['libx265', 'hevc']:
+            actual_codec = 'hevc_nvenc'
+        elif video_codec == 'av1':
+            if self._check_encoder_support('av1_nvenc'):
+                actual_codec = 'av1_nvenc'
+            else:
+                logger.warning("当前环境不支持 av1_nvenc，回退到 hevc_nvenc")
+                actual_codec = 'hevc_nvenc'
+        else:
+            if video_codec != 'h264':
+                logger.info(f"未知编码器 {video_codec}，使用 h264_nvenc")
+            actual_codec = 'h264_nvenc'
+
+        if original_bitrate > 0:
+            target_bitrate = int(original_bitrate * 1.1)
+            max_bitrate = int(original_bitrate * 1.5)
+            codec_params = [
+                '-rc', 'vbr',
+                '-cq', str(crf),
+                '-b:v', str(target_bitrate),
+                '-maxrate', str(max_bitrate),
+                '-bufsize', str(max_bitrate * 2),
+                '-preset', preset if preset.startswith('p') else 'p4',
+            ]
+        else:
+            codec_params = [
+                '-rc', 'constqp',
+                '-qp', str(crf),
+                '-preset', preset if preset.startswith('p') else 'p4',
+            ]
+
+        codec_params.extend([
+            '-gpu', str(gpu_id),
+            '-spatial_aq', '1',
+            '-temporal_aq', '1',
+        ])
+
+        return [
+            'ffmpeg',
+            '-hwaccel', 'cuda',
+            '-hwaccel_device', str(gpu_id),
+            '-i', str(video_path),
+            '-vf', vf,
+            '-c:v', actual_codec,
+            *codec_params,
+            '-c:a', audio_codec,
+            '-movflags', '+faststart',
+            '-y',
+            str(output_path),
+        ]
 
     def _run_ffmpeg_embed_process(
         self,

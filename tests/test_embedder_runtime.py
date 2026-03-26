@@ -151,6 +151,111 @@ class TestFFmpegWrapperSoftEmbedContracts:
         assert wrapper.extract_audio(video, audio) is False
 
 
+class TestFFmpegWrapperHardEmbedPlanning:
+    def test_build_hard_embed_ffmpeg_command_uses_hevc_nvenc_and_vbr_bitrate(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        out = tmp_path / "out.mp4"
+
+        cmd = wrapper._build_hard_embed_ffmpeg_command(
+            video_path=video,
+            output_path=out,
+            vf="subtitles='sub.srt'",
+            video_codec="hevc",
+            audio_codec="copy",
+            crf=28,
+            preset="p6",
+            gpu_id=3,
+            original_bitrate=1000,
+        )
+
+        assert cmd[:8] == [
+            "ffmpeg",
+            "-hwaccel",
+            "cuda",
+            "-hwaccel_device",
+            "3",
+            "-i",
+            str(video),
+            "-vf",
+        ]
+        assert "subtitles='sub.srt'" in cmd
+        assert cmd[cmd.index("-c:v") + 1] == "hevc_nvenc"
+        assert cmd[cmd.index("-rc") + 1] == "vbr"
+        assert cmd[cmd.index("-cq") + 1] == "28"
+        assert cmd[cmd.index("-b:v") + 1] == "1100"
+        assert cmd[cmd.index("-maxrate") + 1] == "1500"
+        assert cmd[cmd.index("-bufsize") + 1] == "3000"
+        assert cmd[cmd.index("-preset") + 1] == "p6"
+        assert cmd[cmd.index("-gpu") + 1] == "3"
+        assert cmd[cmd.index("-c:a") + 1] == "copy"
+        assert cmd[-2:] == ["-y", str(out)]
+
+    def test_build_hard_embed_ffmpeg_command_falls_back_to_hevc_when_av1_nvenc_unavailable(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        out = tmp_path / "out.mp4"
+        monkeypatch.setattr(wrapper, "_check_encoder_support", lambda name: False)
+
+        cmd = wrapper._build_hard_embed_ffmpeg_command(
+            video_path=video,
+            output_path=out,
+            vf="subtitles='sub.srt'",
+            video_codec="av1",
+            audio_codec="aac",
+            crf=23,
+            preset="slow",
+            gpu_id=0,
+            original_bitrate=0,
+        )
+
+        assert cmd[cmd.index("-c:v") + 1] == "hevc_nvenc"
+        assert cmd[cmd.index("-rc") + 1] == "constqp"
+        assert cmd[cmd.index("-qp") + 1] == "23"
+        assert cmd[cmd.index("-preset") + 1] == "p4"
+        assert cmd[cmd.index("-gpu") + 1] == "0"
+        assert cmd[cmd.index("-c:a") + 1] == "aac"
+
+    def test_embed_subtitle_hard_delegates_command_planning_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.srt"
+        out = tmp_path / "out.mp4"
+        video.write_bytes(b"00")
+        sub.write_text("dummy", encoding="utf-8")
+        planned = []
+        delegated = []
+
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.init", lambda max_per_gpu=5: None)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.select_gpu", lambda: 0)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.acquire", lambda gpu_id, timeout=600: True)
+        monkeypatch.setattr("vat.embedder.ffmpeg_wrapper._nvenc_manager.release", lambda gpu_id: None)
+        monkeypatch.setattr(wrapper, "_check_nvenc_support", lambda: True)
+        monkeypatch.setattr(wrapper, "get_video_info", lambda _path: {"bit_rate": 1000})
+        monkeypatch.setattr(
+            wrapper,
+            "_build_hard_embed_ffmpeg_command",
+            lambda **kwargs: planned.append(kwargs) or ["ffmpeg", "planned"],
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_run_ffmpeg_embed_process",
+            lambda **kwargs: delegated.append(kwargs) or True,
+            raising=False,
+        )
+
+        result = wrapper.embed_subtitle_hard(video, sub, out, gpu_device="auto")
+
+        assert result is True
+        assert planned and planned[0]["original_bitrate"] == 1000
+        assert planned[0]["gpu_id"] == 0
+        assert delegated == [{"cmd": ["ffmpeg", "planned"], "output_path": out, "progress_callback": None}]
+
+
 class TestFFmpegWrapperHardEmbedRuntime:
     def test_run_ffmpeg_embed_process_reports_progress_writes_log_and_succeeds(self, monkeypatch, tmp_path):
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
