@@ -218,8 +218,6 @@ class FFmpegWrapper:
             return False
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        subtitle_ext = subtitle_path.suffix.lower()
-        output_ext = output_path.suffix.lower()
         cmd = self._plan_soft_subtitle_command(
             video_path=video_path,
             subtitle_path=subtitle_path,
@@ -227,19 +225,11 @@ class FFmpegWrapper:
             subtitle_language=subtitle_language,
             subtitle_title=subtitle_title,
         )
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            if not output_path.exists():
-                print(f"错误: 软字幕嵌入完成但未生成文件: {output_path}")
-                return False
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"软字幕嵌入失败: {e.stderr}")
-            # 如果是MP4+ASS失败，提示用户
-            if output_ext == '.mp4' and subtitle_ext == '.ass':
-                print("提示: MP4容器不完全支持ASS字幕样式，建议使用MKV容器或硬字幕")
-            return False
+        return self._run_soft_subtitle_runtime_stage(
+            cmd=cmd,
+            subtitle_path=subtitle_path,
+            output_path=output_path,
+        )
 
     def _plan_soft_subtitle_command(
         self,
@@ -268,7 +258,6 @@ class FFmpegWrapper:
                 '-y',
                 str(output_path)
             ]
-
         return [
             'ffmpeg',
             '-i', str(video_path),
@@ -282,6 +271,29 @@ class FFmpegWrapper:
             str(output_path)
         ]
 
+    def _run_soft_subtitle_runtime_stage(
+        self,
+        *,
+        cmd: List[str],
+        subtitle_path: Path,
+        output_path: Path,
+    ) -> bool:
+        """执行软字幕嵌入运行阶段并校验输出。"""
+        subtitle_ext = subtitle_path.suffix.lower()
+        output_ext = output_path.suffix.lower()
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            if not output_path.exists():
+                print(f"错误: 软字幕嵌入完成但未生成文件: {output_path}")
+                return False
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"软字幕嵌入失败: {e.stderr}")
+            if output_ext == '.mp4' and subtitle_ext == '.ass':
+                print("提示: MP4容器不完全支持ASS字幕样式，建议使用MKV容器或硬字幕")
+            return False
+
     def _get_video_resolution(self, video_path: Path) -> tuple[int, int]:
         """获取视频分辨率"""
         result = subprocess.run(
@@ -289,7 +301,7 @@ class FFmpegWrapper:
             capture_output=True,
             text=True,
         )
-        
+
         # 从 ffmpeg 输出中解析分辨率
         pattern = r"(\d{2,5})x(\d{2,5})"
         match = re.search(pattern, result.stderr)

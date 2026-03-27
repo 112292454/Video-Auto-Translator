@@ -236,6 +236,102 @@ class TestFFmpegWrapperSoftEmbedContracts:
         }]
         assert calls == [["ffmpeg", "planned", str(out)]]
 
+    def test_run_soft_subtitle_runtime_stage_returns_true_when_ffmpeg_creates_output(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        sub = tmp_path / "sub.ass"
+        out = tmp_path / "out.mp4"
+        sub.write_text("dummy", encoding="utf-8")
+        calls = []
+
+        def fake_run(cmd, capture_output, text, check):
+            calls.append(cmd)
+            out.write_bytes(b"11")
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        result = wrapper._run_soft_subtitle_runtime_stage(
+            cmd=["ffmpeg", "planned", str(out)],
+            subtitle_path=sub,
+            output_path=out,
+        )
+
+        assert result is True
+        assert calls == [["ffmpeg", "planned", str(out)]]
+
+    def test_run_soft_subtitle_runtime_stage_returns_false_when_output_missing(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        sub = tmp_path / "sub.ass"
+        out = tmp_path / "out.mp4"
+        sub.write_text("dummy", encoding="utf-8")
+
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda cmd, capture_output, text, check: SimpleNamespace(returncode=0),
+        )
+
+        result = wrapper._run_soft_subtitle_runtime_stage(
+            cmd=["ffmpeg", "planned", str(out)],
+            subtitle_path=sub,
+            output_path=out,
+        )
+
+        assert result is False
+        captured = capsys.readouterr()
+        assert f"错误: 软字幕嵌入完成但未生成文件: {out}" in captured.out
+
+    def test_run_soft_subtitle_runtime_stage_reports_mp4_ass_hint_on_failure(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        sub = tmp_path / "sub.ass"
+        out = tmp_path / "out.mp4"
+        sub.write_text("dummy", encoding="utf-8")
+
+        def fake_run(cmd, capture_output, text, check):
+            raise subprocess.CalledProcessError(returncode=1, cmd=cmd, stderr="failed")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        result = wrapper._run_soft_subtitle_runtime_stage(
+            cmd=["ffmpeg", "planned", str(out)],
+            subtitle_path=sub,
+            output_path=out,
+        )
+
+        assert result is False
+        captured = capsys.readouterr()
+        assert "软字幕嵌入失败: failed" in captured.out
+        assert "提示: MP4容器不完全支持ASS字幕样式，建议使用MKV容器或硬字幕" in captured.out
+
+    def test_embed_subtitle_soft_delegates_runtime_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.ass"
+        out = tmp_path / "out.mp4"
+        video.write_bytes(b"00")
+        sub.write_text("dummy", encoding="utf-8")
+        delegated = []
+
+        monkeypatch.setattr(wrapper, "_plan_soft_subtitle_command", lambda **kwargs: ["ffmpeg", "planned"], raising=False)
+        monkeypatch.setattr(
+            wrapper,
+            "_run_soft_subtitle_runtime_stage",
+            lambda **kwargs: delegated.append(kwargs) or True,
+            raising=False,
+        )
+
+        result = wrapper.embed_subtitle_soft(video, sub, out)
+
+        assert result is True
+        assert delegated == [{
+            "cmd": ["ffmpeg", "planned"],
+            "subtitle_path": sub,
+            "output_path": out,
+        }]
+
     def test_extract_audio_returns_false_when_input_missing(self, monkeypatch, tmp_path):
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
         wrapper = FFmpegWrapper()
