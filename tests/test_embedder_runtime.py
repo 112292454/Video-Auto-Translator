@@ -115,6 +115,127 @@ class TestFFmpegWrapperSoftEmbedContracts:
         assert "-c:s" in calls[0]
         assert "mov_text" in calls[0]
 
+    def test_plan_soft_subtitle_command_for_mkv_preserves_ass_and_default_disposition(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.ass"
+        out = tmp_path / "out.mkv"
+
+        cmd = wrapper._plan_soft_subtitle_command(
+            video_path=video,
+            subtitle_path=sub,
+            output_path=out,
+            subtitle_language="zho",
+            subtitle_title="中文字幕",
+        )
+
+        assert cmd == [
+            "ffmpeg",
+            "-i", str(video),
+            "-i", str(sub),
+            "-c:v", "copy",
+            "-c:a", "copy",
+            "-c:s", "copy",
+            "-metadata:s:s:0", "language=zho",
+            "-metadata:s:s:0", "title=中文字幕",
+            "-disposition:s:0", "default",
+            "-y",
+            str(out),
+        ]
+
+    def test_plan_soft_subtitle_command_for_mkv_transcodes_non_ass_subtitle_to_srt(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.srt"
+        out = tmp_path / "out.mkv"
+
+        cmd = wrapper._plan_soft_subtitle_command(
+            video_path=video,
+            subtitle_path=sub,
+            output_path=out,
+            subtitle_language="chi",
+            subtitle_title="中文",
+        )
+
+        assert cmd == [
+            "ffmpeg",
+            "-i", str(video),
+            "-i", str(sub),
+            "-c:v", "copy",
+            "-c:a", "copy",
+            "-c:s", "srt",
+            "-metadata:s:s:0", "language=chi",
+            "-metadata:s:s:0", "title=中文",
+            "-disposition:s:0", "default",
+            "-y",
+            str(out),
+        ]
+
+    def test_plan_soft_subtitle_command_for_mp4_uses_mov_text_without_default_disposition(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.ass"
+        out = tmp_path / "out.mp4"
+
+        cmd = wrapper._plan_soft_subtitle_command(
+            video_path=video,
+            subtitle_path=sub,
+            output_path=out,
+            subtitle_language="chi",
+            subtitle_title="中文",
+        )
+
+        assert cmd == [
+            "ffmpeg",
+            "-i", str(video),
+            "-i", str(sub),
+            "-c:v", "copy",
+            "-c:a", "copy",
+            "-c:s", "mov_text",
+            "-metadata:s:s:0", "language=chi",
+            "-metadata:s:s:0", "title=中文",
+            "-y",
+            str(out),
+        ]
+
+    def test_embed_subtitle_soft_delegates_command_planning_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.ass"
+        out = tmp_path / "nested" / "out.mp4"
+        video.write_bytes(b"00")
+        sub.write_text("dummy", encoding="utf-8")
+        delegated = []
+        calls = []
+
+        def fake_plan(**kwargs):
+            delegated.append(kwargs)
+            return ["ffmpeg", "planned", str(out)]
+
+        def fake_run(cmd, capture_output, text, check):
+            calls.append(cmd)
+            out.write_bytes(b"11")
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(wrapper, "_plan_soft_subtitle_command", fake_plan, raising=False)
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        result = wrapper.embed_subtitle_soft(video, sub, out)
+
+        assert result is True
+        assert delegated == [{
+            "video_path": video,
+            "subtitle_path": sub,
+            "output_path": out,
+            "subtitle_language": "chi",
+            "subtitle_title": "中文",
+        }]
+        assert calls == [["ffmpeg", "planned", str(out)]]
+
     def test_extract_audio_returns_false_when_input_missing(self, monkeypatch, tmp_path):
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
         wrapper = FFmpegWrapper()

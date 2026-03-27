@@ -193,20 +193,20 @@ class FFmpegWrapper:
     ) -> bool:
         """
         软字幕嵌入（作为独立字幕流，不重新编码视频）
-        
+
         优势：
         - 极快（几秒钟完成）
         - 文件大小几乎不变
         - 保持原始视频质量和编码格式
         - 用户可以选择开关字幕
-        
+
         Args:
             video_path: 输入视频路径
             subtitle_path: 字幕文件路径（支持SRT/ASS）
             output_path: 输出视频路径
             subtitle_language: 字幕语言代码（chi/zh/zho）
             subtitle_title: 字幕标题（显示在播放器中）
-            
+
         Returns:
             是否成功
         """
@@ -216,46 +216,18 @@ class FFmpegWrapper:
         if not subtitle_path.exists():
             print(f"错误: 字幕文件不存在: {subtitle_path}")
             return False
-        
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # 检查字幕格式
         subtitle_ext = subtitle_path.suffix.lower()
-        
-        # MKV容器支持更多字幕格式，MP4需要转换
         output_ext = output_path.suffix.lower()
-        
-        if output_ext == '.mkv':
-            # MKV支持原生ASS字幕
-            cmd = [
-                'ffmpeg',
-                '-i', str(video_path),
-                '-i', str(subtitle_path),
-                '-c:v', 'copy',  # 复制视频流（不重新编码）
-                '-c:a', 'copy',  # 复制音频流
-                '-c:s', 'copy' if subtitle_ext == '.ass' else 'srt',  # ASS可直接复制
-                '-metadata:s:s:0', f'language={subtitle_language}',
-                '-metadata:s:s:0', f'title={subtitle_title}',
-                '-disposition:s:0', 'default',  # 设为默认字幕
-                '-y',
-                str(output_path)
-            ]
-        else:
-            # MP4容器，字幕需要转换为mov_text格式
-            # 注意：MP4不支持ASS样式，会丢失样式信息
-            cmd = [
-                'ffmpeg',
-                '-i', str(video_path),
-                '-i', str(subtitle_path),
-                '-c:v', 'copy',  # 复制视频流
-                '-c:a', 'copy',  # 复制音频流
-                '-c:s', 'mov_text',  # MP4字幕格式
-                '-metadata:s:s:0', f'language={subtitle_language}',
-                '-metadata:s:s:0', f'title={subtitle_title}',
-                '-y',
-                str(output_path)
-            ]
-        
+        cmd = self._plan_soft_subtitle_command(
+            video_path=video_path,
+            subtitle_path=subtitle_path,
+            output_path=output_path,
+            subtitle_language=subtitle_language,
+            subtitle_title=subtitle_title,
+        )
+
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             if not output_path.exists():
@@ -268,7 +240,48 @@ class FFmpegWrapper:
             if output_ext == '.mp4' and subtitle_ext == '.ass':
                 print("提示: MP4容器不完全支持ASS字幕样式，建议使用MKV容器或硬字幕")
             return False
-    
+
+    def _plan_soft_subtitle_command(
+        self,
+        *,
+        video_path: Path,
+        subtitle_path: Path,
+        output_path: Path,
+        subtitle_language: str,
+        subtitle_title: str,
+    ) -> List[str]:
+        """规划软字幕嵌入所需 ffmpeg 命令。"""
+        subtitle_ext = subtitle_path.suffix.lower()
+        output_ext = output_path.suffix.lower()
+
+        if output_ext == '.mkv':
+            return [
+                'ffmpeg',
+                '-i', str(video_path),
+                '-i', str(subtitle_path),
+                '-c:v', 'copy',
+                '-c:a', 'copy',
+                '-c:s', 'copy' if subtitle_ext == '.ass' else 'srt',
+                '-metadata:s:s:0', f'language={subtitle_language}',
+                '-metadata:s:s:0', f'title={subtitle_title}',
+                '-disposition:s:0', 'default',
+                '-y',
+                str(output_path)
+            ]
+
+        return [
+            'ffmpeg',
+            '-i', str(video_path),
+            '-i', str(subtitle_path),
+            '-c:v', 'copy',
+            '-c:a', 'copy',
+            '-c:s', 'mov_text',
+            '-metadata:s:s:0', f'language={subtitle_language}',
+            '-metadata:s:s:0', f'title={subtitle_title}',
+            '-y',
+            str(output_path)
+        ]
+
     def _get_video_resolution(self, video_path: Path) -> tuple[int, int]:
         """获取视频分辨率"""
         result = subprocess.run(
