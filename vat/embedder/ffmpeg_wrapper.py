@@ -909,13 +909,7 @@ class FFmpegWrapper:
             crf=crf,
             preset=preset,
         )
-
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"视频转换失败: {e.stderr}")
-            return False
+        return self._run_convert_video_runtime_stage(cmd=cmd)
 
     def _plan_convert_video_command(
         self,
@@ -938,7 +932,20 @@ class FFmpegWrapper:
             '-y',
             str(output_path)
         ]
-    
+
+    def _run_convert_video_runtime_stage(
+        self,
+        *,
+        cmd: List[str],
+    ) -> bool:
+        """执行视频转换 runtime 阶段。"""
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"视频转换失败: {e.stderr}")
+            return False
+
     def extract_thumbnail(
         self,
         video_path: Path,

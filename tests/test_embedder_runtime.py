@@ -175,6 +175,62 @@ class TestFFmpegWrapperConvertVideoContracts:
         captured = capsys.readouterr()
         assert "视频转换失败: failed" in captured.out
 
+    def test_run_convert_video_runtime_stage_returns_true_when_ffmpeg_succeeds(self, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        calls = []
+
+        def fake_run(cmd, capture_output, text, check):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        result = wrapper._run_convert_video_runtime_stage(cmd=["ffmpeg", "planned", "out.mp4"])
+
+        assert result is True
+        assert calls == [["ffmpeg", "planned", "out.mp4"]]
+
+    def test_run_convert_video_runtime_stage_returns_false_and_reports_stderr_on_failure(self, monkeypatch, capsys):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+
+        def fake_run(cmd, capture_output, text, check):
+            raise subprocess.CalledProcessError(returncode=1, cmd=cmd, stderr="failed")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        result = wrapper._run_convert_video_runtime_stage(cmd=["ffmpeg", "planned", "out.mp4"])
+
+        assert result is False
+        captured = capsys.readouterr()
+        assert "视频转换失败: failed" in captured.out
+
+    def test_convert_video_delegates_runtime_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        src = tmp_path / "input.mov"
+        out = tmp_path / "nested" / "output.mp4"
+        delegated = []
+
+        monkeypatch.setattr(wrapper, "_plan_convert_video_command", lambda **kwargs: ["ffmpeg", "planned", str(out)], raising=False)
+        monkeypatch.setattr(
+            wrapper,
+            "_run_convert_video_runtime_stage",
+            lambda **kwargs: delegated.append(kwargs) or True,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda cmd, capture_output, text, check: SimpleNamespace(returncode=0),
+        )
+
+        result = wrapper.convert_video(src, out)
+
+        assert result is True
+        assert out.parent.exists()
+        assert delegated == [{"cmd": ["ffmpeg", "planned", str(out)]}]
+
 
 class TestFFmpegWrapperSoftEmbedContracts:
     def test_embed_subtitle_soft_returns_false_when_video_missing(self, monkeypatch, tmp_path):
