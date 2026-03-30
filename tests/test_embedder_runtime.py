@@ -397,6 +397,94 @@ class TestFFmpegWrapperSoftEmbedContracts:
 
         assert result is False
 
+    def test_prepare_soft_subtitle_preflight_returns_false_when_video_missing(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        subtitle = tmp_path / "sub.srt"
+        subtitle.write_text("dummy", encoding="utf-8")
+
+        result = wrapper._prepare_soft_subtitle_preflight(
+            video_path=tmp_path / "missing.mp4",
+            subtitle_path=subtitle,
+            output_path=tmp_path / "nested" / "out.mkv",
+        )
+
+        assert result is False
+        captured = capsys.readouterr()
+        assert f"错误: 输入视频文件不存在: {tmp_path / 'missing.mp4'}" in captured.out
+
+    def test_prepare_soft_subtitle_preflight_returns_false_when_subtitle_missing(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        video.write_bytes(b"00")
+
+        result = wrapper._prepare_soft_subtitle_preflight(
+            video_path=video,
+            subtitle_path=tmp_path / "missing.srt",
+            output_path=tmp_path / "nested" / "out.mkv",
+        )
+
+        assert result is False
+        captured = capsys.readouterr()
+        assert f"错误: 字幕文件不存在: {tmp_path / 'missing.srt'}" in captured.out
+
+    def test_prepare_soft_subtitle_preflight_creates_output_directory_and_returns_true(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        subtitle = tmp_path / "sub.srt"
+        output_path = tmp_path / "nested" / "out.mkv"
+        video.write_bytes(b"00")
+        subtitle.write_text("dummy", encoding="utf-8")
+
+        result = wrapper._prepare_soft_subtitle_preflight(
+            video_path=video,
+            subtitle_path=subtitle,
+            output_path=output_path,
+        )
+
+        assert result is True
+        assert output_path.parent.is_dir()
+
+    def test_embed_subtitle_soft_delegates_preflight_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        sub = tmp_path / "sub.ass"
+        out = tmp_path / "nested" / "out.mp4"
+        video.write_bytes(b"00")
+        sub.write_text("dummy", encoding="utf-8")
+        delegated = []
+
+        monkeypatch.setattr(
+            wrapper,
+            "_prepare_soft_subtitle_preflight",
+            lambda **kwargs: delegated.append(kwargs) or False,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_plan_soft_subtitle_command",
+            lambda **kwargs: pytest.fail("unexpected command planning"),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            wrapper,
+            "_run_soft_subtitle_runtime_stage",
+            lambda **kwargs: pytest.fail("unexpected runtime stage"),
+            raising=False,
+        )
+
+        result = wrapper.embed_subtitle_soft(video, sub, out)
+
+        assert result is False
+        assert delegated == [{
+            "video_path": video,
+            "subtitle_path": sub,
+            "output_path": out,
+        }]
+
     def test_embed_subtitle_soft_mp4_uses_mov_text_and_succeeds(self, monkeypatch, tmp_path):
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
         wrapper = FFmpegWrapper()

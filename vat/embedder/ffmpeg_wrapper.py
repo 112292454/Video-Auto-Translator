@@ -210,14 +210,13 @@ class FFmpegWrapper:
         Returns:
             是否成功
         """
-        if not video_path.exists():
-            print(f"错误: 输入视频文件不存在: {video_path}")
-            return False
-        if not subtitle_path.exists():
-            print(f"错误: 字幕文件不存在: {subtitle_path}")
+        if not self._prepare_soft_subtitle_preflight(
+            video_path=video_path,
+            subtitle_path=subtitle_path,
+            output_path=output_path,
+        ):
             return False
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
         cmd = self._plan_soft_subtitle_command(
             video_path=video_path,
             subtitle_path=subtitle_path,
@@ -230,6 +229,24 @@ class FFmpegWrapper:
             subtitle_path=subtitle_path,
             output_path=output_path,
         )
+
+    def _prepare_soft_subtitle_preflight(
+        self,
+        *,
+        video_path: Path,
+        subtitle_path: Path,
+        output_path: Path,
+    ) -> bool:
+        """执行软字幕嵌入 preflight 阶段。"""
+        if not video_path.exists():
+            print(f"错误: 输入视频文件不存在: {video_path}")
+            return False
+        if not subtitle_path.exists():
+            print(f"错误: 字幕文件不存在: {subtitle_path}")
+            return False
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        return True
 
     def _plan_soft_subtitle_command(
         self,
