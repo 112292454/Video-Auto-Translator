@@ -969,13 +969,7 @@ class FFmpegWrapper:
             output_path=output_path,
             time_position=time_position,
         )
-
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"缩略图提取失败: {e.stderr}")
-            return False
+        return self._run_extract_thumbnail_runtime_stage(cmd=cmd)
 
     def _plan_extract_thumbnail_command(
         self,
@@ -994,6 +988,19 @@ class FFmpegWrapper:
             '-y',
             str(output_path)
         ]
+
+    def _run_extract_thumbnail_runtime_stage(
+        self,
+        *,
+        cmd: List[str],
+    ) -> bool:
+        """执行提取缩略图 runtime 阶段。"""
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"缩略图提取失败: {e.stderr}")
+            return False
 
     @staticmethod
     def _find_cjk_font() -> Optional[str]:
