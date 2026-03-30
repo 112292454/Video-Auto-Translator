@@ -888,7 +888,7 @@ class FFmpegWrapper:
     ) -> bool:
         """
         转换视频格式
-        
+
         Args:
             input_path: 输入视频路径
             output_path: 输出视频路径
@@ -896,13 +896,39 @@ class FFmpegWrapper:
             audio_codec: 音频编码器
             crf: 视频质量
             preset: 编码预设
-            
+
         Returns:
             是否成功
         """
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        cmd = [
+        cmd = self._plan_convert_video_command(
+            input_path=input_path,
+            output_path=output_path,
+            video_codec=video_codec,
+            audio_codec=audio_codec,
+            crf=crf,
+            preset=preset,
+        )
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"视频转换失败: {e.stderr}")
+            return False
+
+    def _plan_convert_video_command(
+        self,
+        *,
+        input_path: Path,
+        output_path: Path,
+        video_codec: str,
+        audio_codec: str,
+        crf: int,
+        preset: str,
+    ) -> List[str]:
+        """规划视频转换所需 ffmpeg 命令。"""
+        return [
             'ffmpeg',
             '-i', str(input_path),
             '-c:v', video_codec,
@@ -912,13 +938,6 @@ class FFmpegWrapper:
             '-y',
             str(output_path)
         ]
-        
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"视频转换失败: {e.stderr}")
-            return False
     
     def extract_thumbnail(
         self,

@@ -73,6 +73,109 @@ class TestFFmpegWrapperHelpers:
         assert ",36,36,30," in scaled  # MarginL/R 至少 5% 宽度，MarginV 翻倍
 
 
+class TestFFmpegWrapperConvertVideoContracts:
+    def test_plan_convert_video_command_builds_expected_ffmpeg_args(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        src = tmp_path / "input.mov"
+        out = tmp_path / "nested" / "output.mp4"
+
+        cmd = wrapper._plan_convert_video_command(
+            input_path=src,
+            output_path=out,
+            video_codec="libx265",
+            audio_codec="copy",
+            crf=19,
+            preset="slow",
+        )
+
+        assert cmd == [
+            "ffmpeg",
+            "-i", str(src),
+            "-c:v", "libx265",
+            "-crf", "19",
+            "-preset", "slow",
+            "-c:a", "copy",
+            "-y",
+            str(out),
+        ]
+
+    def test_convert_video_delegates_command_planning_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        src = tmp_path / "input.mov"
+        out = tmp_path / "nested" / "output.mp4"
+        planned = []
+        calls = []
+
+        def fake_plan(**kwargs):
+            planned.append(kwargs)
+            return ["ffmpeg", "planned", str(out)]
+
+        def fake_run(cmd, capture_output, text, check):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(wrapper, "_plan_convert_video_command", fake_plan, raising=False)
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        result = wrapper.convert_video(
+            src,
+            out,
+            video_codec="libx265",
+            audio_codec="copy",
+            crf=19,
+            preset="slow",
+        )
+
+        assert result is True
+        assert planned == [{
+            "input_path": src,
+            "output_path": out,
+            "video_codec": "libx265",
+            "audio_codec": "copy",
+            "crf": 19,
+            "preset": "slow",
+        }]
+        assert calls == [["ffmpeg", "planned", str(out)]]
+
+    def test_convert_video_returns_true_when_ffmpeg_succeeds(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        src = tmp_path / "input.mov"
+        out = tmp_path / "nested" / "output.mp4"
+        calls = []
+
+        def fake_run(cmd, capture_output, text, check):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        result = wrapper.convert_video(src, out)
+
+        assert result is True
+        assert out.parent.exists()
+        assert calls[0][0] == "ffmpeg"
+
+    def test_convert_video_returns_false_and_reports_stderr_on_ffmpeg_failure(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        src = tmp_path / "input.mov"
+        out = tmp_path / "nested" / "output.mp4"
+
+        def fake_run(cmd, capture_output, text, check):
+            raise subprocess.CalledProcessError(returncode=1, cmd=cmd, stderr="failed")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        result = wrapper.convert_video(src, out)
+
+        assert result is False
+        captured = capsys.readouterr()
+        assert "视频转换失败: failed" in captured.out
+
+
 class TestFFmpegWrapperSoftEmbedContracts:
     def test_embed_subtitle_soft_returns_false_when_video_missing(self, monkeypatch, tmp_path):
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
