@@ -954,18 +954,38 @@ class FFmpegWrapper:
     ) -> bool:
         """
         提取视频缩略图
-        
+
         Args:
             video_path: 视频文件路径
             output_path: 输出图片路径
             time_position: 时间位置 (HH:MM:SS)
-            
+
         Returns:
             是否成功
         """
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        cmd = [
+        cmd = self._plan_extract_thumbnail_command(
+            video_path=video_path,
+            output_path=output_path,
+            time_position=time_position,
+        )
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"缩略图提取失败: {e.stderr}")
+            return False
+
+    def _plan_extract_thumbnail_command(
+        self,
+        *,
+        video_path: Path,
+        output_path: Path,
+        time_position: str,
+    ) -> List[str]:
+        """规划提取缩略图所需 ffmpeg 命令。"""
+        return [
             'ffmpeg',
             '-ss', time_position,
             '-i', str(video_path),
@@ -974,13 +994,6 @@ class FFmpegWrapper:
             '-y',
             str(output_path)
         ]
-        
-        try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"缩略图提取失败: {e.stderr}")
-            return False
 
     @staticmethod
     def _find_cjk_font() -> Optional[str]:

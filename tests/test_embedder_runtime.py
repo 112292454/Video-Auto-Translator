@@ -232,6 +232,96 @@ class TestFFmpegWrapperConvertVideoContracts:
         assert delegated == [{"cmd": ["ffmpeg", "planned", str(out)]}]
 
 
+class TestFFmpegWrapperExtractThumbnailContracts:
+    def test_plan_extract_thumbnail_command_builds_expected_ffmpeg_args(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "input.mov"
+        out = tmp_path / "nested" / "thumb.jpg"
+
+        cmd = wrapper._plan_extract_thumbnail_command(
+            video_path=video,
+            output_path=out,
+            time_position="00:00:09",
+        )
+
+        assert cmd == [
+            "ffmpeg",
+            "-ss", "00:00:09",
+            "-i", str(video),
+            "-vframes", "1",
+            "-q:v", "2",
+            "-y",
+            str(out),
+        ]
+
+    def test_extract_thumbnail_delegates_command_planning_stage(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "input.mov"
+        out = tmp_path / "nested" / "thumb.jpg"
+        planned = []
+        calls = []
+
+        def fake_plan(**kwargs):
+            planned.append(kwargs)
+            return ["ffmpeg", "planned", str(out)]
+
+        def fake_run(cmd, capture_output, text, check):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(wrapper, "_plan_extract_thumbnail_command", fake_plan, raising=False)
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        result = wrapper.extract_thumbnail(video, out, time_position="00:00:09")
+
+        assert result is True
+        assert out.parent.exists()
+        assert planned == [{
+            "video_path": video,
+            "output_path": out,
+            "time_position": "00:00:09",
+        }]
+        assert calls == [["ffmpeg", "planned", str(out)]]
+
+    def test_extract_thumbnail_returns_true_when_ffmpeg_succeeds(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "input.mov"
+        out = tmp_path / "nested" / "thumb.jpg"
+        calls = []
+
+        def fake_run(cmd, capture_output, text, check):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        result = wrapper.extract_thumbnail(video, out)
+
+        assert result is True
+        assert out.parent.exists()
+        assert calls[0][0] == "ffmpeg"
+
+    def test_extract_thumbnail_returns_false_and_reports_stderr_on_ffmpeg_failure(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "input.mov"
+        out = tmp_path / "nested" / "thumb.jpg"
+
+        def fake_run(cmd, capture_output, text, check):
+            raise subprocess.CalledProcessError(returncode=1, cmd=cmd, stderr="failed")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+
+        result = wrapper.extract_thumbnail(video, out)
+
+        assert result is False
+        captured = capsys.readouterr()
+        assert "缩略图提取失败: failed" in captured.out
+
+
 class TestFFmpegWrapperSoftEmbedContracts:
     def test_embed_subtitle_soft_returns_false_when_video_missing(self, monkeypatch, tmp_path):
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
