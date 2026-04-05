@@ -1,13 +1,16 @@
 """
 视频管理 API
 """
+from pathlib import Path
 from typing import Optional, List
+from urllib.parse import urlparse, unquote
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 
 from vat.database import Database
 from vat.models import Video, SourceType
-from vat.web.deps import get_db
+from vat.services import PlaylistService
+from vat.web.deps import get_db, get_web_config
 
 router = APIRouter(prefix="/api/videos", tags=["videos"])
 
@@ -37,9 +40,118 @@ class VideoListResponse(BaseModel):
 
 class AddVideoRequest(BaseModel):
     """添加视频请求"""
-    url: str                          # 视频源（URL 或本地路径）
-    source_type: str = "auto"         # auto = 自动检测
-    title: Optional[str] = None       # 可选手动标题
+    url: Optional[str] = None                 # 兼容旧接口：单个视频源
+    sources: Optional[List[str]] = None       # 新接口：多个视频源
+    source_type: str = "auto"                 # auto = 自动检测
+    title: Optional[str] = None               # 可选手动标题（仅单条添加）
+    playlist_mode: str = "none"               # none / default / specified
+    playlist_id: Optional[str] = None         # 指定加入的 playlist
+    fetch_info: bool = True                   # 自动尝试抓取平台信息
+
+
+def detect_source_type(source: str) -> SourceType:
+    """可 monkeypatch 的 source_type 识别包装。"""
+    from vat.pipeline import detect_source_type as impl
+    return impl(source)
+
+
+def create_video_from_source(source: str, db: Database, source_type: SourceType, title: str = "") -> str:
+    """可 monkeypatch 的创建视频包装。"""
+    from vat.pipeline import create_video_from_source as impl
+    return impl(source, db, source_type, title=title)
+
+
+def resolve_video_identity_from_source(source: str, source_type: SourceType) -> tuple[str, str]:
+    """可 monkeypatch 的 source 标准化包装。"""
+    from vat.pipeline import resolve_video_identity_from_source as impl
+    return impl(source, source_type)
+
+
+def get_playlist_service(db: Database = Depends(get_db)) -> PlaylistService:
+    config = get_web_config()
+    return PlaylistService(db, config)
+
+
+def _normalize_request_sources(request: AddVideoRequest) -> List[str]:
+    """统一解析单条/多条 source 请求。"""
+    raw_sources = list(request.sources or [])
+    if request.url:
+        raw_sources.append(request.url)
+    sources = [source.strip() for source in raw_sources if source and source.strip()]
+    if not sources:
+        raise HTTPException(400, "至少提供一个视频源")
+    return sources
+
+
+def _infer_initial_title(source: str, source_type: SourceType) -> str:
+    """在无平台元信息前，尽量给本地/直链视频一个可读标题。"""
+    if source_type == SourceType.LOCAL:
+        return Path(source).stem
+    if source_type == SourceType.DIRECT_URL:
+        path = unquote(urlparse(source).path or "")
+        stem = Path(path).stem
+        return stem or ""
+    return ""
+
+
+def _resolve_target_playlist_id(
+    request: AddVideoRequest,
+    service: PlaylistService,
+) -> Optional[str]:
+    """解析视频添加时的 playlist 归属。"""
+    playlist_mode = request.playlist_mode or "none"
+    if playlist_mode == "none":
+        return None
+    if playlist_mode == "default":
+        return service.ensure_default_manual_playlist().id
+    if playlist_mode == "specified":
+        if not request.playlist_id:
+            raise HTTPException(400, "选择指定 playlist 时必须提供 playlist_id")
+        playlist = service.get_playlist(request.playlist_id)
+        if not playlist:
+            raise HTTPException(404, "Playlist not found")
+        return playlist.id
+    raise HTTPException(400, f"无效的 playlist_mode: {playlist_mode}")
+
+
+def _preflight_add_sources(
+    sources: List[str],
+    request: AddVideoRequest,
+    db: Database,
+) -> List[dict]:
+    """批量添加前先解析并校验所有 source，避免部分成功。"""
+    plans = []
+    seen_video_ids = set()
+
+    for source in sources:
+        try:
+            if request.source_type == "auto":
+                source_type = detect_source_type(source)
+            else:
+                source_type = SourceType(request.source_type)
+        except ValueError as e:
+            raise HTTPException(400, f"无效的 source_type 或无法识别的视频源: {e}")
+
+        normalized_source, resolved_video_id = resolve_video_identity_from_source(source, source_type)
+        existing_video = db.get_video(resolved_video_id)
+        if existing_video is not None:
+            raise HTTPException(
+                409,
+                f"视频已存在: {existing_video.id}。如需加入其他 List，请在目标 List 页面使用“添加已有视频”。",
+            )
+        if resolved_video_id in seen_video_ids:
+            raise HTTPException(409, f"批量请求中包含重复视频: {resolved_video_id}")
+
+        initial_title = request.title if request.title else _infer_initial_title(normalized_source, source_type)
+        plans.append({
+            "source": normalized_source,
+            "source_type": source_type,
+            "video_id": resolved_video_id,
+            "initial_title": initial_title,
+        })
+        seen_video_ids.add(resolved_video_id)
+
+    return plans
 
 
 
@@ -147,25 +259,77 @@ async def get_video(video_id: str, db: Database = Depends(get_db)):
 
 
 @router.post("")
-async def add_video(request: AddVideoRequest, db: Database = Depends(get_db)):
-    """添加视频（URL/本地路径，支持自动检测源类型）"""
-    from vat.pipeline import create_video_from_source, detect_source_type
-    
+async def add_video(
+    request: AddVideoRequest,
+    db: Database = Depends(get_db),
+    service: PlaylistService = Depends(get_playlist_service),
+):
+    """添加一个或多个视频，并可选择归属 playlist。"""
+    sources = _normalize_request_sources(request)
+    if len(sources) > 1 and request.title:
+        raise HTTPException(400, "批量添加时不能指定统一标题，请留空后使用自动标题")
+
+    target_playlist_id = _resolve_target_playlist_id(request, service)
+    plans = _preflight_add_sources(sources, request, db)
+    items = []
+    created_video_ids = []
+
     try:
-        if request.source_type == "auto":
-            source_type = detect_source_type(request.url)
-        else:
-            source_type = SourceType(request.source_type)
-    except ValueError as e:
-        raise HTTPException(400, f"无效的 source_type 或无法识别的视频源: {e}")
-    
-    try:
-        video_id = create_video_from_source(
-            request.url, db, source_type, title=request.title or ""
-        )
-        return {"video_id": video_id, "source_type": source_type.value, "status": "created"}
+        for plan in plans:
+            video_id = create_video_from_source(
+                plan["source"],
+                db,
+                plan["source_type"],
+                title=(plan["initial_title"] or ""),
+            )
+            created_video_ids.append(video_id)
+
+            if target_playlist_id:
+                service.attach_video_to_playlist(video_id, target_playlist_id)
+
+            fetch_status = None
+            fetch_message = None
+            if request.fetch_info and plan["source_type"] == SourceType.YOUTUBE:
+                try:
+                    fetch_result = service.fetch_video_source_info(
+                        video_id,
+                        force=False,
+                        submit_translate=True,
+                    )
+                    fetch_status = fetch_result.get("status")
+                    fetch_message = fetch_result.get("message")
+                except Exception as e:
+                    fetch_status = "error"
+                    fetch_message = str(e)
+
+            items.append({
+                "video_id": video_id,
+                "source_type": plan["source_type"].value,
+                "created": True,
+                "fetch_status": fetch_status,
+                "fetch_message": fetch_message,
+            })
+    except HTTPException:
+        for video_id in reversed(created_video_ids):
+            if db.get_video(video_id):
+                db.delete_video(video_id)
+        raise
     except Exception as e:
+        for video_id in reversed(created_video_ids):
+            if db.get_video(video_id):
+                db.delete_video(video_id)
         raise HTTPException(400, str(e))
+
+    response = {
+        "status": "created",
+        "count": len(items),
+        "playlist_id": target_playlist_id,
+        "items": items,
+    }
+    if len(items) == 1:
+        response["video_id"] = items[0]["video_id"]
+        response["source_type"] = items[0]["source_type"]
+    return response
 
 
 
@@ -255,6 +419,23 @@ async def retranslate_video_info(video_id: str, db: Database = Depends(get_db)):
     service._submit_translate_task(video_id, video_info, force=True)
     
     return {"status": "submitted", "video_id": video_id, "message": "翻译任务已提交，刷新页面查看结果"}
+
+
+@router.post("/{video_id}/fetch-source-info")
+async def fetch_source_info(
+    video_id: str,
+    db: Database = Depends(get_db),
+    service: PlaylistService = Depends(get_playlist_service),
+):
+    """尝试从源平台重新抓取视频信息。"""
+    video = db.get_video(video_id)
+    if not video:
+        raise HTTPException(404, "Video not found")
+
+    try:
+        return service.fetch_video_source_info(video_id, force=True, submit_translate=True)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @router.get("/{video_id}/files")

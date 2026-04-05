@@ -3,6 +3,7 @@
 {% block title %}{{ playlist.title }} - VAT Manager{% endblock %}
 
 {% block content %}
+{% set is_manual_playlist = playlist.metadata.list_kind == 'manual' %}
 <div class="space-y-6">
     <a href="/playlists" class="text-blue-600 hover:text-blue-800">&larr; 返回 Playlist 列表</a>
     
@@ -10,14 +11,29 @@
     <div class="bg-white rounded-lg shadow p-6">
         <div class="flex justify-between items-start mb-4">
             <div>
-                <h1 class="text-2xl font-bold text-gray-800">{{ playlist.title or playlist.id }}</h1>
+                <div class="flex items-center gap-2">
+                    <h1 class="text-2xl font-bold text-gray-800">{{ playlist.title or playlist.id }}</h1>
+                    {% if is_manual_playlist %}
+                    <span class="px-2 py-0.5 rounded-full text-xs bg-amber-100 text-amber-800">
+                        {{ '默认列表' if playlist.metadata.is_default_manual_list else '手动列表' }}
+                    </span>
+                    {% endif %}
+                </div>
                 <p class="text-gray-600">{{ playlist.channel or '-' }}</p>
                 <div class="mt-1 text-sm text-gray-500 space-y-0.5">
+                    {% if is_manual_playlist %}
+                    <p>来源: 手动维护</p>
+                    {% if playlist.metadata.description %}
+                    <p>说明: {{ playlist.metadata.description }}</p>
+                    {% endif %}
+                    {% else %}
                     <p>来源: <a href="{{ playlist.source_url }}" target="_blank" class="text-blue-500 hover:underline">{{ playlist.source_url }}</a></p>
                     <p>上次同步: {{ playlist.last_synced_at|format_datetime if playlist.last_synced_at else '从未同步' }}</p>
+                    {% endif %}
                 </div>
             </div>
             <div class="flex space-x-2">
+                {% if not is_manual_playlist %}
                 <button onclick="syncPlaylist()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
                     同步
                 </button>
@@ -45,6 +61,7 @@
                         </button>
                     </div>
                 </div>
+                {% endif %}
                 <button onclick="retranslateAll()" class="px-4 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700" title="重新翻译所有视频的标题/简介">
                     重新翻译
                 </button>
@@ -186,6 +203,10 @@
         <div class="px-6 py-4 border-b flex justify-between items-center">
             <h2 class="text-lg font-semibold">视频列表</h2>
             <div class="flex items-center space-x-2">
+                <button onclick="showAddExistingVideoDialog()"
+                        class="px-3 py-1.5 bg-blue-600 text-white text-sm rounded hover:bg-blue-700">
+                    添加已有视频
+                </button>
                 <span x-show="selectedVideos.length > 0" class="text-sm text-gray-600">
                     已选择 <span x-text="selectedVideos.length"></span> 个视频
                 </span>
@@ -197,19 +218,55 @@
                         class="px-3 py-1.5 bg-yellow-500 text-white text-sm rounded hover:bg-yellow-600">
                     强制重做
                 </button>
+                <div x-show="selectedVideos.length > 0" class="relative" x-data="{ open: false }">
+                    <button @click="open = !open"
+                            class="px-3 py-1.5 border border-gray-300 text-gray-600 text-sm rounded hover:bg-gray-50"
+                            title="更多选中视频操作">
+                        ⋯
+                    </button>
+                    <div x-show="open" @click.away="open = false" x-transition
+                         class="absolute right-0 mt-2 w-40 bg-white border rounded-lg shadow-lg z-20 py-1">
+                        <button type="button" @click="open = false; runInfoAction('fetch-source-info', $event)"
+                                class="block w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50">
+                            补全信息
+                        </button>
+                        <button type="button" @click="open = false; runInfoAction('retranslate-info', $event)"
+                                class="block w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50">
+                            重翻信息
+                        </button>
+                    </div>
+                </div>
             </div>
         </div>
         <table class="min-w-full divide-y divide-gray-200" id="pl-video-table">
+            {% set base_sort_params %}{% if hide_processing %}&hide_processing=1{% endif %}&per_page={{ per_page }}{% endset %}
+            {% macro pl_sort_th(label, col, extra_class='') %}
+                {% if sort_by == col %}
+                    {% set next_order = 'asc' if sort_order == 'desc' else 'desc' %}
+                    {% set arrow = '▲' if sort_order == 'asc' else '▼' %}
+                    <th class="px-6 py-3 text-left text-xs font-medium uppercase {{ extra_class }}">
+                        <a href="?sort={{ col }}&order={{ next_order }}{{ base_sort_params }}" class="text-blue-600 hover:text-blue-800 select-none">
+                            {{ label }} {{ arrow }}
+                        </a>
+                    </th>
+                {% else %}
+                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase {{ extra_class }}">
+                        <a href="?sort={{ col }}&order=asc{{ base_sort_params }}" class="hover:text-gray-800 select-none">
+                            {{ label }}
+                        </a>
+                    </th>
+                {% endif %}
+            {% endmacro %}
             <thead class="bg-gray-50">
                 <tr>
                     <th class="px-4 py-3 text-left">
                         <input type="checkbox" @change="toggleAll($event.target.checked)" 
                                class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
                     </th>
-                    <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase" data-sort="1" data-sort-type="number">#</th>
-                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase" data-sort="2" data-sort-type="text">标题</th>
-                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase" data-sort="3" data-sort-type="date">发布日期</th>
-                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase" data-sort="4" data-sort-type="number">时长</th>
+                    {{ pl_sort_th('#', 'playlist_index', 'px-4') }}
+                    {{ pl_sort_th('标题', 'title') }}
+                    {{ pl_sort_th('发布日期', 'upload_date') }}
+                    {{ pl_sort_th('时长', 'duration') }}
                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">状态</th>
                     <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">操作</th>
                 </tr>
@@ -221,6 +278,8 @@
                     <td class="px-4 py-4">
                         <input type="checkbox" :checked="selectedVideos.includes('{{ video.id }}')"
                                @change="toggleVideo('{{ video.id }}')"
+                               data-video-id="{{ video.id }}"
+                               data-source-type="{{ video.source_type }}"
                                class="rounded border-gray-300 text-blue-600 focus:ring-blue-500">
                     </td>
                     <td class="px-4 py-4 text-sm text-gray-500" data-sort-value="{{ video.global_index }}">{{ video.global_index }}</td>
@@ -272,13 +331,22 @@
                         {% endif %}
                     </td>
                     <td class="px-6 py-4 text-sm">
-                        <a href="/video/{{ video.id }}?from_playlist={{ playlist.id }}" class="text-blue-600 hover:text-blue-800">查看</a>
+                        <div class="flex items-center gap-3">
+                            <a href="/video/{{ video.id }}?from_playlist={{ playlist.id }}" class="text-blue-600 hover:text-blue-800">查看</a>
+                            <button type="button"
+                                    data-video-id="{{ video.id }}"
+                                    data-video-title="{{ video.title or video.id }}"
+                                    onclick="removeVideoFromPlaylist(this.dataset.videoId, this.dataset.videoTitle)"
+                                    class="text-red-600 hover:text-red-800">
+                                移出
+                            </button>
+                        </div>
                     </td>
                 </tr>
                 {% else %}
                 <tr>
-                    <td colspan="6" class="px-6 py-8 text-center text-gray-500">
-                        没有视频，请先同步 Playlist
+                    <td colspan="7" class="px-6 py-8 text-center text-gray-500">
+                        {% if is_manual_playlist %}没有视频，请从已有视频中手动添加{% else %}没有视频，请先同步 Playlist 或手动添加已有视频{% endif %}
                     </td>
                 </tr>
                 {% endfor %}
@@ -296,7 +364,7 @@
                 <span>共 {{ total }} 个视频</span>
                 <span class="text-gray-300">|</span>
                 <span>每页</span>
-                <select onchange="location.href='?per_page='+this.value+'{% if hide_processing %}&hide_processing=1{% endif %}'" class="border rounded px-1 py-0.5 text-sm">
+                <select onchange="location.href='?per_page='+this.value+'&sort={{ sort_by }}&order={{ sort_order }}{% if hide_processing %}&hide_processing=1{% endif %}'" class="border rounded px-1 py-0.5 text-sm">
                     {% for n in [50, 100, 200, 500] %}
                     <option value="{{ n }}" {% if per_page == n %}selected{% endif %}>{{ n }}</option>
                     {% endfor %}
@@ -306,21 +374,44 @@
             {% if total_pages > 1 %}
             <div class="flex items-center space-x-2">
                 {% if current_page > 1 %}
-                <a href="?page={{ current_page - 1 }}&per_page={{ per_page }}{% if hide_processing %}&hide_processing=1{% endif %}" 
+                <a href="?page={{ current_page - 1 }}&per_page={{ per_page }}&sort={{ sort_by }}&order={{ sort_order }}{% if hide_processing %}&hide_processing=1{% endif %}" 
                    class="px-3 py-1 bg-gray-200 rounded hover:bg-gray-300 text-sm">上一页</a>
                 {% endif %}
                 <span class="px-3 py-1 text-sm">
                     <input type="number" value="{{ current_page }}" min="1" max="{{ total_pages }}"
                            class="w-16 border rounded px-2 py-1 text-center text-sm"
-                           onchange="location.href='?page='+this.value+'&per_page={{ per_page }}{% if hide_processing %}&hide_processing=1{% endif %}'">
+                           onchange="location.href='?page='+this.value+'&per_page={{ per_page }}&sort={{ sort_by }}&order={{ sort_order }}{% if hide_processing %}&hide_processing=1{% endif %}'">
                     / {{ total_pages }}
                 </span>
                 {% if current_page < total_pages %}
-                <a href="?page={{ current_page + 1 }}&per_page={{ per_page }}{% if hide_processing %}&hide_processing=1{% endif %}" 
+                <a href="?page={{ current_page + 1 }}&per_page={{ per_page }}&sort={{ sort_by }}&order={{ sort_order }}{% if hide_processing %}&hide_processing=1{% endif %}" 
                    class="px-3 py-1 bg-gray-200 rounded hover:bg-gray-300 text-sm">下一页</a>
                 {% endif %}
             </div>
             {% endif %}
+        </div>
+    </div>
+</div>
+
+<!-- 添加已有视频对话框 -->
+<div id="add-existing-video-dialog" class="fixed inset-0 bg-black bg-opacity-50 hidden z-50 flex items-center justify-center">
+    <div class="bg-white rounded-lg shadow-xl w-full max-w-2xl m-4">
+        <div class="flex justify-between items-center px-6 py-4 border-b">
+            <h3 class="text-lg font-semibold">添加已有视频到当前 List</h3>
+            <button onclick="closeAddExistingVideoDialog()" class="text-gray-500 hover:text-gray-700 text-2xl">&times;</button>
+        </div>
+        <div class="p-6 space-y-4">
+            <div class="flex items-center gap-2">
+                <input type="text" id="attach-video-search" placeholder="搜索标题 / 视频 ID / source_url"
+                       class="flex-1 border rounded px-3 py-2"
+                       onkeypress="if (event.key === 'Enter') loadAttachableVideos()">
+                <button onclick="loadAttachableVideos()" class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">
+                    搜索
+                </button>
+            </div>
+            <div id="attach-video-results" class="border rounded-lg divide-y max-h-96 overflow-y-auto">
+                <div class="px-4 py-6 text-sm text-gray-500 text-center">输入关键词后搜索可添加的视频</div>
+            </div>
         </div>
     </div>
 </div>
@@ -395,10 +486,11 @@ function filterPlVideos(status) {
     filterTableRows(table, row => !status || row.dataset.filterStatus === status);
 }
 
-// 初始化表格排序
-document.addEventListener('DOMContentLoaded', () => {
-    initSortableTable(document.getElementById('pl-video-table'));
-});
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text ?? '';
+    return div.innerHTML;
+}
 
 // Alpine.js 组件：Playlist 批量管理
 function playlistManager() {
@@ -459,6 +551,78 @@ function playlistManager() {
             form.appendChild(plInput);
             document.body.appendChild(form);
             form.submit();
+        },
+
+        async runInfoAction(action, event) {
+            if (this.selectedVideos.length === 0) {
+                showToast('请先选择视频', 'warning');
+                return;
+            }
+            const selectedTargets = Array.from(document.querySelectorAll('#pl-video-table tbody input[type="checkbox"]:checked')).map(cb => ({
+                id: cb.dataset.videoId || '',
+                sourceType: cb.dataset.sourceType || '',
+            }));
+            const targetIds = action === 'fetch-source-info'
+                ? selectedTargets.filter(item => item.sourceType === 'youtube').map(item => item.id)
+                : [...this.selectedVideos];
+            const skipped = selectedTargets.length - targetIds.length;
+            if (targetIds.length === 0) {
+                showToast('选中的视频里没有可补全源信息的 YouTube 视频', 'warning');
+                return;
+            }
+
+            const isFetch = action === 'fetch-source-info';
+            const confirmMessage = isFetch
+                ? `确定要为选中的 ${targetIds.length} 个视频补全源信息吗？\n\n只会尝试补抓信息，不会创建新任务类型。`
+                : `确定要为选中的 ${targetIds.length} 个视频重新翻译视频信息吗？\n\n这会重新提交标题/简介翻译请求。`;
+            if (!confirm(confirmMessage)) return;
+
+            const button = event?.currentTarget;
+            const originalText = button?.textContent || '';
+            if (button) button.disabled = true;
+
+            const results = await runConcurrentBatch(
+                targetIds,
+                async (videoId) => {
+                    const response = await fetch(`/api/videos/${encodeURIComponent(videoId)}/${action}`, {method: 'POST'});
+                    let data = {};
+                    try {
+                        data = await response.json();
+                    } catch (_err) {
+                        data = {};
+                    }
+                    const ok = response.ok && (isFetch ? data.status === 'ok' : data.status === 'submitted');
+                    return {ok, data};
+                },
+                {
+                    concurrency: 2,
+                    onProgress: ({completed, total}) => {
+                        if (button) {
+                            button.textContent = (isFetch ? '补全中 ' : '提交中 ') + `${completed}/${total}`;
+                        }
+                    },
+                }
+            );
+
+            const success = results.filter(item => item && item.ok).length;
+            const failed = results.length - success;
+            if (button) {
+                button.disabled = false;
+                button.textContent = originalText;
+            }
+
+            if (isFetch) {
+                showToast(
+                    `批量补全完成：成功 ${success} 个，失败 ${failed} 个${skipped > 0 ? `，跳过 ${skipped} 个非 YouTube 视频` : ''}`,
+                    failed > 0 ? 'warning' : 'success',
+                    4000
+                );
+                if (success > 0) {
+                    setTimeout(() => location.reload(), 800);
+                }
+            } else {
+                showToast(`已提交重翻请求：成功 ${success} 个，失败 ${failed} 个`, failed > 0 ? 'warning' : 'success', 4000);
+            }
         }
     };
 }
@@ -508,6 +672,96 @@ function pollSyncStatus() {
 
 function processAll() {
     location.href = `/tasks/new?playlist=${playlistId}`;
+}
+
+function showAddExistingVideoDialog() {
+    document.getElementById('add-existing-video-dialog').classList.remove('hidden');
+    document.getElementById('attach-video-search').focus();
+    loadAttachableVideos();
+}
+
+function closeAddExistingVideoDialog() {
+    document.getElementById('add-existing-video-dialog').classList.add('hidden');
+}
+
+function renderAttachableVideos(videos) {
+    const container = document.getElementById('attach-video-results');
+    if (!videos || videos.length === 0) {
+        container.innerHTML = '<div class="px-4 py-6 text-sm text-gray-500 text-center">没有可添加的视频</div>';
+        return;
+    }
+
+    container.innerHTML = videos.map(video => `
+        <div class="px-4 py-3 flex items-center justify-between gap-4">
+            <div class="min-w-0">
+                <div class="text-sm font-medium text-gray-900 truncate">${escapeHtml(video.title || video.id)}</div>
+                <div class="text-xs text-gray-500">${escapeHtml(video.id)} · ${escapeHtml(video.source_type || '')}</div>
+            </div>
+            <button onclick="addExistingVideoToPlaylist('${video.id}')"
+                    class="px-3 py-1.5 bg-green-600 text-white text-sm rounded hover:bg-green-700 flex-shrink-0">
+                添加
+            </button>
+        </div>
+    `).join('');
+}
+
+async function loadAttachableVideos() {
+    const query = document.getElementById('attach-video-search').value.trim();
+    const container = document.getElementById('attach-video-results');
+    container.innerHTML = '<div class="px-4 py-6 text-sm text-gray-500 text-center">加载中...</div>';
+
+    try {
+        const response = await fetch(`/api/playlists/${playlistId}/available-videos?q=${encodeURIComponent(query)}`);
+        const data = await response.json();
+        if (!response.ok) {
+            showToast('加载可添加视频失败: ' + (data.detail || '未知错误'), 'error');
+            container.innerHTML = '<div class="px-4 py-6 text-sm text-red-500 text-center">加载失败</div>';
+            return;
+        }
+        renderAttachableVideos(data.videos || []);
+    } catch (e) {
+        showToast('请求失败: ' + e.message, 'error');
+        container.innerHTML = '<div class="px-4 py-6 text-sm text-red-500 text-center">请求失败</div>';
+    }
+}
+
+async function addExistingVideoToPlaylist(videoId) {
+    try {
+        const response = await fetch(`/api/playlists/${playlistId}/videos`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({video_id: videoId})
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            showToast('添加失败: ' + (data.detail || '未知错误'), 'error');
+            return;
+        }
+        showToast(data.attached ? '已添加到当前 List' : '该视频已在当前 List 中', 'success');
+        closeAddExistingVideoDialog();
+        setTimeout(() => location.reload(), 500);
+    } catch (e) {
+        showToast('请求失败: ' + e.message, 'error');
+    }
+}
+
+async function removeVideoFromPlaylist(videoId, title) {
+    if (!confirm(`确定要将「${title}」移出当前 List？\n\n这不会删除视频本身。`)) return;
+
+    try {
+        const response = await fetch(`/api/playlists/${playlistId}/videos/${encodeURIComponent(videoId)}`, {
+            method: 'DELETE'
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            showToast('移出失败: ' + (data.detail || '未知错误'), 'error');
+            return;
+        }
+        showToast(data.removed ? '已移出当前 List' : '该视频当前不在此 List 中', 'success');
+        setTimeout(() => location.reload(), 400);
+    } catch (e) {
+        showToast('请求失败: ' + e.message, 'error');
+    }
 }
 
 async function deletePlaylist() {
@@ -750,7 +1004,15 @@ function applyRangeProcess() {
 
 // ESC 关闭对话框
 document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeRangeDialog();
+    if (e.key === 'Escape') {
+        closeRangeDialog();
+        closeAddExistingVideoDialog();
+    }
+});
+
+document.addEventListener('DOMContentLoaded', function() {
+    setupModalClickOutside('range-dialog', closeRangeDialog);
+    setupModalClickOutside('add-existing-video-dialog', closeAddExistingVideoDialog);
 });
 
 // 初始化

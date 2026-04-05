@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 
 logger = setup_logger("playlist_service")
 
+MANUAL_PLAYLIST_KIND = "manual"
+DEFAULT_MANUAL_PLAYLIST_ID = "manual-default"
+DEFAULT_MANUAL_PLAYLIST_TITLE = "默认列表"
+
 # YouTube channel tab URL 中 tab 路径到 playlist ID 后缀的映射
 # yt-dlp 对 channel tab URL 返回裸 channel ID（如 UCxxx），
 # 需要追加后缀（如 -shorts）以在 DB 中区分不同 tab 的 playlist。
@@ -747,21 +751,27 @@ class PlaylistService:
             return
 
         metadata = video.metadata or {}
+        title = info.get('title') or video.title
         metadata['upload_date'] = info.get('upload_date') or ''
         metadata['duration'] = info.get('duration') or 0
         metadata['thumbnail'] = info.get('thumbnail') or ''
+        description = info.get('description')
+        if description is not None:
+            metadata['description'] = description
         new_uploader = info.get('uploader') or ''
         if new_uploader:
             metadata['uploader'] = new_uploader
+            metadata['channel'] = new_uploader
         new_live_status = info.get('live_status')
         if new_live_status:
             metadata['live_status'] = new_live_status
         metadata['view_count'] = info.get('view_count') or 0
         metadata['like_count'] = info.get('like_count') or 0
+        metadata['_video_info'] = dict(info)
         metadata.pop('unavailable', None)
         metadata.pop('unavailable_reason', None)
         metadata.pop('upload_date_interpolated', None)
-        self.db.update_video(video_id, metadata=metadata)
+        self.db.update_video(video_id, title=title, metadata=metadata)
 
     def _classify_pruned_unavailable_videos(
         self,
@@ -1081,7 +1091,8 @@ class PlaylistService:
     def get_playlist_videos(
         self,
         playlist_id: str,
-        order_by: str = "upload_date"
+        order_by: str = "upload_date",
+        sort_order: str = "asc",
     ) -> List[Video]:
         """
         获取 Playlist 下的所有视频
@@ -1092,22 +1103,33 @@ class PlaylistService:
                 - "upload_date": 按发布日期（默认，最早在前，支持增量更新）
                 - "playlist_index": 按 Playlist 中的顺序
                 - "created_at": 按添加时间
+                - "title": 按标题
+                - "duration": 按时长
+            sort_order: asc / desc
                 
         Returns:
             视频列表
         """
         videos = self.db.list_videos(playlist_id=playlist_id)
-        
+
+        reverse = (sort_order or "asc").lower() == "desc"
+
         if order_by == "upload_date":
-            # 按发布日期排序（最早在前），无日期的排最后
             def get_upload_date(v):
                 date_str = v.metadata.get('upload_date', '') if v.metadata else ''
-                return date_str if date_str else '99999999'  # 无日期排最后
-            videos.sort(key=get_upload_date)
+                return date_str if date_str else '99999999'
+            videos.sort(key=get_upload_date, reverse=reverse)
         elif order_by == "playlist_index":
-            videos.sort(key=lambda v: v.playlist_index or 0)
+            videos.sort(key=lambda v: v.playlist_index or 0, reverse=reverse)
         elif order_by == "created_at":
-            videos.sort(key=lambda v: v.created_at or datetime.min)
+            videos.sort(key=lambda v: v.created_at or datetime.min, reverse=reverse)
+        elif order_by == "title":
+            videos.sort(key=lambda v: (v.title or v.id).lower(), reverse=reverse)
+        elif order_by == "duration":
+            videos.sort(
+                key=lambda v: (v.metadata or {}).get('duration') or 0,
+                reverse=reverse,
+            )
         
         return videos
     
@@ -1180,6 +1202,235 @@ class PlaylistService:
     def get_playlist(self, playlist_id: str) -> Optional[Playlist]:
         """获取 Playlist 信息"""
         return self.db.get_playlist(playlist_id)
+
+    @staticmethod
+    def is_manual_playlist(playlist: Optional[Playlist]) -> bool:
+        """判断列表是否为手动维护的 list。"""
+        if not playlist:
+            return False
+        return (playlist.metadata or {}).get("list_kind") == MANUAL_PLAYLIST_KIND
+
+    def create_manual_playlist(
+        self,
+        *,
+        title: str,
+        description: str = "",
+        playlist_id: Optional[str] = None,
+        is_default: bool = False,
+    ) -> Playlist:
+        """创建手动维护的 playlist。"""
+        normalized_title = (title or "").strip()
+        if not normalized_title:
+            raise ValueError("手动列表标题不能为空")
+
+        resolved_playlist_id = playlist_id or (
+            DEFAULT_MANUAL_PLAYLIST_ID if is_default else f"manual-{time.time_ns():x}"
+        )
+        existing = self.db.get_playlist(resolved_playlist_id)
+        if existing:
+            if is_default and self.is_manual_playlist(existing):
+                return existing
+            raise ValueError(f"Playlist 已存在: {resolved_playlist_id}")
+
+        metadata = {
+            "list_kind": MANUAL_PLAYLIST_KIND,
+            "is_default_manual_list": bool(is_default),
+        }
+        if description:
+            metadata["description"] = description.strip()
+
+        playlist = Playlist(
+            id=resolved_playlist_id,
+            title=normalized_title,
+            source_url=f"manual://{resolved_playlist_id}",
+            channel=None,
+            channel_id=None,
+            video_count=0,
+            last_synced_at=None,
+            metadata=metadata,
+        )
+        self.db.add_playlist(playlist)
+        created = self.db.get_playlist(resolved_playlist_id)
+        assert created is not None, f"创建手动 playlist 后未能回读: {resolved_playlist_id}"
+        return created
+
+    def ensure_default_manual_playlist(self) -> Playlist:
+        """确保默认手动列表存在。"""
+        existing = self.db.get_playlist(DEFAULT_MANUAL_PLAYLIST_ID)
+        if existing:
+            if not self.is_manual_playlist(existing):
+                raise ValueError(
+                    f"{DEFAULT_MANUAL_PLAYLIST_ID} 已存在但不是手动列表，请先清理冲突记录"
+                )
+            return existing
+
+        return self.create_manual_playlist(
+            title=DEFAULT_MANUAL_PLAYLIST_TITLE,
+            description="手动添加视频时使用的默认列表",
+            playlist_id=DEFAULT_MANUAL_PLAYLIST_ID,
+            is_default=True,
+        )
+
+    def attach_video_to_playlist(self, video_id: str, playlist_id: str) -> Dict[str, Any]:
+        """将视频追加到指定 playlist 末尾，不破坏已有顺序。"""
+        playlist = self.db.get_playlist(playlist_id)
+        if not playlist:
+            raise ValueError(f"Playlist 不存在: {playlist_id}")
+        video = self.db.get_video(video_id)
+        if not video:
+            raise ValueError(f"视频不存在: {video_id}")
+
+        existing_info = self.db.get_playlist_video_info(playlist_id, video_id)
+        if existing_info:
+            return {
+                "playlist_id": playlist_id,
+                "attached": False,
+                "playlist_index": existing_info.get("playlist_index") or 0,
+                "upload_order_index": existing_info.get("upload_order_index") or 0,
+            }
+
+        existing_members = self.get_playlist_videos(playlist_id, order_by="playlist_index")
+        next_playlist_index = (
+            max((member.playlist_index or 0) for member in existing_members) + 1
+            if existing_members else 1
+        )
+        max_upload_order_index = 0
+        for member in existing_members:
+            pv_info = self.db.get_playlist_video_info(playlist_id, member.id)
+            max_upload_order_index = max(
+                max_upload_order_index,
+                (pv_info or {}).get("upload_order_index") or 0,
+            )
+        next_upload_order_index = max(max_upload_order_index, next_playlist_index - 1) + 1
+
+        self.db.add_video_to_playlist(
+            video_id,
+            playlist_id,
+            playlist_index=next_playlist_index,
+            upload_order_index=next_upload_order_index,
+        )
+        self.db.update_playlist(
+            playlist_id,
+            video_count=len(self.db.get_playlist_video_ids(playlist_id)),
+        )
+        return {
+            "playlist_id": playlist_id,
+            "attached": True,
+            "playlist_index": next_playlist_index,
+            "upload_order_index": next_upload_order_index,
+        }
+
+    def remove_video_from_playlist(self, video_id: str, playlist_id: str) -> Dict[str, Any]:
+        """仅移除视频与当前 playlist 的关联，不删除视频本身。"""
+        playlist = self.db.get_playlist(playlist_id)
+        if not playlist:
+            raise ValueError(f"Playlist 不存在: {playlist_id}")
+        video = self.db.get_video(video_id)
+        if not video:
+            raise ValueError(f"视频不存在: {video_id}")
+
+        existing_info = self.db.get_playlist_video_info(playlist_id, video_id)
+        if not existing_info:
+            return {
+                "playlist_id": playlist_id,
+                "video_id": video_id,
+                "removed": False,
+                "remaining_playlists": self.db.get_video_playlists(video_id),
+            }
+
+        self.db.remove_video_from_playlist(video_id, playlist_id)
+        remaining_playlists = self.db.get_video_playlists(video_id)
+        self.db.update_playlist(
+            playlist_id,
+            video_count=len(self.db.get_playlist_video_ids(playlist_id)),
+        )
+        return {
+            "playlist_id": playlist_id,
+            "video_id": video_id,
+            "removed": True,
+            "remaining_playlists": remaining_playlists,
+        }
+
+    def list_attachable_videos(
+        self,
+        playlist_id: str,
+        query: str = "",
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """列出当前未加入该 playlist、可供手动加入的视频。"""
+        playlist = self.db.get_playlist(playlist_id)
+        if not playlist:
+            raise ValueError(f"Playlist 不存在: {playlist_id}")
+
+        normalized_query = (query or "").strip().lower()
+        existing_ids = self.db.get_playlist_video_ids(playlist_id)
+        candidates = []
+        for video in self.db.list_videos():
+            if video.id in existing_ids:
+                continue
+            title = video.title or ""
+            haystacks = [video.id.lower(), title.lower(), video.source_url.lower()]
+            if normalized_query and not any(normalized_query in text for text in haystacks):
+                continue
+            candidates.append({
+                "id": video.id,
+                "title": title or video.id,
+                "source_type": video.source_type.value,
+                "created_at": video.created_at.isoformat() if video.created_at else None,
+            })
+            if len(candidates) >= limit:
+                break
+        return candidates
+
+    def fetch_video_source_info(
+        self,
+        video_id: str,
+        *,
+        force: bool = False,
+        submit_translate: bool = True,
+    ) -> Dict[str, Any]:
+        """尝试从源平台抓取单个视频的元信息。"""
+        video = self.db.get_video(video_id)
+        if not video:
+            raise ValueError(f"视频不存在: {video_id}")
+        if video.source_type != SourceType.YOUTUBE:
+            raise ValueError("当前仅支持为 YouTube 视频自动获取信息")
+        has_translated = 'translated' in (video.metadata or {})
+
+        result = self.downloader.get_video_info(video.source_url)
+        if result.ok:
+            assert result.info is not None, f"get_video_info({video_id}) 返回 ok 但 info 为空"
+            self._apply_video_info_to_db(video_id, result.info)
+            if submit_translate and (not has_translated) and result.info.get("title"):
+                self._submit_translate_task(video_id, result.info, force=False)
+            return {
+                "status": "ok",
+                "video_id": video_id,
+                "title": result.info.get("title") or "",
+            }
+
+        metadata = dict(video.metadata or {})
+        if result.is_unavailable:
+            metadata["unavailable"] = True
+            metadata["unavailable_reason"] = result.error_message or "视频不可用"
+            self.db.update_video(video_id, metadata=metadata)
+
+        return {
+            "status": result.status,
+            "video_id": video_id,
+            "message": result.error_message or "无法获取视频信息",
+        }
+
+    @staticmethod
+    def _normalize_video_info_payload(raw_result: Any) -> tuple[VideoInfoResult, Optional[Dict[str, Any]]]:
+        """兼容历史 dict 返回值与新的 VideoInfoResult。"""
+        if isinstance(raw_result, VideoInfoResult):
+            return raw_result, raw_result.info
+        if isinstance(raw_result, dict):
+            return VideoInfoResult(status="ok", info=raw_result), raw_result
+        if raw_result is None:
+            return VideoInfoResult(status="error", error_message="视频信息为空"), None
+        raise TypeError(f"不支持的视频信息返回类型: {type(raw_result).__name__}")
     
     def delete_playlist(self, playlist_id: str, delete_videos: bool = False) -> Dict[str, Any]:
         """
@@ -1379,62 +1630,52 @@ class PlaylistService:
             """刷新单个视频的元信息"""
             nonlocal completed_count
             try:
-                video_info = self.downloader.get_video_info(
+                raw_result = self.downloader.get_video_info(
                     f"https://www.youtube.com/watch?v={video.id}"
                 )
-                if not video_info:
-                    logger.warning(f"视频 {video.id} 信息获取失败（返回空）")
+                result, video_info = self._normalize_video_info_payload(raw_result)
+                if not result.ok or not video_info:
+                    if result.is_unavailable:
+                        metadata = dict(video.metadata or {})
+                        metadata['unavailable'] = True
+                        metadata['unavailable_reason'] = result.error_message or '视频不可用'
+                        self.db.update_video(video.id, metadata=metadata)
+                    logger.warning(
+                        f"视频 {video.id} 信息获取失败: {result.error_message or result.status}"
+                    )
                     return False
-                
-                metadata = video.metadata or {}
+
+                metadata = dict(video.metadata or {})
                 new_title = video_info.get('title', '')
                 
                 if force_refetch:
-                    # 强制模式：覆盖所有字段
-                    metadata['upload_date'] = video_info.get('upload_date', '') or metadata.get('upload_date', '')
-                    metadata['duration'] = video_info.get('duration', 0) or metadata.get('duration', 0)
-                    metadata['thumbnail'] = video_info.get('thumbnail', '') or metadata.get('thumbnail', '')
-                    metadata['uploader'] = video_info.get('uploader', '') or metadata.get('uploader', '')
-                    metadata['view_count'] = video_info.get('view_count', 0)
-                    metadata['like_count'] = video_info.get('like_count', 0)
-                    # 清除 interpolated 标记（如果获取到了真实日期）
-                    if video_info.get('upload_date'):
-                        metadata.pop('upload_date_interpolated', None)
-                    # 更新缓存的 _video_info
-                    metadata['_video_info'] = {
-                        'video_id': video_info.get('id', video.id),
-                        'url': video_info.get('webpage_url', f"https://www.youtube.com/watch?v={video.id}"),
-                        'title': new_title,
-                        'uploader': video_info.get('uploader', ''),
-                        'description': video_info.get('description', ''),
-                        'duration': video_info.get('duration', 0),
-                        'upload_date': video_info.get('upload_date', ''),
-                        'thumbnail': video_info.get('thumbnail', ''),
-                        'tags': video_info.get('tags', []),
-                        'width': video_info.get('width', 0),
-                        'height': video_info.get('height', 0),
-                    }
-                    # 保留 translated，除非 force_retranslate
+                    existing_translated = metadata.get('translated')
+                    self._apply_video_info_to_db(video.id, video_info)
+                    refreshed_video = self.db.get_video(video.id)
+                    refreshed_metadata = dict(refreshed_video.metadata or {}) if refreshed_video else {}
+
                     if force_retranslate:
-                        metadata.pop('translated', None)
-                    
-                    title_to_save = new_title or video.title
-                    self.db.update_video(video.id, title=title_to_save, metadata=metadata)
-                    
-                    # 重新翻译
-                    if force_retranslate:
+                        refreshed_metadata.pop('translated', None)
+                        self.db.update_video(video.id, metadata=refreshed_metadata)
                         self._submit_translate_task(video.id, video_info, force=True)
-                    elif 'translated' not in metadata:
-                        # 没有翻译结果，自动翻译
-                        self._submit_translate_task(video.id, video_info, force=False)
+                    else:
+                        if existing_translated is not None:
+                            refreshed_metadata['translated'] = existing_translated
+                            self.db.update_video(video.id, metadata=refreshed_metadata)
+                        elif 'translated' not in refreshed_metadata:
+                            self._submit_translate_task(video.id, video_info, force=False)
                 else:
                     # merge 模式：仅填充缺失字段
                     changed = False
-                    if not metadata.get('upload_date') and video_info.get('upload_date'):
+
+                    def _is_missing(value: Any) -> bool:
+                        return value in (None, '', 0)
+
+                    if _is_missing(metadata.get('upload_date')) and video_info.get('upload_date'):
                         metadata['upload_date'] = video_info['upload_date']
                         metadata.pop('upload_date_interpolated', None)
                         changed = True
-                    if not metadata.get('duration') and video_info.get('duration'):
+                    if _is_missing(metadata.get('duration')) and video_info.get('duration'):
                         metadata['duration'] = video_info['duration']
                         changed = True
                     if not metadata.get('thumbnail') and video_info.get('thumbnail'):
@@ -1443,35 +1684,27 @@ class PlaylistService:
                     if not metadata.get('uploader') and video_info.get('uploader'):
                         metadata['uploader'] = video_info['uploader']
                         changed = True
-                    if metadata.get('view_count') is None:
+                    if not metadata.get('channel') and video_info.get('uploader'):
+                        metadata['channel'] = video_info['uploader']
+                        changed = True
+                    if not metadata.get('description') and video_info.get('description'):
+                        metadata['description'] = video_info['description']
+                        changed = True
+                    if _is_missing(metadata.get('view_count')) and video_info.get('view_count') is not None:
                         metadata['view_count'] = video_info.get('view_count', 0)
                         changed = True
-                    if metadata.get('like_count') is None:
+                    if _is_missing(metadata.get('like_count')) and video_info.get('like_count') is not None:
                         metadata['like_count'] = video_info.get('like_count', 0)
                         changed = True
-                    # 补全 _video_info 缓存
                     if '_video_info' not in metadata:
-                        metadata['_video_info'] = {
-                            'video_id': video_info.get('id', video.id),
-                            'url': video_info.get('webpage_url', f"https://www.youtube.com/watch?v={video.id}"),
-                            'title': new_title or video.title or '',
-                            'uploader': video_info.get('uploader', ''),
-                            'description': video_info.get('description', ''),
-                            'duration': video_info.get('duration', 0),
-                            'upload_date': video_info.get('upload_date', ''),
-                            'thumbnail': video_info.get('thumbnail', ''),
-                            'tags': video_info.get('tags', []),
-                            'width': video_info.get('width', 0),
-                            'height': video_info.get('height', 0),
-                        }
+                        metadata['_video_info'] = dict(video_info)
                         changed = True
-                    
+
                     title_to_save = video.title or new_title or None
                     if changed or (not video.title and new_title):
                         self.db.update_video(video.id, title=title_to_save, metadata=metadata)
-                    
-                    # 如果没有翻译结果且有 video_info，自动翻译
-                    if 'translated' not in metadata:
+
+                    if 'translated' not in metadata and new_title:
                         self._submit_translate_task(video.id, video_info, force=False)
                 
                 return True

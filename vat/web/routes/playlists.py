@@ -2,7 +2,7 @@
 Playlist 管理 API
 """
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel
 
 from vat.database import Database
@@ -10,7 +10,7 @@ from vat.models import Playlist
 from vat.services import PlaylistService
 from vat.services.playlist_service import resolve_playlist_id
 from vat.utils.logger import setup_logger
-from vat.web.deps import get_db
+from vat.web.deps import get_db, get_web_config
 
 logger = setup_logger("playlist_api")
 
@@ -30,7 +30,10 @@ class PlaylistResponse(BaseModel):
 
 class AddPlaylistRequest(BaseModel):
     """添加 Playlist 请求"""
-    url: str
+    mode: str = "youtube"  # youtube / manual
+    url: Optional[str] = None
+    title: Optional[str] = None
+    description: str = ""
     auto_sync: bool = True
     fetch_upload_dates: bool = True  # 默认获取发布日期（用于按时间排序）
 
@@ -51,6 +54,11 @@ class SyncResultResponse(BaseModel):
     existing_videos: int
     total_videos: int
 
+
+class PlaylistVideoMembershipRequest(BaseModel):
+    """playlist 成员增删请求。"""
+    video_id: str
+
 # 全局同步状态存储
 # 兼容保留：历史上用内存字典记录最近 job_id。
 # 当前路由已优先通过 web_jobs 反查任务，后续可彻底删除。
@@ -58,9 +66,14 @@ _sync_status = {}  # playlist_id -> {status, message, result}
 
 
 def get_playlist_service(db: Database = Depends(get_db)) -> PlaylistService:
-    from vat.config import load_config
-    config = load_config()
+    config = get_web_config()
     return PlaylistService(db, config)
+
+
+def _ensure_syncable_playlist(playlist: Playlist) -> None:
+    """阻止对手动列表执行平台同步/刷新。"""
+    if PlaylistService.is_manual_playlist(playlist):
+        raise HTTPException(400, "手动列表不支持同步")
 
 
 @router.get("")
@@ -181,13 +194,27 @@ async def get_sync_status(playlist_id: str):
 @router.post("", response_model=SyncResponse)
 async def add_playlist(
     request: AddPlaylistRequest,
-    db: Database = Depends(get_db)
+    db: Database = Depends(get_db),
+    service: PlaylistService = Depends(get_playlist_service),
 ):
     """添加 Playlist（URL），通过 JobManager 后台执行同步"""
+    if request.mode == "manual":
+        title = (request.title or "").strip()
+        if not title:
+            raise HTTPException(400, "手动列表标题不能为空")
+        playlist = service.create_manual_playlist(
+            title=title,
+            description=request.description or "",
+        )
+        return SyncResponse(
+            playlist_id=playlist.id,
+            message="已创建手动列表",
+            syncing=False,
+        )
+
     from vat.downloaders import YouTubeDownloader
-    from vat.config import load_config
-    
-    config = load_config()
+
+    config = get_web_config()
     downloader = YouTubeDownloader(
         proxy=config.get_stage_proxy("downloader"),
         video_format=config.downloader.youtube.format,
@@ -196,6 +223,8 @@ async def add_playlist(
     )
     
     try:
+        if not request.url:
+            raise HTTPException(400, "YouTube Playlist URL 不能为空")
         playlist_info = downloader.get_playlist_info(request.url)
         if not playlist_info:
             raise HTTPException(400, "无法获取 Playlist 信息")
@@ -248,6 +277,7 @@ async def sync_playlist(
     pl = db.get_playlist(playlist_id)
     if not pl:
         raise HTTPException(404, "Playlist not found")
+    _ensure_syncable_playlist(pl)
     
     # 检查是否已有 running job
     existing_job = _find_latest_playlist_job("sync-playlist", playlist_id)
@@ -330,6 +360,7 @@ async def refresh_playlist_videos(
     pl = db.get_playlist(playlist_id)
     if not pl:
         raise HTTPException(404, "Playlist not found")
+    _ensure_syncable_playlist(pl)
     
     # 检查是否已有 running job
     existing_job = _find_latest_playlist_job("refresh-playlist", playlist_id)
@@ -434,6 +465,56 @@ async def update_playlist_metadata(
     
     db.update_playlist(playlist_id, metadata=metadata)
     return {"status": "updated", "playlist_id": playlist_id, "metadata": metadata}
+
+
+@router.get("/{playlist_id}/available-videos")
+async def list_attachable_videos(
+    playlist_id: str,
+    q: str = Query("", description="标题/ID/source_url 模糊搜索"),
+    limit: int = Query(50, ge=1, le=200),
+    service: PlaylistService = Depends(get_playlist_service),
+):
+    """列出当前未加入该 playlist、可手动加入的视频。"""
+    pl = service.get_playlist(playlist_id)
+    if not pl:
+        raise HTTPException(404, "Playlist not found")
+    try:
+        videos = service.list_attachable_videos(playlist_id, query=q, limit=limit)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"videos": videos}
+
+
+@router.post("/{playlist_id}/videos")
+async def add_existing_video_to_playlist(
+    playlist_id: str,
+    request: PlaylistVideoMembershipRequest,
+    service: PlaylistService = Depends(get_playlist_service),
+):
+    """把已有视频添加到指定 playlist。"""
+    pl = service.get_playlist(playlist_id)
+    if not pl:
+        raise HTTPException(404, "Playlist not found")
+    try:
+        return service.attach_video_to_playlist(request.video_id, playlist_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.delete("/{playlist_id}/videos/{video_id}")
+async def remove_video_from_playlist(
+    playlist_id: str,
+    video_id: str,
+    service: PlaylistService = Depends(get_playlist_service),
+):
+    """仅移除视频与当前 playlist 的关联。"""
+    pl = service.get_playlist(playlist_id)
+    if not pl:
+        raise HTTPException(404, "Playlist not found")
+    try:
+        return service.remove_video_from_playlist(video_id, playlist_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @router.delete("/{playlist_id}")

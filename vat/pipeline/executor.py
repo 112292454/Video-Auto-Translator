@@ -21,7 +21,6 @@ from ..database import Database
 from ..config import Config
 from ..downloaders import YouTubeDownloader, BaseDownloader, LocalImporter, DirectURLDownloader
 from ..asr import WhisperASR, ASRData, ASRDataSeg, write_srt, write_ass, split_by_llm, ASRPostProcessor
-from ..asr.vocal_separation import VocalSeparator, VocalSeparationResult
 from ..translator import LLMTranslator
 from ..embedder import FFmpegWrapper
 from ..media import extract_audio_ffmpeg
@@ -929,6 +928,8 @@ class VideoProcessor:
                     
                     # 执行人声分离
                     try:
+                        from ..asr.vocal_separation import VocalSeparator
+
                         separator = VocalSeparator(
                             models_dir=self.config.storage.models_dir,
                             model_filename=vocal_sep_config.model_filename,
@@ -2303,6 +2304,32 @@ def detect_source_type(source: str) -> SourceType:
     )
 
 
+def resolve_video_identity_from_source(
+    source: str,
+    source_type: SourceType,
+) -> tuple[str, str]:
+    """标准化 source 并计算稳定 video_id。"""
+    normalized_source = source.strip()
+    if source_type == SourceType.LOCAL:
+        from vat.downloaders.local import generate_content_based_id
+
+        source_path = Path(normalized_source).expanduser().resolve()
+        assert source_path.exists(), f"本地视频文件不存在: {source}"
+        normalized_source = str(source_path)
+        video_id = generate_content_based_id(source_path)
+        return normalized_source, video_id
+
+    if source_type == SourceType.YOUTUBE:
+        from vat.downloaders import YouTubeDownloader
+
+        extracted_video_id = YouTubeDownloader().extract_video_id(normalized_source)
+        if extracted_video_id:
+            return normalized_source, extracted_video_id
+
+    video_id = hashlib.md5(normalized_source.encode()).hexdigest()[:16]
+    return normalized_source, video_id
+
+
 def create_video_from_source(
     source: str,
     db: Database,
@@ -2320,18 +2347,7 @@ def create_video_from_source(
     Returns:
         视频 ID
     """
-    # 生成视频 ID
-    if source_type == SourceType.LOCAL:
-        # 本地文件：基于内容哈希
-        from vat.downloaders.local import generate_content_based_id
-        source_path = Path(source).resolve()
-        assert source_path.exists(), f"本地视频文件不存在: {source}"
-        video_id = generate_content_based_id(source_path)
-        # 规范化为绝对路径
-        source = str(source_path)
-    else:
-        # URL 类型：基于 URL 哈希
-        video_id = hashlib.md5(source.encode()).hexdigest()[:16]
+    source, video_id = resolve_video_identity_from_source(source, source_type)
     
     # 检查视频是否已存在，清理旧任务记录避免重复
     existing = db.get_video(video_id)

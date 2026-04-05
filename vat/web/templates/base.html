@@ -57,6 +57,7 @@
                     <a href="/prompts" class="text-gray-600 hover:text-gray-900 {% if '/prompts' in request.url.path %}font-semibold text-blue-600{% endif %}">
                         📝 Prompts
                     </a>
+                    <a href="/test" class="text-gray-600 hover:text-gray-900 {% if '/test' in request.url.path %}font-semibold text-emerald-600{% endif %}">🧪 测试</a>
                     <a href="/watch" class="text-gray-600 hover:text-gray-900 {% if '/watch' in request.url.path %}font-semibold text-blue-600{% endif %}">
                         👁️ Watch
                     </a>
@@ -251,6 +252,41 @@
                 tag.classList.remove(...allActiveClasses);
             }
         });
+    }
+
+    // ==================== 通用批量并发执行 ====================
+    async function runConcurrentBatch(items, worker, options = {}) {
+        const concurrency = Math.max(1, options.concurrency || 2);
+        const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+        const results = new Array(items.length);
+        let nextIndex = 0;
+        let completed = 0;
+
+        async function runner() {
+            while (true) {
+                const currentIndex = nextIndex;
+                nextIndex += 1;
+                if (currentIndex >= items.length) return;
+
+                try {
+                    results[currentIndex] = await worker(items[currentIndex], currentIndex);
+                } catch (error) {
+                    results[currentIndex] = {ok: false, error};
+                } finally {
+                    completed += 1;
+                    if (onProgress) {
+                        onProgress({completed, total: items.length, currentIndex});
+                    }
+                }
+            }
+        }
+
+        const runners = [];
+        for (let i = 0; i < Math.min(concurrency, items.length); i++) {
+            runners.push(runner());
+        }
+        await Promise.all(runners);
+        return results;
     }
     </script>
 </body>

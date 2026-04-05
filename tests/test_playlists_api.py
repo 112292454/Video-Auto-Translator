@@ -99,6 +99,11 @@ class _FakeDb:
 class _FakePlaylistService:
     def __init__(self, playlist=None):
         self.playlist = playlist
+        self.manual_playlist_calls = []
+        self.manual_playlist_to_return = None
+        self.attach_calls = []
+        self.detach_calls = []
+        self.available_videos = []
 
     def get_playlist(self, playlist_id):
         if self.playlist and self.playlist.id == playlist_id:
@@ -113,6 +118,46 @@ class _FakePlaylistService:
 
     def delete_playlist(self, playlist_id, delete_videos=False):
         return {"deleted_videos": 0, "deleted_relations": 0, "delete_videos": delete_videos}
+
+    def create_manual_playlist(self, *, title, description="", playlist_id=None, is_default=False):
+        self.manual_playlist_calls.append({
+            "title": title,
+            "description": description,
+            "playlist_id": playlist_id,
+            "is_default": is_default,
+        })
+        return self.manual_playlist_to_return or SimpleNamespace(
+            id="manual-created",
+            title=title,
+            source_url="manual://manual-created",
+            channel=None,
+            channel_id=None,
+            video_count=0,
+            last_synced_at=None,
+            metadata={"list_kind": "manual", "description": description},
+        )
+
+    def attach_video_to_playlist(self, video_id, playlist_id):
+        self.attach_calls.append((video_id, playlist_id))
+        return {
+            "playlist_id": playlist_id,
+            "video_id": video_id,
+            "attached": True,
+            "playlist_index": 4,
+            "upload_order_index": 4,
+        }
+
+    def remove_video_from_playlist(self, video_id, playlist_id):
+        self.detach_calls.append((video_id, playlist_id))
+        return {
+            "playlist_id": playlist_id,
+            "video_id": video_id,
+            "removed": True,
+            "remaining_playlists": ["PL_OTHER"],
+        }
+
+    def list_attachable_videos(self, playlist_id, query="", limit=50):
+        return self.available_videos
 
 
 def _make_playlist(playlist_id="PL1"):
@@ -176,6 +221,51 @@ class TestPlaylistJobRoutes:
                 "url": "https://www.youtube.com/@test/videos",
             },
         }]
+
+    @pytest.mark.anyio
+    async def test_add_playlist_supports_manual_mode_without_submitting_job(self, app, client, monkeypatch):
+        fake_db = _FakeDb()
+        service = _FakePlaylistService()
+        service.manual_playlist_to_return = SimpleNamespace(
+            id="manual-anime",
+            title="手动合集",
+            source_url="manual://manual-anime",
+            channel=None,
+            channel_id=None,
+            video_count=0,
+            last_synced_at=None,
+            metadata={"list_kind": "manual", "description": "一些手动收集的视频"},
+        )
+        job_manager = _FakeJobManager()
+
+        app.include_router(router)
+        app.dependency_overrides[get_db] = lambda: fake_db
+        app.dependency_overrides[get_playlist_service] = lambda: service
+        monkeypatch.setattr("vat.web.routes.playlists._get_job_manager", lambda: job_manager)
+
+        async with client as ac:
+            response = await ac.post(
+                "/api/playlists",
+                json={
+                    "mode": "manual",
+                    "title": "手动合集",
+                    "description": "一些手动收集的视频",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "playlist_id": "manual-anime",
+            "message": "已创建手动列表",
+            "syncing": False,
+        }
+        assert service.manual_playlist_calls == [{
+            "title": "手动合集",
+            "description": "一些手动收集的视频",
+            "playlist_id": None,
+            "is_default": False,
+        }]
+        assert job_manager.submit_calls == []
 
     @pytest.mark.anyio
     async def test_add_playlist_does_not_resubmit_running_sync_job(self, app, client, monkeypatch):
@@ -245,6 +335,32 @@ class TestPlaylistJobRoutes:
             "task_type": "sync-playlist",
             "task_params": {"playlist_id": "PL1"},
         }]
+
+    @pytest.mark.anyio
+    async def test_sync_playlist_rejects_manual_playlist(self, app, client, monkeypatch):
+        fake_db = _FakeDb()
+        fake_db.playlists["manual-1"] = SimpleNamespace(
+            id="manual-1",
+            title="手动列表",
+            source_url="manual://manual-1",
+            channel=None,
+            channel_id=None,
+            video_count=0,
+            last_synced_at=None,
+            metadata={"list_kind": "manual"},
+        )
+        job_manager = _FakeJobManager()
+
+        app.include_router(router)
+        app.dependency_overrides[get_db] = lambda: fake_db
+        monkeypatch.setattr("vat.web.routes.playlists._get_job_manager", lambda: job_manager)
+
+        async with client as ac:
+            response = await ac.post("/api/playlists/manual-1/sync", json={})
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == "手动列表不支持同步"
+        assert job_manager.submit_calls == []
 
     @pytest.mark.anyio
     async def test_sync_playlist_does_not_resubmit_running_job(self, app, client, monkeypatch):
@@ -390,3 +506,51 @@ class TestPlaylistJobRoutes:
             "task_type": "retranslate-playlist",
             "task_params": {"playlist_id": "PL1"},
         }]
+
+    @pytest.mark.anyio
+    async def test_add_existing_video_to_playlist_delegates_to_service(self, app, client):
+        playlist = _make_playlist("PL1")
+        service = _FakePlaylistService(playlist=playlist)
+
+        app.include_router(router)
+        app.dependency_overrides[get_playlist_service] = lambda: service
+
+        async with client as ac:
+            response = await ac.post("/api/playlists/PL1/videos", json={"video_id": "v1"})
+
+        assert response.status_code == 200
+        assert response.json()["attached"] is True
+        assert service.attach_calls == [("v1", "PL1")]
+
+    @pytest.mark.anyio
+    async def test_remove_video_from_playlist_delegates_to_service(self, app, client):
+        playlist = _make_playlist("PL1")
+        service = _FakePlaylistService(playlist=playlist)
+
+        app.include_router(router)
+        app.dependency_overrides[get_playlist_service] = lambda: service
+
+        async with client as ac:
+            response = await ac.delete("/api/playlists/PL1/videos/v1")
+
+        assert response.status_code == 200
+        assert response.json()["removed"] is True
+        assert service.detach_calls == [("v1", "PL1")]
+
+    @pytest.mark.anyio
+    async def test_list_attachable_videos_returns_service_payload(self, app, client):
+        playlist = _make_playlist("PL1")
+        service = _FakePlaylistService(playlist=playlist)
+        service.available_videos = [
+            {"id": "v10", "title": "My Video", "source_type": "youtube"},
+            {"id": "v11", "title": "Other Video", "source_type": "local"},
+        ]
+
+        app.include_router(router)
+        app.dependency_overrides[get_playlist_service] = lambda: service
+
+        async with client as ac:
+            response = await ac.get("/api/playlists/PL1/available-videos?q=video")
+
+        assert response.status_code == 200
+        assert response.json() == {"videos": service.available_videos}

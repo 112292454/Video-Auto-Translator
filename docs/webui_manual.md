@@ -24,8 +24,8 @@
 
 VAT Web UI 是一个基于 FastAPI 的视频处理管理界面，提供以下核心功能：
 
-- **视频管理**：查看、搜索、处理视频，查看处理状态和相关文件。支持多种方式添加视频（平台链接、直链、本地路径、文件上传）
-- **Playlist 管理**：添加 YouTube Playlist，自动同步视频列表，批量处理
+- **视频管理**：查看、搜索、处理视频，查看处理状态和相关文件。支持平台链接、直链、本地路径、文件上传四种方式手动添加，且可一次添加多个视频
+- **Playlist 管理**：支持 YouTube Playlist 与手动 List 两种列表形态，可作为批量处理、默认归档和手动整理入口
 - **任务管理**：创建处理任务，实时查看进度和日志，取消/重试任务
 - **Custom Prompts**：管理翻译和优化阶段使用的自定义提示词
 - **文件浏览**：查看、编辑、下载视频处理生成的各类文件
@@ -201,12 +201,23 @@ vat/web/
 
 | Tab | 输入 | source_type |
 |-----|------|-------------|
-| **平台链接**（默认） | YouTube / Bilibili 视频 URL | 自动检测 |
-| **直链** | HTTP/HTTPS 视频文件直链 | `direct_url` |
-| **服务器路径** | 服务器上的视频文件绝对路径 | `local` |
-| **上传视频** | 拖拽/选择文件上传到服务器 | `local`（上传后转为服务器路径） |
+| **平台链接**（默认） | YouTube / Bilibili 视频 URL（每行一个） | 自动检测 |
+| **直链** | HTTP/HTTPS 视频文件直链（每行一个） | `direct_url` |
+| **服务器路径** | 服务器上的视频文件绝对路径（每行一个） | `local` |
+| **上传视频** | 拖拽/选择一个或多个文件上传到服务器 | `local`（上传后转为服务器路径） |
 
-所有 Tab 共用一个可选的「标题」输入框，不填则自动从文件名/平台获取。上传视频支持 mp4、mkv、webm、avi、mov、flv 格式，上传完成后自动填入服务器路径。
+所有 Tab 共用一个可选的「标题」输入框，但仅在单条添加时生效；批量添加时应留空，让系统自动从文件名或平台信息补标题。
+
+添加视频时还可以选择三种归属方式：
+- 不加入任何 List
+- 加入默认 List（若不存在则自动创建一个手动 List）
+- 加入指定 List
+
+如果手动添加的 source 已经映射到系统里的现有视频（尤其是 YouTube 链接），系统会阻止重复添加并提示冲突；如果只是想把该视频补加到另一个 List，应去目标 List 详情页使用「添加已有视频」。
+
+手动添加 YouTube 视频时，系统会尝试立即抓取标题、简介、封面等平台信息；视频详情页也提供「尝试获取信息」按钮，可在后续重试。
+对旧视频执行 Playlist「刷新信息 → 补全缺失信息」时，也会走同一套 richer metadata 补齐逻辑，但只补缺失字段，不覆盖已有信息。
+重复添加同一个已存在视频时，系统会直接拒绝请求；如果只是想把它补加到另一个 List，请去目标 List 页面使用「添加已有视频」。
 
 ### 4.2 视频详情页 (`/video/{id}`)
 
@@ -216,6 +227,7 @@ vat/web/
 - 视频标题（原文 + 翻译）
 - 来源类型、时长、源地址链接
 - 处理进度时间线：7 个阶段的状态和完成时间
+- 对 YouTube 视频会显示「尝试获取信息」按钮；本地文件和直链视频不显示这个入口
 - 翻译信息：翻译标题、优化标题、简介摘要、推荐标签、推荐分区
 - 相关文件列表
 
@@ -322,7 +334,7 @@ vat/web/
 - Playlist 标题、频道名、视频数、进度、最后同步时间
 
 **操作**：
-- **+ 添加 Playlist**：输入 YouTube Playlist URL 添加
+- **+ 添加 Playlist**：可添加 YouTube Playlist，或创建仅包含名称/描述的手动 List
 - **同步**：增量同步 Playlist（获取新视频）
 - **处理**：处理全部待处理视频
 - **删除**：删除 Playlist（视频记录保留）
@@ -343,10 +355,15 @@ vat/web/
 - 显示：标题、上传日期、时长、状态（已完成/失败/进行中/待处理）
 - 按上传日期排序（旧 → 新）
 - 分页显示，默认每页 100 条（仅对当前页视频查询进度，避免全量加载）
+- 点击 `# / 标题 / 发布日期 / 时长` 表头时，使用服务端全量排序，因此排序会跨分页生效
 
 **操作按钮**：
-- **同步 Playlist**：增量同步
+- **同步 Playlist**：仅对平台同步型 Playlist 可用；手动 List 不显示同步/刷新入口
+- **添加已有视频**：从现有视频库中搜索一个视频并加入当前 List
+- **移出**：仅移除该视频与当前 List 的关联，不删除视频本体
 - **处理选中**：处理选中的视频
+- **批量补全信息**：对选中的视频批量调用现有“尝试获取信息”接口，小并发执行，完成后刷新页面
+- **批量重翻信息**：对选中的视频批量提交“重新翻译视频信息”请求，小并发执行
 - **处理范围**：打开范围选择对话框
 - **强制重做选中**：强制重新处理选中视频
 
@@ -452,8 +469,9 @@ vat/web/
 |------|------|------|
 | GET | `/api/videos` | 列出视频（支持分页、状态过滤） |
 | GET | `/api/videos/{id}` | 获取视频详情 |
-| POST | `/api/videos` | 添加视频（支持 source_type: auto/youtube/local/direct_url，可选 title） |
+| POST | `/api/videos` | 添加一个或多个视频（支持 `url` 或 `sources[]`，可选 playlist 归属与自动抓取信息） |
 | POST | `/api/videos/upload-file` | 上传视频文件到服务器（返回 server_path 供创建 LOCAL 记录） |
+| POST | `/api/videos/{id}/fetch-source-info` | 尝试从源平台重新抓取标题/简介/封面等信息 |
 | DELETE | `/api/videos/{id}` | 删除视频 |
 
 ### 5.2 Playlist API
@@ -462,8 +480,11 @@ vat/web/
 |------|------|------|
 | GET | `/api/playlists` | 列出 Playlist |
 | GET | `/api/playlists/{id}` | 获取 Playlist 详情 |
-| POST | `/api/playlists` | 添加 Playlist |
+| POST | `/api/playlists` | 添加 YouTube Playlist 或创建手动 List |
 | POST | `/api/playlists/{id}/sync` | 同步 Playlist |
+| GET | `/api/playlists/{id}/available-videos` | 查询当前未加入该 List、可手动加入的视频 |
+| POST | `/api/playlists/{id}/videos` | 把一个已有视频加入指定 List |
+| DELETE | `/api/playlists/{id}/videos/{video_id}` | 将一个视频移出当前 List（不删除视频） |
 | DELETE | `/api/playlists/{id}` | 删除 Playlist |
 | GET | `/api/playlists/{id}/prompt` | 获取 Prompt 配置 |
 | PUT | `/api/playlists/{id}/prompt` | 设置 Prompt 配置 |
@@ -580,12 +601,25 @@ vat/web/
 ### 6.2 批量处理 Playlist 视频
 
 1. 访问 `/playlists`，点击"+ 添加 Playlist"
-2. 输入 YouTube Playlist URL，点击添加
-3. 等待同步完成（自动获取视频列表和信息翻译）
+2. 选择一种列表类型：
+   - 输入 YouTube Playlist URL 创建平台同步型 Playlist
+   - 或直接创建一个手动 List，用于临时整理、默认归档或自定义分组
+3. 如果是 YouTube Playlist，等待同步完成
 4. 进入 Playlist 详情页
 5. 选择视频（或使用"处理范围"功能）
 6. 点击"处理选中"
 7. 在新建任务页确认配置后执行
+
+如果你是先把视频单独加到系统里，再想补充归属到某个 List：
+1. 打开目标 `/playlists/{id}`
+2. 点击「添加已有视频」
+3. 搜索标题 / 视频 ID
+4. 点击「添加」
+
+如果只想把某个视频从当前 List 里拿掉而不删视频本体：
+1. 打开 `/playlists/{id}`
+2. 在该视频所在行点击「移出」
+3. 确认即可
 
 ### 6.3 重新处理某个阶段
 

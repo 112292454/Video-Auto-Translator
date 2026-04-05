@@ -138,6 +138,190 @@ class TestPlaylistProgress:
         assert wh['completed'] == 2
         assert wh['failed'] == 1
 
+
+class TestManualPlaylistAndVideoInfo:
+
+    def test_create_manual_playlist_persists_metadata(self, db):
+        service = PlaylistService(db)
+
+        playlist = service.create_manual_playlist(
+            title="手动列表",
+            description="手工整理的视频",
+        )
+
+        loaded = db.get_playlist(playlist.id)
+        assert loaded is not None
+        assert loaded.title == "手动列表"
+        assert loaded.source_url.startswith("manual://")
+        assert loaded.channel is None
+        assert loaded.metadata["list_kind"] == "manual"
+        assert loaded.metadata["description"] == "手工整理的视频"
+
+    def test_ensure_default_manual_playlist_reuses_existing_playlist(self, db):
+        service = PlaylistService(db)
+
+        first = service.ensure_default_manual_playlist()
+        second = service.ensure_default_manual_playlist()
+
+        assert first.id == second.id
+        assert db.list_playlists()[0].metadata["is_default_manual_list"] is True
+
+    def test_attach_video_to_playlist_appends_new_membership(self, db):
+        service = PlaylistService(db)
+        playlist = service.create_manual_playlist(title="手动列表")
+        _setup_playlist(db, "PL_OTHER")
+        _add_pl_video(db, "v_exist", playlist_id=playlist.id, index=1)
+        _add_pl_video(db, "v_new", playlist_id="PL_OTHER", index=1)
+
+        result = service.attach_video_to_playlist("v_new", playlist.id)
+
+        membership = db.get_playlist_video_info(playlist.id, "v_new")
+        assert result["attached"] is True
+        assert membership["playlist_index"] == 2
+        assert membership["upload_order_index"] == 2
+        assert db.get_playlist(playlist.id).video_count == 2
+
+    def test_fetch_video_source_info_updates_video_and_submits_translate(self, db, monkeypatch):
+        _setup_playlist(db, "PL1")
+        _add_pl_video(db, "yt_fetch", playlist_id="PL1", index=1)
+        video = db.get_video("yt_fetch")
+        db.update_video(video.id, title=None, metadata={})
+        service = PlaylistService(db)
+
+        class _FakeDownloader:
+            def get_video_info(self, url):
+                assert url == "https://youtube.com/watch?v=yt_fetch"
+                return VideoInfoResult(
+                    status="ok",
+                    info={
+                        "video_id": "yt_fetch",
+                        "url": url,
+                        "title": "Fetched Title",
+                        "description": "Fetched Desc",
+                        "duration": 123,
+                        "uploader": "Fetcher",
+                        "upload_date": "20250401",
+                        "thumbnail": "https://img.test/fetch.jpg",
+                        "view_count": 456,
+                        "like_count": 78,
+                    },
+                )
+
+        translated = []
+        service._downloader = _FakeDownloader()
+        monkeypatch.setattr(
+            service,
+            "_submit_translate_task",
+            lambda video_id, video_info, force=False: translated.append((video_id, video_info, force)),
+        )
+
+        result = service.fetch_video_source_info("yt_fetch", force=True, submit_translate=True)
+
+        refreshed = db.get_video("yt_fetch")
+        assert result["status"] == "ok"
+        assert refreshed.title == "Fetched Title"
+        assert refreshed.metadata["uploader"] == "Fetcher"
+        assert refreshed.metadata["channel"] == "Fetcher"
+        assert refreshed.metadata["_video_info"]["title"] == "Fetched Title"
+        assert translated == [("yt_fetch", {
+            "video_id": "yt_fetch",
+            "url": "https://youtube.com/watch?v=yt_fetch",
+            "title": "Fetched Title",
+            "description": "Fetched Desc",
+            "duration": 123,
+            "uploader": "Fetcher",
+            "upload_date": "20250401",
+            "thumbnail": "https://img.test/fetch.jpg",
+            "view_count": 456,
+            "like_count": 78,
+        }, False)]
+
+    def test_fetch_video_source_info_does_not_submit_translate_when_already_translated(self, db, monkeypatch):
+        _setup_playlist(db, "PL1")
+        _add_pl_video(db, "yt_translated", playlist_id="PL1", index=1)
+        db.update_video("yt_translated", metadata={"translated": {"title_translated": "已有翻译"}})
+        service = PlaylistService(db)
+
+        class _FakeDownloader:
+            def get_video_info(self, url):
+                assert url == "https://youtube.com/watch?v=yt_translated"
+                return VideoInfoResult(
+                    status="ok",
+                    info={
+                        "video_id": "yt_translated",
+                        "url": url,
+                        "title": "Fetched Title",
+                        "description": "Fetched Desc",
+                        "duration": 123,
+                        "uploader": "Fetcher",
+                        "upload_date": "20250401",
+                        "thumbnail": "https://img.test/fetch.jpg",
+                        "view_count": 456,
+                        "like_count": 78,
+                    },
+                )
+
+        translated = []
+        service._downloader = _FakeDownloader()
+        monkeypatch.setattr(
+            service,
+            "_submit_translate_task",
+            lambda video_id, video_info, force=False: translated.append((video_id, video_info, force)),
+        )
+
+        result = service.fetch_video_source_info("yt_translated", force=True, submit_translate=True)
+
+        assert result["status"] == "ok"
+        assert translated == []
+        assert db.get_video("yt_translated").metadata["translated"] == {"title_translated": "已有翻译"}
+
+    def test_remove_video_from_playlist_only_removes_membership(self, db):
+        service = PlaylistService(db)
+        playlist = service.create_manual_playlist(title="手动列表")
+        _setup_playlist(db, "PL_OTHER")
+        _add_pl_video(db, "v_move", playlist_id=playlist.id, index=1)
+        db.add_video_to_playlist("v_move", "PL_OTHER", playlist_index=2, upload_order_index=2)
+
+        result = service.remove_video_from_playlist("v_move", playlist.id)
+
+        assert result["removed"] is True
+        assert db.get_playlist_video_info(playlist.id, "v_move") is None
+        assert db.get_video("v_move") is not None
+        assert db.get_video_playlists("v_move") == ["PL_OTHER"]
+        assert db.get_playlist(playlist.id).video_count == 0
+
+    def test_list_attachable_videos_excludes_existing_members_and_supports_query(self, db):
+        service = PlaylistService(db)
+        playlist = service.create_manual_playlist(title="手动列表")
+        _add_pl_video(db, "v_in", playlist_id=playlist.id, index=1)
+        db.add_video(
+            Video(
+                id="v_keep",
+                source_type=SourceType.YOUTUBE,
+                source_url="https://youtube.com/watch?v=v_keep",
+                title="Alpha Clip",
+                metadata={},
+            )
+        )
+        db.add_video(
+            Video(
+                id="v_skip",
+                source_type=SourceType.LOCAL,
+                source_url="/tmp/video.mp4",
+                title="Beta Clip",
+                metadata={},
+            )
+        )
+
+        result = service.list_attachable_videos(playlist.id, query="alpha")
+
+        assert result == [{
+            "id": "v_keep",
+            "title": "Alpha Clip",
+            "source_type": "youtube",
+            "created_at": db.get_video("v_keep").created_at.isoformat(),
+        }]
+
     def test_skipped_step_counts_as_completed_in_by_step_and_partial(self, db):
         _setup_playlist(db, "PL_SKIP")
         _add_pl_video(db, "v_skip", playlist_id="PL_SKIP", index=1)
@@ -1916,6 +2100,17 @@ class TestPlaylistVideoSelectionContracts:
 
         assert [v.id for v in videos] == ["v_old", "v_new", "v_none"]
 
+    def test_get_playlist_videos_order_by_title_desc(self, db):
+        _setup_playlist(db, "PL_TITLE")
+        _add_pl_video(db, "v_b", playlist_id="PL_TITLE", index=1)
+        _add_pl_video(db, "v_a", playlist_id="PL_TITLE", index=2)
+        db.update_video("v_b", title="Beta")
+        db.update_video("v_a", title="Alpha")
+
+        videos = PlaylistService(db).get_playlist_videos("PL_TITLE", order_by="title", sort_order="desc")
+
+        assert [v.id for v in videos] == ["v_b", "v_a"]
+
     def test_get_pending_videos_filters_specific_target_step(self, db):
         _setup_playlist(db, "PL_STEP")
         _add_pl_video(db, "v_download_done", playlist_id="PL_STEP", index=1)
@@ -2019,6 +2214,50 @@ class TestRefreshVideosContracts:
         assert video.metadata["translated"] == {"title_translated": "已有"}
         assert "_video_info" in video.metadata
         assert video.metadata["_video_info"]["title"] == "标题A"
+        assert translate_calls == []
+
+    def test_refresh_videos_accepts_video_info_result_and_backfills_richer_fields(self, db, monkeypatch):
+        _setup_playlist(db, "PL_RICH")
+        _add_pl_video(db, "v_rich", playlist_id="PL_RICH", index=1)
+        db.update_video("v_rich", metadata={"translated": {"title_translated": "旧翻译"}})
+
+        service = PlaylistService(db)
+        service._downloader = type(
+            "FakeDownloader",
+            (),
+            {
+                "get_video_info": lambda _self, _url: VideoInfoResult(
+                    status="ok",
+                    info={
+                        "video_id": "v_rich",
+                        "url": "https://www.youtube.com/watch?v=v_rich",
+                        "title": "标题Rich",
+                        "uploader": "频道Rich",
+                        "description": "简介Rich",
+                        "duration": 321,
+                        "upload_date": "20250402",
+                        "thumbnail": "thumbRich",
+                        "view_count": 999,
+                        "like_count": 88,
+                    },
+                )
+            },
+        )()
+        translate_calls = []
+        monkeypatch.setattr(
+            service,
+            "_submit_translate_task",
+            lambda video_id, video_info, force=False: translate_calls.append((video_id, video_info, force)),
+        )
+
+        result = service.refresh_videos("PL_RICH", force_refetch=False, force_retranslate=False)
+
+        assert result == {"refreshed": 1, "skipped": 0, "failed": 0}
+        video = db.get_video("v_rich")
+        assert video.metadata["description"] == "简介Rich"
+        assert video.metadata["channel"] == "频道Rich"
+        assert video.metadata["_video_info"]["title"] == "标题Rich"
+        assert video.metadata["translated"] == {"title_translated": "旧翻译"}
         assert translate_calls == []
 
     def test_refresh_videos_merge_mode_auto_submits_translate_when_missing(self, db, monkeypatch):
