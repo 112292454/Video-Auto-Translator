@@ -30,6 +30,9 @@ from ..utils.logger import setup_logger, set_video_id
 from .exceptions import PipelineError, ASRError, TranslateError, EmbedError, DownloadError, UploadError
 from .progress import ProgressTracker, ProgressEvent
 
+
+PASSTHROUGH_CAPABLE_STEPS = {"split", "optimize", "translate"}
+
 class VideoProcessor:
     """单个视频的完整处理流程"""
     
@@ -270,14 +273,14 @@ class VideoProcessor:
         first_idx = stage_order[sorted_steps[0]]
         last_idx = stage_order[sorted_steps[-1]]
         
-        # 构建完整的阶段列表（包含中间需要直通的阶段）
+        # 构建完整的阶段列表（包含中间需要补执行/直通的阶段）
         full_steps = []
         passthrough_steps = set()
         
         for i in range(first_idx, last_idx + 1):
             stage_name = DEFAULT_STAGE_SEQUENCE[i].value
             full_steps.append(stage_name)
-            if stage_name not in user_steps:
+            if stage_name not in user_steps and stage_name in PASSTHROUGH_CAPABLE_STEPS:
                 passthrough_steps.add(stage_name)
         
         # 记录直通阶段以便后续处理

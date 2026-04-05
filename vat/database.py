@@ -641,6 +641,8 @@ class Database:
                 base_params = []
                 default_order = "ORDER BY v.created_at DESC"
             
+            satisfied_status_sql = "', '".join(SATISFIED_TASK_STATUS_VALUES)
+
             # 服务端排序：将前端列名映射到 SQL 表达式
             sort_dir = "ASC" if sort_order == "asc" else "DESC"
             SORT_COLUMN_MAP = {
@@ -652,13 +654,13 @@ class Database:
             }
             if sort_by and sort_by in SORT_COLUMN_MAP:
                 if sort_by == "progress":
-                    # 进度排序需要子查询计算 completed_count
+                    # 进度排序需要子查询计算 satisfied_count（completed/skipped）
                     order_by = f"""ORDER BY (
                         SELECT COUNT(*) FROM (
                             SELECT video_id, status,
                                    ROW_NUMBER() OVER (PARTITION BY video_id, step ORDER BY id DESC) as rn
                             FROM tasks WHERE video_id = v.id
-                        ) t WHERE t.rn = 1 AND t.status = 'completed'
+                        ) t WHERE t.rn = 1 AND t.status IN ('{satisfied_status_sql}')
                     ) {sort_dir}"""
                 else:
                     order_by = f"ORDER BY {SORT_COLUMN_MAP[sort_by]}"
@@ -689,8 +691,6 @@ class Database:
             if status:
                 # unavailable 视频的排除条件（unavailable 只在 status='unavailable' 时显示）
                 unavailable_exclude = "COALESCE(JSON_EXTRACT(v.metadata, '$.unavailable'), 0) != 1"
-                satisfied_status_sql = "', '".join(SATISFIED_TASK_STATUS_VALUES)
-                
                 # 子查询：计算每个视频的状态
                 status_subquery = f"""
                     v.id IN (

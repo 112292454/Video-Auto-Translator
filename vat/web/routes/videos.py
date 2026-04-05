@@ -114,6 +114,26 @@ def _resolve_target_playlist_id(
     raise HTTPException(400, f"无效的 playlist_mode: {playlist_mode}")
 
 
+def _validate_playlist_request(
+    request: AddVideoRequest,
+    service: PlaylistService,
+) -> None:
+    """校验 playlist 请求，但避免在 preflight 失败前产生副作用。"""
+    playlist_mode = request.playlist_mode or "none"
+    if playlist_mode == "none":
+        return
+    if playlist_mode == "default":
+        return
+    if playlist_mode == "specified":
+        if not request.playlist_id:
+            raise HTTPException(400, "选择指定 playlist 时必须提供 playlist_id")
+        playlist = service.get_playlist(request.playlist_id)
+        if not playlist:
+            raise HTTPException(404, "Playlist not found")
+        return
+    raise HTTPException(400, f"无效的 playlist_mode: {playlist_mode}")
+
+
 def _preflight_add_sources(
     sources: List[str],
     request: AddVideoRequest,
@@ -269,8 +289,9 @@ async def add_video(
     if len(sources) > 1 and request.title:
         raise HTTPException(400, "批量添加时不能指定统一标题，请留空后使用自动标题")
 
-    target_playlist_id = _resolve_target_playlist_id(request, service)
+    _validate_playlist_request(request, service)
     plans = _preflight_add_sources(sources, request, db)
+    target_playlist_id = _resolve_target_playlist_id(request, service)
     items = []
     created_video_ids = []
 

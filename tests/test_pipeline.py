@@ -385,17 +385,17 @@ class TestProcessOrchestration:
         vp._run_download.assert_not_called()
 
     def test_explicit_steps_only(self, tmp_path):
-        """只传入 download 和 embed 时，中间阶段以直通模式执行"""
+        """只传入 download 和 embed 时，仅可直通阶段标记为 skipped。"""
         vp, db = _make_vp(tmp_path)
         result = vp.process(steps=['download', 'embed'])
         assert result is True
         # download 和 embed 必须被调用
         vp._run_download.assert_called_once()
         vp._run_embed.assert_called_once()
-        # 中间阶段也被执行（直通填充）
+        # 中间阶段也被执行；仅 split/optimize/translate 属于真正直通
         vp._run_whisper.assert_called_once()
         assert db.get_task("test_vid", TaskStep.DOWNLOAD).status == TaskStatus.COMPLETED
-        assert db.get_task("test_vid", TaskStep.WHISPER).status == TaskStatus.SKIPPED
+        assert db.get_task("test_vid", TaskStep.WHISPER).status == TaskStatus.COMPLETED
         assert db.get_task("test_vid", TaskStep.SPLIT).status == TaskStatus.SKIPPED
         assert db.get_task("test_vid", TaskStep.OPTIMIZE).status == TaskStatus.SKIPPED
         assert db.get_task("test_vid", TaskStep.TRANSLATE).status == TaskStatus.SKIPPED
@@ -518,6 +518,28 @@ class TestPassthroughConfigBackupRestore:
             vp.config.translator.llm.optimize.enable,
             vp.config.translator.skip_translate,
         ) == original
+
+
+class TestPassthroughExecutionSemantics:
+    def test_non_passthrough_gap_stage_is_recorded_completed_for_download_split(self, tmp_path):
+        vp, db = _make_vp(tmp_path)
+
+        result = vp.process(steps=["download", "split"])
+
+        assert result is True
+        assert "whisper" not in vp._passthrough_stages
+        assert db.get_task("test_vid", TaskStep.WHISPER).status == TaskStatus.COMPLETED
+        assert db.get_task("test_vid", TaskStep.SPLIT).status == TaskStatus.COMPLETED
+
+    def test_non_passthrough_gap_stage_is_recorded_completed_for_translate_upload(self, tmp_path):
+        vp, db = _make_vp(tmp_path)
+
+        result = vp.process(steps=["translate", "upload"])
+
+        assert result is True
+        assert "embed" not in vp._passthrough_stages
+        assert db.get_task("test_vid", TaskStep.EMBED).status == TaskStatus.COMPLETED
+        assert db.get_task("test_vid", TaskStep.UPLOAD).status == TaskStatus.COMPLETED
 
 
 class TestConfigIsolationContracts:

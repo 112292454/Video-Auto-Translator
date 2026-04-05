@@ -970,14 +970,19 @@ def _auto_season_sync(config, db, logger, playlist_id: str, retry_delay_minutes:
         bilibili_config = config.uploader.bilibili
         project_root = Path(__file__).parent.parent.parent
         cookies_file = project_root / bilibili_config.cookies_file
+        storage_config = getattr(config, "storage", None)
+        concurrency_config = getattr(config, "concurrency", None)
+        lock_db_path = getattr(storage_config, "database_path", "")
+        upload_interval = getattr(bilibili_config, "upload_interval", 0)
+        max_concurrent_uploads = getattr(concurrency_config, "max_concurrent_uploads", 1)
         
         uploader = BilibiliUploader(
             cookies_file=str(cookies_file),
             line=bilibili_config.line,
             threads=bilibili_config.threads,
-            lock_db_path=config.storage.database_path,
-            upload_interval=bilibili_config.upload_interval,
-            max_concurrent_uploads=getattr(config.concurrency, "max_concurrent_uploads", 1),
+            lock_db_path=lock_db_path,
+            upload_interval=upload_interval,
+            max_concurrent_uploads=max_concurrent_uploads,
         )
         
         # 第一次尝试
@@ -1006,9 +1011,9 @@ def _auto_season_sync(config, db, logger, playlist_id: str, retry_delay_minutes:
             cookies_file=str(cookies_file),
             line=bilibili_config.line,
             threads=bilibili_config.threads,
-            lock_db_path=config.storage.database_path,
-            upload_interval=bilibili_config.upload_interval,
-            max_concurrent_uploads=getattr(config.concurrency, "max_concurrent_uploads", 1),
+            lock_db_path=lock_db_path,
+            upload_interval=upload_interval,
+            max_concurrent_uploads=max_concurrent_uploads,
         )
         
         logger.info(f"=== Season Sync: 第2次尝试 (playlist={playlist_id}) ===")

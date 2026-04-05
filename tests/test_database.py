@@ -373,6 +373,18 @@ class TestListVideosPaginated:
         assert result['total'] == 1
         assert result['videos'][0].id == "v1"
 
+    def test_sort_progress_counts_skipped_as_satisfied(self, db):
+        _add_video(db, "v_done")
+        _add_video(db, "v_skip")
+        db.add_task(Task(video_id="v_done", step=TaskStep.DOWNLOAD, status=TaskStatus.COMPLETED))
+        db.add_task(Task(video_id="v_skip", step=TaskStep.DOWNLOAD, status=TaskStatus.COMPLETED))
+        db.add_task(Task(video_id="v_skip", step=TaskStep.WHISPER, status=TaskStatus.SKIPPED))
+
+        result = db.list_videos_paginated(sort_by="progress", sort_order="desc", page=1, per_page=10)
+        ordered_ids = [video.id for video in result["videos"]]
+
+        assert ordered_ids.index("v_skip") < ordered_ids.index("v_done")
+
 
 # ==================== Batch Progress ====================
 

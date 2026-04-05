@@ -289,3 +289,47 @@ class TestVideosApiProgress:
         assert "已存在" in response.json()["detail"]
         assert created_sources == []
         assert [video.id for video in fake_db.videos] == ["yt-existing"]
+
+    @pytest.mark.anyio
+    async def test_add_video_default_playlist_not_created_when_preflight_fails(self, app, client, monkeypatch):
+        fake_db = _FakeDb()
+        fake_db.videos = [
+            Video(
+                id="yt-existing",
+                source_type=SourceType.YOUTUBE,
+                source_url="https://www.youtube.com/watch?v=dup",
+                title="Already There",
+                metadata={},
+            )
+        ]
+        service = _FakePlaylistService()
+
+        app.include_router(router)
+        app.dependency_overrides[get_db] = lambda: fake_db
+        app.dependency_overrides[get_playlist_service] = lambda: service
+        monkeypatch.setattr(
+            "vat.web.routes.videos.detect_source_type",
+            lambda source: SourceType.YOUTUBE if "youtube.com" in source else SourceType.LOCAL,
+        )
+        monkeypatch.setattr(
+            "vat.web.routes.videos.resolve_video_identity_from_source",
+            lambda source, source_type: (
+                source,
+                "yt-existing" if source.endswith("dup") else f"id::{source}",
+            ),
+        )
+
+        async with client as ac:
+            response = await ac.post(
+                "/api/videos",
+                json={
+                    "sources": [
+                        "/tmp/demo.mp4",
+                        "https://www.youtube.com/watch?v=dup",
+                    ],
+                    "playlist_mode": "default",
+                },
+            )
+
+        assert response.status_code == 409
+        assert service.default_playlist_calls == 0
