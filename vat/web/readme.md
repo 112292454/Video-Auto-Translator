@@ -17,7 +17,7 @@
 | `deps.py` | 依赖注入（Database 单例） |
 | `routes/` | API 路由模块（按功能拆分） |
 | `templates/` | Jinja2 HTML 模板 |
-| `services/` | Web 层业务服务（预留） |
+| `services/` | Web 层业务服务（当前包含测试中心的检测/配置编辑逻辑） |
 
 ---
 
@@ -38,6 +38,7 @@ FastAPI (app.py)
   │    ├─ /tasks/new            → task_new.html
   │    ├─ /bilibili             → bilibili.html
   │    ├─ /prompts              → prompts.html
+  │    ├─ /test                 → test_center.html
   │    ├─ /watch                → watch.html
   │    └─ /database             → database.html
   │
@@ -48,6 +49,7 @@ FastAPI (app.py)
   │    ├─ files.py              → /api/files/...
   │    ├─ bilibili.py           → /bilibili/...
   │    ├─ prompts.py            → /api/prompts/...
+  │    ├─ test_center.py        → /api/test-center/...
   │    ├─ watch.py              → /api/watch/...
   │    └─ database.py           → /api/database/...
   │
@@ -69,6 +71,7 @@ FastAPI (app.py)
 | `files.py` | `/api/files` | 字幕文件查看/编辑、视频文件服务 |
 | `bilibili.py` | `/bilibili` | B 站合集管理、违规修复、单视频/整合集元信息同步 |
 | `prompts.py` | `/api/prompts` | 提示词查看/编辑（热重载） |
+| `test_center.py` | `/api/test-center` | LLM 接口测试、真实 Prompt 预览、主配置编辑/备份恢复、ffmpeg/Whisper/视频探测 |
 | `watch.py` | `/api/watch` | Watch 会话管理（启动/停止/删除/轮次查询） |
 | `database.py` | `/api/database` | 数据库只读浏览（表列表/分页查询/行详情） |
 
@@ -118,12 +121,32 @@ JobManager 通过轮询子进程 stdout 解析标准化标记：
 | `task_detail.html` | 任务详情（实时日志） |
 | `bilibili.html` | B 站管理（合集、批量同步、违规修复） |
 | `prompts.html` | 提示词编辑器 |
+| `test_center.html` | 测试中心（接口连通性、配置编辑、环境自检） |
 | `watch.html` | Watch 模式管理（会话列表、轮次详情、新建/停止/删除） |
 | `database.html` | 数据库浏览（表列表、分页查询、行详情弹窗） |
 
 ---
 
-## 6. 启动方式
+## 6. 测试中心说明
+
+测试中心的目标不是承载正式业务，而是把“安装/配置/环境/提示词”这类排查动作集中到一个独立页面，方便非专业用户和开发者自检。
+
+当前包含：
+
+- LLM 接口测试：按各阶段的有效配置解析后发送最小请求，检查接口是否能返回
+- Prompt 预览：直接复用 split / translate / optimize / scene_identify / video_info_translate 的真实 request builder，展示最终发出去的 model / proxy / messages
+- 配置编辑：同时支持主配置与 `config/upload.yaml` 原文编辑；保存前自动备份，主配置保存后会重载 Web runtime、LLM client cache 与 prompt cache
+- 环境检测：ffmpeg / ffprobe、硬件加速与 NVENC 信息、样例视频探测、音频提取、Whisper 模型来源/缓存/GPU/加载/最小推理、视频文件信息检查
+
+配置保护策略：
+
+- 不把 YAML 转成表单后再回写，避免丢注释或重排结构
+- 每次保存主配置或 upload 配置前都创建时间戳备份，可在页面直接恢复
+- 页面额外展示基于 `config/default.yaml` 注释和 starter config 生成的参考项，便于查看字段说明、示例和当前值
+
+---
+
+## 7. 启动方式
 
 ```bash
 # 开发模式

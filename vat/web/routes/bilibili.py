@@ -11,7 +11,6 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from ...config import load_config
 from ...database import Database
 from ...uploaders.bilibili import BilibiliUploader
 from ...services.bilibili_workflows import (
@@ -21,7 +20,7 @@ from ...services.bilibili_workflows import (
 from ...uploaders.upload_config import get_upload_config_manager, UploadConfigManager
 from ...embedder.ffmpeg_wrapper import FFmpegWrapper
 from ...utils.logger import setup_logger
-from ..deps import get_db
+from ..deps import get_db, get_web_config
 
 logger = setup_logger("web.bilibili")
 
@@ -79,7 +78,7 @@ def _get_uploader(with_upload_params: bool = False) -> BilibiliUploader:
     Args:
         with_upload_params: 是否包含上传参数（line/threads），上传/替换视频时需要
     """
-    config = load_config()
+    config = get_web_config()
     project_root = _get_project_root()
     cookies_file = project_root / config.uploader.bilibili.cookies_file
     kwargs = {'cookies_file': str(cookies_file)}
@@ -91,7 +90,7 @@ def _get_uploader(with_upload_params: bool = False) -> BilibiliUploader:
 
 def _get_cookies_path() -> Path:
     """获取 cookie 文件路径"""
-    config = load_config()
+    config = get_web_config()
     project_root = _get_project_root()
     return project_root / config.uploader.bilibili.cookies_file
 
@@ -148,8 +147,7 @@ async def bilibili_settings_page(request: Request):
         'custom_vars': bilibili_config.templates.custom_vars,
     }
     
-    return templates.TemplateResponse("bilibili.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "bilibili.html", {
         "login_status": login_status,
         "seasons": seasons,
         "config": {
@@ -396,7 +394,7 @@ def _find_local_video(aid: int) -> Optional[Path]:
     """
     import re
     
-    config = load_config()
+    config = get_web_config()
     db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
     
     yt_video_id = None  # 记录提取到的 YouTube video ID，供后续 fallback 使用
@@ -524,7 +522,7 @@ def _download_from_bilibili(aid: int, bvid: str) -> Optional[Path]:
     ]
     
     # 添加代理（B站不需要代理，但保留以防特殊网络环境）
-    config = load_config()
+    config = get_web_config()
     proxy = config.get_stage_proxy('downloader') if hasattr(config, 'get_stage_proxy') else None
     if proxy:
         cmd.extend(["--proxy", proxy])
@@ -706,7 +704,7 @@ async def resync_video_info_route(aid: int):
     try:
         from ...services.bilibili_workflows import resync_video_info
         
-        config = load_config()
+        config = get_web_config()
         db = get_db()
         uploader = _get_uploader(with_upload_params=False)
         
@@ -732,7 +730,7 @@ async def resync_video_info_route(aid: int):
 async def resync_season_info_route(season_id: int):
     """按合集批量刷新视频元信息（标题/简介/标签/分区）"""
     try:
-        config = load_config()
+        config = get_web_config()
         db = get_db()
         uploader = _get_uploader(with_upload_params=False)
 

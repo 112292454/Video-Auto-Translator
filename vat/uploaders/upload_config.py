@@ -24,6 +24,21 @@ class UploadTemplates:
     description: str = "${translated_desc}"
     custom_vars: Dict[str, str] = field(default_factory=dict)
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "UploadTemplates":
+        return cls(
+            title=data.get('title', '${translated_title}'),
+            description=data.get('description', '${translated_desc}'),
+            custom_vars=data.get('custom_vars', {}) or {},
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'title': self.title,
+            'description': self.description,
+            'custom_vars': self.custom_vars,
+        }
+
 
 @dataclass
 class BilibiliUploadConfig:
@@ -35,6 +50,19 @@ class BilibiliUploadConfig:
     cover_source: str = "thumbnail"
     season_id: Optional[int] = None
     templates: UploadTemplates = field(default_factory=UploadTemplates)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "BilibiliUploadConfig":
+        templates = UploadTemplates.from_dict(data.get('templates', {}) or {})
+        return cls(
+            copyright=data.get('copyright', 2),
+            default_tid=data.get('default_tid', 21),
+            default_tags=data.get('default_tags', ['VTuber', '日本']),
+            auto_cover=data.get('auto_cover', True),
+            cover_source=data.get('cover_source', 'thumbnail'),
+            season_id=data.get('season_id'),
+            templates=templates,
+        )
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -45,11 +73,7 @@ class BilibiliUploadConfig:
             'auto_cover': self.auto_cover,
             'cover_source': self.cover_source,
             'season_id': self.season_id,
-            'templates': {
-                'title': self.templates.title,
-                'description': self.templates.description,
-                'custom_vars': self.templates.custom_vars,
-            }
+            'templates': self.templates.to_dict(),
         }
 
 
@@ -57,6 +81,12 @@ class BilibiliUploadConfig:
 class UploadConfig:
     """完整上传配置"""
     bilibili: BilibiliUploadConfig = field(default_factory=BilibiliUploadConfig)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "UploadConfig":
+        return cls(
+            bilibili=BilibiliUploadConfig.from_dict(data.get('bilibili', {}) or {}),
+        )
     
     def to_dict(self) -> Dict[str, Any]:
         return {'bilibili': self.bilibili.to_dict()}
@@ -83,27 +113,8 @@ class UploadConfigManager:
         try:
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 data = yaml.safe_load(f) or {}
-            
-            bilibili_data = data.get('bilibili', {})
-            templates_data = bilibili_data.pop('templates', {})
-            
-            templates = UploadTemplates(
-                title=templates_data.get('title', '${translated_title}'),
-                description=templates_data.get('description', '${translated_desc}'),
-                custom_vars=templates_data.get('custom_vars', {}),
-            )
-            
-            bilibili = BilibiliUploadConfig(
-                copyright=bilibili_data.get('copyright', 2),
-                default_tid=bilibili_data.get('default_tid', 21),
-                default_tags=bilibili_data.get('default_tags', ['VTuber', '日本']),
-                auto_cover=bilibili_data.get('auto_cover', True),
-                cover_source=bilibili_data.get('cover_source', 'thumbnail'),
-                season_id=bilibili_data.get('season_id'),
-                templates=templates,
-            )
-            
-            self._config = UploadConfig(bilibili=bilibili)
+
+            self._config = UploadConfig.from_dict(data)
             # logger.debug(f"上传配置已加载: {self.config_path}")
             return self._config
             

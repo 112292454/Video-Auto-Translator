@@ -1,6 +1,6 @@
 import difflib
 import re
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from vat.llm import call_llm
 from vat.llm.prompts import get_prompt
@@ -30,6 +30,62 @@ def _get_next_model(current_model: str, upgrade_chain: List[str]) -> str | None:
         # 当前模型不在升级链中，不升级
         pass
     return None
+
+
+def _inject_scene_prompt(system_prompt: str, scene_prompt: str) -> str:
+    """将场景提示词插入 split system prompt。"""
+    if not scene_prompt:
+        return system_prompt
+
+    insert_marker = "</instructions>"
+    scene_block = f"\n\n<scene_specific>\n{scene_prompt.strip()}\n</scene_specific>"
+    if insert_marker in system_prompt:
+        return system_prompt.replace(insert_marker, insert_marker + scene_block)
+    return f"{system_prompt}{scene_block}"
+
+
+def build_split_llm_request(
+    *,
+    text: str,
+    model: str,
+    max_word_count_cjk: int,
+    max_word_count_english: int,
+    min_word_count_cjk: int,
+    min_word_count_english: int,
+    recommend_word_count_cjk: int = 12,
+    recommend_word_count_english: int = 8,
+    scene_prompt: str = "",
+    mode: str = "sentence",
+    api_key: str = "",
+    base_url: str = "",
+    proxy: str = "",
+) -> Dict[str, Any]:
+    """构建 split 阶段真实发送的 LLM 请求。"""
+    assert text, "调用契约错误: text 不能为空"
+    prompt_path = f"split/{mode}"
+    system_prompt = get_prompt(
+        prompt_path,
+        max_word_count_cjk=max_word_count_cjk,
+        max_word_count_english=max_word_count_english,
+        min_word_count_cjk=min_word_count_cjk,
+        min_word_count_english=min_word_count_english,
+        recommend_word_count_cjk=recommend_word_count_cjk,
+        recommend_word_count_english=recommend_word_count_english,
+    )
+    system_prompt = _inject_scene_prompt(system_prompt, scene_prompt)
+    user_prompt = f"Please use multiple <br> tags to separate the following sentence:\n{text}"
+    return {
+        "stage": "split",
+        "model": model,
+        "temperature": 0.1,
+        "api_key": api_key,
+        "base_url": base_url,
+        "proxy": proxy,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
 
 
 def split_by_llm(
@@ -132,51 +188,33 @@ def _split_with_agent_loop(
     Returns:
         (result, success): 断句结果和是否成功
     """
-    assert text, "调用契约错误: text 不能为空"
-    prompt_path = f"split/{mode}"
-    system_prompt = get_prompt(
-        prompt_path,
+    request = build_split_llm_request(
+        text=text,
+        model=model,
         max_word_count_cjk=max_word_count_cjk,
         max_word_count_english=max_word_count_english,
         min_word_count_cjk=min_word_count_cjk,
         min_word_count_english=min_word_count_english,
         recommend_word_count_cjk=recommend_word_count_cjk,
         recommend_word_count_english=recommend_word_count_english,
+        scene_prompt=scene_prompt,
+        mode=mode,
+        api_key=api_key,
+        base_url=base_url,
+        proxy=proxy,
     )
-    
-    # 插入场景特定提示词（如果有）
-    if scene_prompt:
-        # 在 </instructions> 之后插入场景提示词
-        insert_marker = "</instructions>"
-        if insert_marker in system_prompt:
-            scene_block = f"\n\n<scene_specific>\n{scene_prompt.strip()}\n</scene_specific>"
-            system_prompt = system_prompt.replace(
-                insert_marker, 
-                insert_marker + scene_block
-            )
-        else:
-            # 如果没有找到标记，追加到末尾
-            system_prompt = f"{system_prompt}\n\n<scene_specific>\n{scene_prompt.strip()}\n</scene_specific>"
-
-    user_prompt = (
-        f"Please use multiple <br> tags to separate the following sentence:\n{text}"
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+    messages = list(request["messages"])
 
     last_result = None
 
     for step in range(MAX_STEPS):
         response = call_llm(
             messages=messages,
-            model=model,
-            temperature=0.1,
-            api_key=api_key,
-            base_url=base_url,
-            proxy=proxy,
+            model=request["model"],
+            temperature=request["temperature"],
+            api_key=request["api_key"],
+            base_url=request["base_url"],
+            proxy=request["proxy"],
         )
 
         if not response or not response.choices:

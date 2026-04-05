@@ -96,6 +96,63 @@ class LLMTranslator(BaseTranslator):
         # 处理过程中的非致命警告（由 pipeline 读取并写入 processing_notes）
         self._processing_warnings: List[str] = []
 
+    def build_optimize_llm_request(self, subtitle_chunk: Dict[str, str]) -> Dict[str, Any]:
+        """构建 optimize 阶段真实发送的 LLM 请求。"""
+        prompt = get_prompt("optimize/subtitle")
+        user_prompt = (
+            "Correct the following subtitles. Keep the original language, do not translate:\n"
+            f"<input_subtitle>{json.dumps(subtitle_chunk, ensure_ascii=False)}</input_subtitle>"
+        )
+        if self.optimize_prompt:
+            user_prompt += f"\nReference content:\n<reference>{self.optimize_prompt}</reference>"
+
+        return {
+            "stage": "optimize",
+            "model": self.optimize_model,
+            "temperature": 0.2,
+            "api_key": self.optimize_api_key,
+            "base_url": self.optimize_base_url,
+            "proxy": self.optimize_proxy,
+            "expected_keys": set(subtitle_chunk.keys()),
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+
+    def build_translate_llm_request(
+        self,
+        subtitle_chunk: List[SubtitleProcessData],
+    ) -> Dict[str, Any]:
+        """构建 translate 阶段真实发送的 LLM 请求。"""
+        subtitle_dict = {str(data.index): data.original_text for data in subtitle_chunk}
+        if self.is_reflect:
+            prompt = get_prompt(
+                "translate/reflect",
+                target_language=self.target_language.value,
+                custom_prompt=self.custom_prompt,
+            )
+        else:
+            prompt = get_prompt(
+                "translate/standard",
+                target_language=self.target_language.value,
+                custom_prompt=self.custom_prompt,
+            )
+        user_input = self._build_input_with_context(subtitle_dict)
+        return {
+            "stage": "translate",
+            "model": self.model,
+            "temperature": 1.0,
+            "api_key": self.api_key,
+            "base_url": self.base_url,
+            "proxy": self.proxy,
+            "expected_keys": set(subtitle_dict.keys()),
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_input},
+            ],
+        }
+
     def translate_subtitle(self, subtitle_data: ASRData) -> ASRData:
         """翻译字幕文件（集成可选的优化前置步骤）"""
         try:
@@ -218,20 +275,8 @@ class LLMTranslator(BaseTranslator):
         end_idx = next(reversed(subtitle_chunk))
         logger.debug(f"正在优化字幕：{start_idx} - {end_idx}")
         
-        prompt = get_prompt("optimize/subtitle")
-        
-        user_prompt = (
-            f"Correct the following subtitles. Keep the original language, do not translate:\n"
-            f"<input_subtitle>{json.dumps(subtitle_chunk, ensure_ascii=False)}</input_subtitle>"
-        )
-
-        if self.optimize_prompt:
-            user_prompt += f"\nReference content:\n<reference>{self.optimize_prompt}</reference>"
-
-        messages = [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": user_prompt},
-        ]
+        request = self.build_optimize_llm_request(subtitle_chunk)
+        messages = list(request["messages"])
 
         last_result = subtitle_chunk
         
@@ -239,9 +284,12 @@ class LLMTranslator(BaseTranslator):
         for step in range(self.MAX_STEPS):
             try:
                 response = call_llm(
-                    messages=messages, model=self.optimize_model, temperature=0.2,
-                    api_key=self.optimize_api_key, base_url=self.optimize_base_url,
-                    proxy=self.optimize_proxy,
+                    messages=messages,
+                    model=request["model"],
+                    temperature=request["temperature"],
+                    api_key=request["api_key"],
+                    base_url=request["base_url"],
+                    proxy=request["proxy"],
                 )
                 
                 result_text = response.choices[0].message.content
@@ -441,27 +489,13 @@ class LLMTranslator(BaseTranslator):
             f"正在翻译字幕：{subtitle_chunk[0].index} - {subtitle_chunk[-1].index}"
         )
 
-        subtitle_dict = {str(data.index): data.original_text for data in subtitle_chunk}
-
-        # 获取提示词
-        if self.is_reflect:
-            prompt = get_prompt(
-                "translate/reflect",
-                target_language=self.target_language,
-                custom_prompt=self.custom_prompt,
-            )
-        else:
-            prompt = get_prompt(
-                "translate/standard",
-                target_language=self.target_language,
-                custom_prompt=self.custom_prompt,
-            )
-
         try:
-            # 构建带上下文的输入（新增）
-            user_input = self._build_input_with_context(subtitle_dict)
-            
-            result_dict = self._agent_loop(prompt, user_input, expected_keys=set(subtitle_dict.keys()))
+            request = self.build_translate_llm_request(subtitle_chunk)
+            result_dict = self._agent_loop(
+                request["messages"][0]["content"],
+                request["messages"][1]["content"],
+                expected_keys=request["expected_keys"],
+            )
 
             # 处理反思翻译模式的结果
             if self.is_reflect and isinstance(result_dict, dict):
@@ -510,28 +544,24 @@ class LLMTranslator(BaseTranslator):
                 logger.error(f"降级翻译也失败: {str(fallback_error)}")
                 raise RuntimeError(f"翻译失败且降级处理也失败: {str(e)}") from e
 
-    def _agent_loop(
-        self, 
-        system_prompt: str, 
-        user_input: str,
-        expected_keys: Optional[set] = None
-    ) -> Dict[str, str]:
-        """Agent loop翻译/优化字幕块"""
-        assert system_prompt, "调用契约错误: system_prompt 不能为空"
-        assert user_input, "调用契约错误: user_input 不能为空"
-        
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_input},
-        ]
+    def _agent_loop_request(self, request: Dict[str, Any]) -> Dict[str, str]:
+        """基于预构造 request 执行 agent loop。"""
+        messages = [dict(message) for message in request["messages"]]
+        assert messages, "调用契约错误: messages 不能为空"
+        expected_keys = request.get("expected_keys")
         last_response_dict = None
         
         for _ in range(self.MAX_STEPS):
-            response = call_llm(
-                messages=messages, model=self.model,
-                api_key=self.api_key, base_url=self.base_url,
-                proxy=self.proxy,
-            )
+            call_kwargs = {
+                "messages": messages,
+                "model": request["model"],
+                "api_key": request["api_key"],
+                "base_url": request["base_url"],
+                "proxy": request["proxy"],
+            }
+            if "temperature" in request:
+                call_kwargs["temperature"] = request["temperature"]
+            response = call_llm(**call_kwargs)
             if not response or not response.choices:
                 raise RuntimeError("LLM 未返回有效响应")
             
@@ -561,6 +591,28 @@ class LLMTranslator(BaseTranslator):
                 })
 
         return last_response_dict
+
+    def _agent_loop(
+        self,
+        system_prompt: str,
+        user_input: str,
+        expected_keys: Optional[set] = None,
+    ) -> Dict[str, str]:
+        """兼容旧调用点的 agent loop 包装。"""
+        assert system_prompt, "调用契约错误: system_prompt 不能为空"
+        assert user_input, "调用契约错误: user_input 不能为空"
+        request = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_input},
+            ],
+            "model": self.model,
+            "api_key": self.api_key,
+            "base_url": self.base_url,
+            "proxy": self.proxy,
+            "expected_keys": expected_keys,
+        }
+        return self._agent_loop_request(request)
 
     def _validate_llm_response(
         self, response_dict: Any, expected_keys: set
@@ -619,7 +671,7 @@ class LLMTranslator(BaseTranslator):
         逐条翻译字幕。翻译不允许部分失败：任何一条失败即立即抛出异常。
         """
         single_prompt = get_prompt(
-            "translate/single", target_language=self.target_language
+            "translate/single", target_language=self.target_language.value
         )
 
         for data in subtitle_chunk:
