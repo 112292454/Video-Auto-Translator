@@ -11,23 +11,76 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from ...config import load_config
 from ...database import Database
-from ...uploaders.bilibili import BilibiliUploader, resync_season_video_infos
+from ...uploaders.bilibili import BilibiliUploader
+from ...services.bilibili_workflows import (
+    resync_season_video_infos,
+    sync_season_episode_titles_with_recovery,
+)
+from ...services.bilibili_support import (
+    build_bilibili_uploader,
+    find_local_video_for_aid,
+    resolve_video_file,
+)
 from ...uploaders.upload_config import get_upload_config_manager, UploadConfigManager
 from ...embedder.ffmpeg_wrapper import FFmpegWrapper
 from ...utils.logger import setup_logger
+from ..deps import get_db, get_web_config
+from ..jobs import JobStatus
+from .job_support import build_job_status_payload, submit_or_reuse_job
 
 logger = setup_logger("web.bilibili")
 
-# 审核修复任务状态（内存存储，key=aid）
-_fix_tasks: Dict[int, Dict[str, Any]] = {}
-
 router = APIRouter(prefix="/bilibili", tags=["bilibili"])
+
+_BILIBILI_ACTIVE_STATUSES = [JobStatus.PENDING, JobStatus.RUNNING]
+_FIX_STATUS_MAP = {
+    'pending': 'pending',
+    'running': 'masking',
+    'completed': 'completed',
+    'failed': 'failed',
+    'cancelled': 'cancelled',
+}
 
 # 模板目录
 templates_dir = Path(__file__).parent.parent / "templates"
 templates = Jinja2Templates(directory=str(templates_dir))
+
+
+def _get_job_manager():
+    """获取统一的 JobManager 实例。"""
+    from .tasks import get_job_manager
+    return get_job_manager()
+
+
+def _find_latest_bilibili_job(task_type: str, task_params_subset: Dict[str, Any]):
+    """按 task_type + task_params 子集反查最近的 B站后台任务。"""
+    jm = _get_job_manager()
+    return jm.find_latest_job(
+        task_type=task_type,
+        task_params_subset=task_params_subset,
+    )
+
+
+
+
+def _build_bilibili_job_payload(task_type: str, task_params_subset: Dict[str, Any], *, status_map: Optional[Dict[str, str]] = None):
+    """统一构造 B 站 tools job 的状态 payload。"""
+    job = _find_latest_bilibili_job(task_type, task_params_subset)
+    if not job:
+        return None
+    return build_job_status_payload(_get_job_manager(), job.job_id, status_map=status_map)
+
+
+def _derive_fix_status(aid: int) -> Optional[str]:
+    """根据 web_jobs 反查修复状态，供 rejected 列表展示。"""
+    payload = _build_bilibili_job_payload("fix-violation", {"aid": aid}, status_map=_FIX_STATUS_MAP)
+    if not payload:
+        return None
+    status = payload.get("status")
+    if status in ('completed', 'failed'):
+        return None
+    return status
 
 
 def _get_project_root() -> Path:
@@ -37,23 +90,21 @@ def _get_project_root() -> Path:
 
 def _get_uploader(with_upload_params: bool = False) -> BilibiliUploader:
     """获取 B站上传器实例
-    
+
     Args:
         with_upload_params: 是否包含上传参数（line/threads），上传/替换视频时需要
     """
-    config = load_config()
-    project_root = _get_project_root()
-    cookies_file = project_root / config.uploader.bilibili.cookies_file
-    kwargs = {'cookies_file': str(cookies_file)}
-    if with_upload_params:
-        kwargs['line'] = config.uploader.bilibili.line
-        kwargs['threads'] = config.uploader.bilibili.threads
-    return BilibiliUploader(**kwargs)
+    config = get_web_config()
+    return build_bilibili_uploader(
+        config,
+        with_upload_params=with_upload_params,
+        project_root=_get_project_root(),
+    )
 
 
 def _get_cookies_path() -> Path:
     """获取 cookie 文件路径"""
-    config = load_config()
+    config = get_web_config()
     project_root = _get_project_root()
     return project_root / config.uploader.bilibili.cookies_file
 
@@ -110,8 +161,7 @@ async def bilibili_settings_page(request: Request):
         'custom_vars': bilibili_config.templates.custom_vars,
     }
     
-    return templates.TemplateResponse("bilibili.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "bilibili.html", {
         "login_status": login_status,
         "seasons": seasons,
         "config": {
@@ -317,14 +367,8 @@ async def list_rejected_videos(keyword: str = ""):
                 })
             
             fixable = bool(all_ranges) and not is_full
-            
-            # 如果视频仍在退回列表中，说明 B站当前状态就是"退回"
-            # 之前 completed/failed 的修复任务已过时，清除旧状态以允许重新修复
-            old_status = _fix_tasks.get(v['aid'], {}).get('status')
-            if old_status in ('completed', 'failed'):
-                _fix_tasks.pop(v['aid'], None)
-                old_status = None
-            
+            fix_status = _derive_fix_status(v['aid'])
+
             result.append({
                 'aid': v['aid'],
                 'bvid': v['bvid'],
@@ -334,7 +378,7 @@ async def list_rejected_videos(keyword: str = ""):
                 'all_ranges': all_ranges,
                 'is_full_video': is_full,
                 'fixable': fixable,
-                'fix_status': old_status,
+                'fix_status': fix_status,
             })
         
         return JSONResponse({"success": True, "videos": result})
@@ -344,109 +388,16 @@ async def list_rejected_videos(keyword: str = ""):
 
 
 def _find_local_video(aid: int) -> Optional[Path]:
-    """
-    根据 aid 查找本地视频文件路径。
-    
-    查找策略（按优先级）：
-    1. 从 B站稿件 source URL 提取 YouTube video ID → DB 查找视频记录 → 本地 final.mp4
-    2. DB 中通过 bilibili_aid 匹配 → 本地 final.mp4
-    3. 通过 B站稿件标题匹配 DB 翻译标题 → 本地 final.mp4
-    4. 直接按 YouTube video ID 查找 output 目录
-    
-    Returns:
-        找到的本地视频文件路径，或 None
-    """
-    import re
-    
-    config = load_config()
+    """根据 aid 查找本地视频文件路径。"""
+    config = get_web_config()
     db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
-    
-    yt_video_id = None  # 记录提取到的 YouTube video ID，供后续 fallback 使用
-    bili_title = None    # B站稿件标题，用于标题匹配
-    
-    # 方法1: 从 B站稿件 source / desc 提取 YouTube video ID → DB 匹配
-    try:
-        uploader = _get_uploader()
-        detail = uploader.get_archive_detail(aid)
-        if detail:
-            archive = detail.get('archive', {})
-            bili_title = archive.get('title', '')
-            # 从 source 字段和 desc 字段中搜索 YouTube URL
-            # 注意：创作中心 API 的 desc 截断到 250 字符，需补充公共 API 获取完整 desc
-            source = archive.get('source', '')
-            desc = archive.get('desc', '')
-            full_desc = uploader._get_full_desc(aid)
-            for text in [source, full_desc or desc, desc]:
-                yt_match = re.search(r'youtube\.com/watch\?v=([a-zA-Z0-9_-]+)', text)
-                if yt_match:
-                    yt_video_id = yt_match.group(1)
-                    break
-            
-            if yt_video_id:
-                logger.info(f"稿件 av{aid} 对应 YouTube 视频: {yt_video_id}")
-                
-                video = db.get_video(yt_video_id)
-                if video:
-                    path = _resolve_video_file(video, config)
-                    if path:
-                        logger.info(f"通过 YouTube ID 找到本地视频: {path}")
-                        return path
-    except Exception as e:
-        logger.warning(f"通过 source URL 查找视频失败: {e}")
-    
-    # 方法2: DB 中通过 bilibili_aid 匹配
-    # 方法3: 通过 B站稿件标题匹配 DB 翻译标题
-    # 合并遍历 list_videos，避免重复查询
-    videos = db.list_videos()
-    for v in videos:
-        meta = v.metadata or {}
-        
-        # 方法2: bilibili_aid
-        if str(meta.get('bilibili_aid', '')) == str(aid):
-            path = _resolve_video_file(v, config)
-            if path:
-                logger.info(f"通过 bilibili_aid 找到本地视频: {path}")
-                return path
-    
-    # 方法3: 标题匹配（B站稿件标题通常是我们上传时的翻译标题）
-    if bili_title:
-        # 从 B站标题中提取核心部分（去掉 " | #N" 等上传模板后缀）
-        clean_title = re.sub(r'\s*\|\s*#\d+\s*$', '', bili_title).strip()
-        for v in videos:
-            meta = v.metadata or {}
-            translated = meta.get('translated', {})
-            t_title = translated.get('title_translated', '') if translated else ''
-            if t_title and clean_title and (clean_title in t_title or t_title in clean_title):
-                path = _resolve_video_file(v, config)
-                if path:
-                    logger.info(f"通过标题匹配找到本地视频: '{clean_title}' → {v.id}, {path}")
-                    return path
-    
-    # 方法4: 如果有 YouTube video ID，直接查找 output 目录（可能 DB 记录已删但文件还在）
-    if yt_video_id:
-        vid_dir = Path(config.storage.output_dir) / yt_video_id
-        for name in ['final.mp4', f'{yt_video_id}.mp4']:
-            candidate = vid_dir / name
-            if candidate.exists():
-                logger.info(f"通过 output 目录直接找到视频: {candidate}")
-                return candidate
-    
-    return None
+    uploader = _get_uploader()
+    return find_local_video_for_aid(aid, config, db, uploader)
 
 
 def _resolve_video_file(video, config) -> Optional[Path]:
     """从视频记录解析本地视频文件路径（final.mp4 优先）"""
-    candidates = []
-    if video.output_dir:
-        candidates.append(Path(video.output_dir) / "final.mp4")
-    vid_dir = Path(config.storage.output_dir) / video.id
-    candidates.append(vid_dir / "final.mp4")
-    candidates.append(vid_dir / f"{video.id}.mp4")
-    
-    for c in candidates:
-        if c.exists():
-            return c
-    return None
+    return resolve_video_file(video, config)
 
 
 def _download_from_bilibili(aid: int, bvid: str) -> Optional[Path]:
@@ -486,7 +437,7 @@ def _download_from_bilibili(aid: int, bvid: str) -> Optional[Path]:
     ]
     
     # 添加代理（B站不需要代理，但保留以防特殊网络环境）
-    config = load_config()
+    config = get_web_config()
     proxy = config.get_stage_proxy('downloader') if hasattr(config, 'get_stage_proxy') else None
     if proxy:
         cmd.extend(["--proxy", proxy])
@@ -526,18 +477,17 @@ async def fix_rejected_video(aid: int, request: Request):
     - 优先本地文件，降级从 B站下载
     """
     try:
-        from .tasks import get_job_manager
-        jm = get_job_manager()
+        jm = _get_job_manager()
         
         # 检查是否已有任务在运行
-        existing_job_id = _fix_tasks.get(aid, {}).get('job_id')
-        if existing_job_id:
-            jm.update_job_status(existing_job_id)
-            existing_job = jm.get_job(existing_job_id)
+        existing_job = _find_latest_bilibili_job("fix-violation", {"aid": aid})
+        if existing_job:
+            jm.update_job_status(existing_job.job_id)
+            existing_job = jm.get_job(existing_job.job_id)
             if existing_job and existing_job.status.value == 'running':
                 return JSONResponse({
                     "success": False,
-                    "error": f"aid={aid} 已有修复任务在运行 (job={existing_job_id})"
+                    "error": f"aid={aid} 已有修复任务在运行 (job={existing_job.job_id})"
                 })
         
         body = await request.json()
@@ -563,20 +513,18 @@ async def fix_rejected_video(aid: int, request: Request):
         if video_path:
             task_params['video_path'] = str(video_path)
         
-        job_id = jm.submit_job(
-            video_ids=[],
-            steps=['fix-violation'],
+        result = submit_or_reuse_job(
+            jm,
             task_type='fix-violation',
             task_params=task_params,
+            steps=['fix-violation'],
+            active_statuses=_BILIBILI_ACTIVE_STATUSES,
         )
-        
-        # 记录 aid → job_id 映射（供 status 端点查询）
-        _fix_tasks[aid] = {'job_id': job_id}
-        
+
         return JSONResponse({
             "success": True,
             "message": "修复任务已启动",
-            "job_id": job_id,
+            "job_id": result["job_id"],
             "video_path": str(video_path) if video_path else "将从B站下载",
         })
         
@@ -588,47 +536,16 @@ async def fix_rejected_video(aid: int, request: Request):
 @router.get("/fix/{aid}/status")
 async def get_fix_status(aid: int):
     """获取修复任务状态（通过 JobManager 查询）"""
-    entry = _fix_tasks.get(aid)
-    if not entry or 'job_id' not in entry:
+    payload = _build_bilibili_job_payload("fix-violation", {"aid": aid}, status_map=_FIX_STATUS_MAP)
+    if not payload:
         return JSONResponse({"status": "none", "message": "无任务记录"})
-    
-    from .tasks import get_job_manager
-    jm = get_job_manager()
-    job_id = entry['job_id']
-    jm.update_job_status(job_id)
-    job = jm.get_job(job_id)
-    
-    if not job:
-        return JSONResponse({"status": "none", "message": "任务记录已删除"})
-    
-    # 转换为原有响应格式
-    status_map = {
-        'pending': 'pending',
-        'running': 'masking',
-        'completed': 'completed',
-        'failed': 'failed',
-        'cancelled': 'cancelled',
-    }
-    
-    # 从日志获取最新消息
-    log_lines = jm.get_log_content(job_id, tail_lines=3)
-    last_msg = log_lines[-1] if log_lines else ''
-    
-    return JSONResponse({
-        "status": status_map.get(job.status.value, job.status.value),
-        "message": job.error or last_msg,
-        "job_id": job_id,
-        "progress": job.progress,
-    })
+
+    return JSONResponse(payload)
 
 
 # =============================================================================
 # 合集同步管理
 # =============================================================================
-
-# 同步任务状态（内存存储，key=playlist_id）
-_sync_tasks: Dict[str, Dict[str, Any]] = {}
-
 
 @router.get("/season/{season_id}/episodes")
 async def get_season_episodes(season_id: int):
@@ -668,10 +585,10 @@ async def resync_video_info_route(aid: int):
     翻译更新后需要同步等）。
     """
     try:
-        from ...uploaders.bilibili import resync_video_info
+        from ...services.bilibili_workflows import resync_video_info
         
-        config = load_config()
-        db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
+        config = get_web_config()
+        db = get_db()
         uploader = _get_uploader(with_upload_params=False)
         
         result = resync_video_info(db, uploader, config, aid)
@@ -696,8 +613,8 @@ async def resync_video_info_route(aid: int):
 async def resync_season_info_route(season_id: int):
     """按合集批量刷新视频元信息（标题/简介/标签/分区）"""
     try:
-        config = load_config()
-        db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
+        config = get_web_config()
+        db = get_db()
         uploader = _get_uploader(with_upload_params=False)
 
         result = await run_in_threadpool(
@@ -745,8 +662,7 @@ async def get_sync_playlists():
     - 已同步视频数
     """
     try:
-        config = load_config()
-        db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
+        db = get_db()
         from ...services.playlist_service import PlaylistService
         playlist_service = PlaylistService(db)
         
@@ -790,8 +706,8 @@ async def get_sync_playlists():
                         # 视为待同步候选
                         pending_count += 1
             
-            # 检查是否有正在运行的同步任务
-            sync_task = _sync_tasks.get(pl.id, {})
+            # 检查是否有正在运行的同步任务（优先反查 web_jobs）
+            sync_job = _find_latest_bilibili_job("season-sync", {"playlist_id": pl.id})
             
             result.append({
                 'playlist_id': pl.id,
@@ -801,8 +717,8 @@ async def get_sync_playlists():
                 'total_uploaded': total_uploaded,
                 'pending_count': pending_count,
                 'synced_count': synced_count,
-                'sync_status': sync_task.get('status'),
-                'sync_message': sync_task.get('message'),
+                'sync_status': sync_job.status.value if sync_job else None,
+                'sync_message': sync_job.error if sync_job else None,
             })
         
         return JSONResponse({"success": True, "playlists": result})
@@ -819,16 +735,19 @@ async def do_season_sync(playlist_id: str):
     在后台线程中执行，避免阻塞。
     """
     # 检查是否有正在运行的任务
-    existing = _sync_tasks.get(playlist_id, {})
-    if existing.get('status') == 'running':
+    jm = _get_job_manager()
+    existing_job = _find_latest_bilibili_job("season-sync", {"playlist_id": playlist_id})
+    if existing_job:
+        jm.update_job_status(existing_job.job_id)
+        existing_job = jm.get_job(existing_job.job_id)
+    if existing_job and existing_job.status.value == 'running':
         return JSONResponse({
             "success": False,
             "error": f"Playlist {playlist_id} 已有同步任务在运行"
         })
     
     try:
-        config = load_config()
-        db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
+        db = get_db()
         from ...services.playlist_service import PlaylistService
         playlist_service = PlaylistService(db)
         
@@ -862,26 +781,18 @@ async def do_season_sync(playlist_id: str):
         if patched > 0:
             logger.info(f"为 {patched} 个视频补充了 bilibili_target_season_id={season_id}")
         
-        # 通过 JobManager 提交 season-sync 任务
-        from .tasks import get_job_manager
-        jm = get_job_manager()
-        
-        job_id = jm.submit_job(
-            video_ids=[],
-            steps=['season-sync'],
+        result = submit_or_reuse_job(
+            jm,
             task_type='season-sync',
             task_params={'playlist_id': playlist_id},
+            steps=['season-sync'],
+            active_statuses=_BILIBILI_ACTIVE_STATUSES,
         )
-        
-        _sync_tasks[playlist_id] = {
-            'job_id': job_id,
-            'season_id': season_id,
-        }
-        
+
         return JSONResponse({
             "success": True,
             "message": f"同步任务已启动 (playlist={playlist_id}, season={season_id})",
-            "job_id": job_id,
+            "job_id": result["job_id"],
             "patched": patched,
         })
     except Exception as e:
@@ -892,36 +803,11 @@ async def do_season_sync(playlist_id: str):
 @router.get("/season-sync/{playlist_id}/status")
 async def get_season_sync_status(playlist_id: str):
     """获取 season sync 任务状态（通过 JobManager 查询）"""
-    entry = _sync_tasks.get(playlist_id)
-    if not entry or 'job_id' not in entry:
+    payload = _build_bilibili_job_payload("season-sync", {"playlist_id": playlist_id})
+    if not payload:
         return JSONResponse({"status": "none", "message": "无同步任务"})
-    
-    from .tasks import get_job_manager
-    jm = get_job_manager()
-    job_id = entry['job_id']
-    jm.update_job_status(job_id)
-    job = jm.get_job(job_id)
-    
-    if not job:
-        return JSONResponse({"status": "none", "message": "任务记录已删除"})
-    
-    status_map = {
-        'pending': 'pending',
-        'running': 'running',
-        'completed': 'completed',
-        'failed': 'failed',
-        'cancelled': 'cancelled',
-    }
-    
-    log_lines = jm.get_log_content(job_id, tail_lines=3)
-    last_msg = log_lines[-1] if log_lines else ''
-    
-    return JSONResponse({
-        "status": status_map.get(job.status.value, job.status.value),
-        "message": job.error or last_msg,
-        "season_id": entry.get('season_id'),
-        "job_id": job_id,
-    })
+
+    return JSONResponse(payload)
 
 
 @router.post("/season/{season_id}/sort")
@@ -943,8 +829,15 @@ async def sort_season(season_id: int):
 async def sync_season_titles(season_id: int):
     """同步合集中的视频标题：用实际标题替换合集中的名称"""
     try:
+        db = get_db()
         uploader = _get_uploader()
-        result = uploader.sync_season_episode_titles(season_id)
+        result = await run_in_threadpool(
+            sync_season_episode_titles_with_recovery,
+            db,
+            uploader,
+            season_id,
+            2.0,
+        )
         if result['success']:
             return JSONResponse({
                 "success": True,

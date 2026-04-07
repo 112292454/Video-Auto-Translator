@@ -21,6 +21,8 @@ wheels/
 *.egg
 *.pth
 docs/superpowers/
+.claude/
+.juno_task/
 
 # IDEs & Editors
 .vscode/

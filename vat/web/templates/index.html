@@ -105,6 +105,21 @@
         <button id="batch-process-btn" onclick="batchProcessVideos()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 hidden">
             处理选中 (<span id="selected-process-count">0</span>)
         </button>
+        <div id="batch-info-menu-wrap" class="hidden relative">
+            <button id="batch-info-menu-btn" onclick="toggleBatchInfoMenu()"
+                    class="px-3 py-2 border border-gray-300 text-gray-600 rounded-lg hover:bg-gray-50"
+                    title="更多选中视频操作">
+                ⋯
+            </button>
+            <div id="batch-info-menu" class="hidden absolute right-0 mt-2 w-40 bg-white border rounded-lg shadow-lg z-20 py-1">
+                <button type="button" onclick="batchFetchSourceInfo()" class="block w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50">
+                    补全信息
+                </button>
+                <button type="button" onclick="batchRetranslateInfo()" class="block w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50">
+                    重翻信息
+                </button>
+            </div>
+        </div>
         <button id="batch-delete-btn" onclick="batchDeleteVideos()" class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 hidden">
             删除选中 (<span id="selected-count">0</span>)
         </button>
@@ -151,7 +166,7 @@
             {% for video in videos %}
             <tr class="hover:bg-gray-50" data-filter-status="{% if video.progress == 100 %}completed{% elif video.task_status.values()|selectattr('status','equalto','failed')|list %}failed{% elif video.task_status.values()|selectattr('status','equalto','running')|list %}running{% else %}pending{% endif %}" data-stages="{% for step, task in video.task_status.items() %}{{ step }}-{{ task.status }} {% endfor %}">
                 <td class="px-2 py-3" onclick="event.stopPropagation()">
-                    <input type="checkbox" class="video-checkbox rounded" value="{{ video.id }}" onchange="updateSelectedCount()">
+                    <input type="checkbox" class="video-checkbox rounded" value="{{ video.id }}" data-source-type="{{ video.source_type }}" onchange="updateSelectedCount()">
                 </td>
                 <td class="px-4 py-3 cursor-pointer" onclick="window.location='/video/{{ video.id }}'" data-sort-value="{{ video.title }}">
                     <div class="flex items-center space-x-3">
@@ -286,26 +301,26 @@
         
         <!-- Tab 1: 平台链接 -->
         <div id="tab-platform" class="add-tab-content mb-4">
-            <label class="block text-sm font-medium text-gray-700 mb-1">视频 URL</label>
-            <input type="text" id="input-platform" placeholder="YouTube 或 Bilibili 视频链接"
-                   class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500">
-            <p class="text-xs text-gray-500 mt-1">自动检测平台类型</p>
+            <label class="block text-sm font-medium text-gray-700 mb-1">视频 URL（每行一个）</label>
+            <textarea id="input-platform" rows="4" placeholder="https://www.youtube.com/watch?v=...\nhttps://www.bilibili.com/video/..."
+                      class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500"></textarea>
+            <p class="text-xs text-gray-500 mt-1">支持一次粘贴多个 YouTube / Bilibili 链接，每行一个</p>
         </div>
         
         <!-- Tab 2: 直链 -->
         <div id="tab-direct" class="add-tab-content mb-4 hidden">
-            <label class="block text-sm font-medium text-gray-700 mb-1">视频直链</label>
-            <input type="text" id="input-direct" placeholder="https://example.com/video.mp4"
-                   class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500">
-            <p class="text-xs text-gray-500 mt-1">直接指向视频文件的 HTTP/HTTPS 下载链接（如 .mp4, .mkv）</p>
+            <label class="block text-sm font-medium text-gray-700 mb-1">视频直链（每行一个）</label>
+            <textarea id="input-direct" rows="4" placeholder="https://example.com/video-1.mp4\nhttps://example.com/video-2.mkv"
+                      class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500"></textarea>
+            <p class="text-xs text-gray-500 mt-1">直接指向视频文件的 HTTP/HTTPS 下载链接（如 .mp4, .mkv），每行一个</p>
         </div>
         
         <!-- Tab 3: 服务器路径 -->
         <div id="tab-local" class="add-tab-content mb-4 hidden">
-            <label class="block text-sm font-medium text-gray-700 mb-1">文件路径</label>
-            <input type="text" id="input-local" placeholder="/path/to/video.mp4"
-                   class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500">
-            <p class="text-xs text-gray-500 mt-1">VAT 服务器上的视频文件绝对路径</p>
+            <label class="block text-sm font-medium text-gray-700 mb-1">文件路径（每行一个）</label>
+            <textarea id="input-local" rows="4" placeholder="/path/to/video-1.mp4\n/path/to/video-2.mkv"
+                      class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500"></textarea>
+            <p class="text-xs text-gray-500 mt-1">VAT 服务器上的视频文件绝对路径，每行一个</p>
         </div>
         
         <!-- Tab 4: 上传视频 -->
@@ -317,7 +332,7 @@
                  ondrop="handleFileDrop(event)">
                 <div id="upload-prompt">
                     <div class="text-3xl text-gray-400 mb-2">📁</div>
-                    <p class="text-sm text-gray-600">拖拽视频文件到此处，或点击选择</p>
+                    <p class="text-sm text-gray-600">拖拽一个或多个视频文件到此处，或点击选择</p>
                     <p class="text-xs text-gray-400 mt-1">支持: mp4, mkv, webm, avi, mov, flv</p>
                 </div>
                 <div id="upload-progress" class="hidden">
@@ -331,11 +346,10 @@
                     <div class="text-3xl text-green-500 mb-2">✓</div>
                     <p class="text-sm text-green-700" id="upload-done-name"></p>
                     <p class="text-xs text-gray-500" id="upload-done-size"></p>
+                    <div id="upload-done-list" class="mt-3 max-h-28 overflow-y-auto text-left text-xs text-gray-600 space-y-1"></div>
                 </div>
             </div>
-            <input type="file" id="upload-file-input" accept=".mp4,.mkv,.webm,.avi,.mov,.flv,.ts,.m4v" class="hidden" onchange="handleFileSelect(this.files)">
-            <!-- 隐藏字段存储上传后的服务器路径 -->
-            <input type="hidden" id="upload-server-path" value="">
+            <input type="file" id="upload-file-input" accept=".mp4,.mkv,.webm,.avi,.mov,.flv,.ts,.m4v" multiple class="hidden" onchange="handleFileSelect(this.files)">
         </div>
         
         <!-- 标题输入（所有 Tab 共用） -->
@@ -343,6 +357,31 @@
             <label class="block text-sm font-medium text-gray-700 mb-1">标题（可选）</label>
             <input type="text" id="input-title" placeholder="不填则自动从文件名/平台获取"
                    class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500">
+            <p class="text-xs text-gray-500 mt-1">仅单条添加时生效；批量添加时请留空，系统会尽量自动补标题</p>
+        </div>
+
+        <div class="mb-4 border rounded-lg p-3 bg-gray-50">
+            <div class="text-sm font-medium text-gray-700 mb-2">加入 List</div>
+            <div class="space-y-2 text-sm text-gray-700">
+                <label class="flex items-center gap-2">
+                    <input type="radio" name="playlist-mode" value="none" checked>
+                    <span>不添加到 List</span>
+                </label>
+                <label class="flex items-center gap-2">
+                    <input type="radio" name="playlist-mode" value="default">
+                    <span>添加到默认 List</span>
+                </label>
+                <label class="flex items-center gap-2">
+                    <input type="radio" name="playlist-mode" value="specified">
+                    <span>添加到指定 List</span>
+                </label>
+                <select id="input-add-playlist-id" class="w-full px-3 py-2 border border-gray-300 rounded-lg">
+                    <option value="">选择已有 List</option>
+                    {% for pl in playlists %}
+                    <option value="{{ pl.id }}">{{ pl.title | truncate(40) }}</option>
+                    {% endfor %}
+                </select>
+            </div>
         </div>
         
         <div class="flex justify-end space-x-2">
@@ -404,6 +443,115 @@ function updateSelectedCount() {
     document.getElementById('selected-process-count').textContent = count;
     document.getElementById('batch-delete-btn').classList.toggle('hidden', count === 0);
     document.getElementById('batch-process-btn').classList.toggle('hidden', count === 0);
+    document.getElementById('batch-info-menu-wrap').classList.toggle('hidden', count === 0);
+    if (count === 0) closeBatchInfoMenu();
+}
+
+function getSelectedVideoIds() {
+    return Array.from(document.querySelectorAll('.video-checkbox:checked')).map(cb => cb.value);
+}
+
+function getSelectedVideoTargets() {
+    return Array.from(document.querySelectorAll('.video-checkbox:checked')).map(cb => ({
+        id: cb.value,
+        sourceType: cb.dataset.sourceType || '',
+    }));
+}
+
+function setBatchInfoButtonsState(disabled) {
+    ['batch-info-menu-btn', 'batch-process-btn', 'batch-delete-btn'].forEach(id => {
+        const btn = document.getElementById(id);
+        if (btn) btn.disabled = disabled;
+    });
+}
+
+function toggleBatchInfoMenu() {
+    document.getElementById('batch-info-menu').classList.toggle('hidden');
+}
+
+function closeBatchInfoMenu() {
+    document.getElementById('batch-info-menu').classList.add('hidden');
+}
+
+async function runBatchVideoInfoAction(action) {
+    const selectedTargets = getSelectedVideoTargets();
+    if (selectedTargets.length === 0) {
+        showToast('请先选择视频', 'warning');
+        return;
+    }
+    const ids = action === 'fetch-source-info'
+        ? selectedTargets.filter(item => item.sourceType === 'youtube').map(item => item.id)
+        : selectedTargets.map(item => item.id);
+    const skipped = selectedTargets.length - ids.length;
+    if (ids.length === 0) {
+        showToast('选中的视频里没有可补全源信息的 YouTube 视频', 'warning');
+        return;
+    }
+
+    const isFetch = action === 'fetch-source-info';
+    closeBatchInfoMenu();
+    const confirmMessage = isFetch
+        ? `确定要为选中的 ${ids.length} 个视频补全源信息吗？\n\n只会尝试补抓信息，不会创建新任务类型。`
+        : `确定要为选中的 ${ids.length} 个视频重新翻译视频信息吗？\n\n这会重新提交标题/简介翻译请求。`;
+    if (!confirm(confirmMessage)) return;
+
+    const menuBtn = document.getElementById('batch-info-menu-btn');
+    const originalText = menuBtn ? menuBtn.textContent : '';
+    setBatchInfoButtonsState(true);
+    if (menuBtn) {
+        menuBtn.textContent = isFetch ? `补 0/${ids.length}` : `翻 0/${ids.length}`;
+    }
+
+    const results = await runConcurrentBatch(
+        ids,
+        async (videoId) => {
+            const response = await fetch(`/api/videos/${encodeURIComponent(videoId)}/${action}`, {method: 'POST'});
+            let data = {};
+            try {
+                data = await response.json();
+            } catch (_err) {
+                data = {};
+            }
+            const ok = response.ok && (isFetch ? data.status === 'ok' : data.status === 'submitted');
+            return {ok, data};
+        },
+        {
+            concurrency: 2,
+            onProgress: ({completed, total}) => {
+                if (menuBtn) {
+                    menuBtn.textContent = (isFetch ? '补 ' : '翻 ') + `${completed}/${total}`;
+                }
+            },
+        }
+    );
+
+    const success = results.filter(item => item && item.ok).length;
+    const failed = results.length - success;
+    if (menuBtn) {
+        menuBtn.textContent = originalText;
+    }
+    setBatchInfoButtonsState(false);
+
+    if (isFetch) {
+        showToast(
+            `批量补全完成：成功 ${success} 个，失败 ${failed} 个${skipped > 0 ? `，跳过 ${skipped} 个非 YouTube 视频` : ''}`,
+            failed > 0 ? 'warning' : 'success',
+            4000
+        );
+        if (success > 0) {
+            setTimeout(() => location.reload(), 800);
+        }
+    } else {
+        showToast(`已提交重翻请求：成功 ${success} 个，失败 ${failed} 个`, failed > 0 ? 'warning' : 'success', 4000);
+    }
+}
+
+function batchFetchSourceInfo() {
+    return runBatchVideoInfoAction('fetch-source-info');
+}
+
+function batchRetranslateInfo() {
+    return runBatchVideoInfoAction('retranslate-info');
 }
 
 // 批量处理：用 POST 表单将选中视频发送到新建任务页（避免 URL 过长导致 414）
@@ -476,6 +624,25 @@ async function confirmBatchDelete() {
 
 // ==================== 添加视频弹窗 ====================
 let currentAddTab = 'platform';
+let uploadedServerPaths = [];
+let uploadedFilesSummary = [];
+
+function parseSourceLines(inputId) {
+    return document.getElementById(inputId).value
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean);
+}
+
+function resetUploadState() {
+    uploadedServerPaths = [];
+    uploadedFilesSummary = [];
+    document.getElementById('upload-prompt').classList.remove('hidden');
+    document.getElementById('upload-progress').classList.add('hidden');
+    document.getElementById('upload-done').classList.add('hidden');
+    document.getElementById('upload-file-input').value = '';
+    document.getElementById('upload-done-list').innerHTML = '';
+}
 
 function switchAddTab(tabName) {
     currentAddTab = tabName;
@@ -501,43 +668,54 @@ function showAddVideoDialog() {
     document.getElementById('add-video-modal').classList.remove('hidden');
     document.getElementById('add-video-modal').classList.add('flex');
     switchAddTab('platform');
-    // 重置上传状态
-    document.getElementById('upload-server-path').value = '';
-    document.getElementById('upload-prompt').classList.remove('hidden');
-    document.getElementById('upload-progress').classList.add('hidden');
-    document.getElementById('upload-done').classList.add('hidden');
-    document.getElementById('upload-file-input').value = '';
+    resetUploadState();
+    document.querySelector('input[name="playlist-mode"][value="none"]').checked = true;
+    document.getElementById('input-add-playlist-id').value = '';
 }
 
 function closeAddVideoDialog() {
     document.getElementById('add-video-modal').classList.add('hidden');
     document.getElementById('add-video-modal').classList.remove('flex');
-    // 清空所有输入
     ['input-platform', 'input-direct', 'input-local', 'input-title'].forEach(id => {
         document.getElementById(id).value = '';
     });
+    document.getElementById('input-add-playlist-id').value = '';
+    document.querySelector('input[name="playlist-mode"][value="none"]').checked = true;
+    resetUploadState();
 }
 
 async function addVideo() {
     const title = document.getElementById('input-title').value.trim();
-    let url = '';
+    let sources = [];
     let sourceType = 'auto';
     
     if (currentAddTab === 'platform') {
-        url = document.getElementById('input-platform').value.trim();
-        if (!url) { showToast('请输入视频 URL', 'warning'); return; }
+        sources = parseSourceLines('input-platform');
+        if (sources.length === 0) { showToast('请输入至少一个视频 URL', 'warning'); return; }
     } else if (currentAddTab === 'direct') {
-        url = document.getElementById('input-direct').value.trim();
-        if (!url) { showToast('请输入视频直链', 'warning'); return; }
+        sources = parseSourceLines('input-direct');
+        if (sources.length === 0) { showToast('请输入至少一个视频直链', 'warning'); return; }
         sourceType = 'direct_url';
     } else if (currentAddTab === 'local') {
-        url = document.getElementById('input-local').value.trim();
-        if (!url) { showToast('请输入文件路径', 'warning'); return; }
+        sources = parseSourceLines('input-local');
+        if (sources.length === 0) { showToast('请输入至少一个文件路径', 'warning'); return; }
         sourceType = 'local';
     } else if (currentAddTab === 'upload') {
-        url = document.getElementById('upload-server-path').value;
-        if (!url) { showToast('请先上传视频文件', 'warning'); return; }
+        sources = [...uploadedServerPaths];
+        if (sources.length === 0) { showToast('请先上传至少一个视频文件', 'warning'); return; }
         sourceType = 'local';
+    }
+
+    if (sources.length > 1 && title) {
+        showToast('批量添加时不能指定统一标题，请留空后使用自动标题', 'warning');
+        return;
+    }
+
+    const playlistMode = document.querySelector('input[name="playlist-mode"]:checked')?.value || 'none';
+    const selectedPlaylistId = document.getElementById('input-add-playlist-id').value;
+    if (playlistMode === 'specified' && !selectedPlaylistId) {
+        showToast('请选择要加入的 List', 'warning');
+        return;
     }
     
     const btn = document.getElementById('add-video-btn');
@@ -545,8 +723,15 @@ async function addVideo() {
     btn.textContent = '添加中...';
     
     try {
-        const body = {url, source_type: sourceType};
+        const body = {
+            source_type: sourceType,
+            playlist_mode: playlistMode,
+            fetch_info: true,
+        };
+        if (sources.length === 1) body.url = sources[0];
+        else body.sources = sources;
         if (title) body.title = title;
+        if (playlistMode === 'specified') body.playlist_id = selectedPlaylistId;
         
         const response = await fetch('/api/videos', {
             method: 'POST',
@@ -556,9 +741,15 @@ async function addVideo() {
         
         if (response.ok) {
             const result = await response.json();
-            showToast(`添加成功 (${result.source_type})`, 'success');
+            showToast(`添加成功，共 ${result.count || 1} 个视频`, 'success');
             closeAddVideoDialog();
-            location.href = `/video/${result.video_id}`;
+            if ((result.count || 1) === 1 && result.video_id) {
+                location.href = `/video/${result.video_id}`;
+            } else if (result.playlist_id) {
+                location.href = `/playlists/${result.playlist_id}`;
+            } else {
+                location.reload();
+            }
         } else {
             const error = await response.json();
             showToast('添加失败: ' + (error.detail || '未知错误'), 'error');
@@ -580,64 +771,88 @@ function handleFileDrop(e) {
     }
 }
 
-async function handleFileSelect(files) {
-    if (!files || files.length === 0) return;
-    const file = files[0];
-    
-    // 显示上传进度
-    document.getElementById('upload-prompt').classList.add('hidden');
-    document.getElementById('upload-done').classList.add('hidden');
-    document.getElementById('upload-progress').classList.remove('hidden');
-    document.getElementById('upload-filename').textContent = file.name;
-    document.getElementById('upload-bar').style.width = '0%';
-    document.getElementById('upload-status').textContent = '上传中...';
-    
-    const formData = new FormData();
-    formData.append('file', file);
-    
-    try {
+function uploadSingleFile(file, index, total) {
+    return new Promise((resolve, reject) => {
+        const formData = new FormData();
+        formData.append('file', file);
+
         const xhr = new XMLHttpRequest();
         xhr.open('POST', '/api/videos/upload-file');
-        
+
         xhr.upload.onprogress = function(e) {
             if (e.lengthComputable) {
                 const pct = (e.loaded / e.total * 100).toFixed(0);
                 document.getElementById('upload-bar').style.width = pct + '%';
-                document.getElementById('upload-status').textContent = `上传中... ${pct}% (${(e.loaded/1024/1024).toFixed(1)}MB)`;
+                document.getElementById('upload-status').textContent =
+                    `上传中... (${index + 1}/${total}) ${pct}% ${(e.loaded / 1024 / 1024).toFixed(1)}MB`;
             }
         };
-        
+
         xhr.onload = function() {
             if (xhr.status === 200) {
-                const result = JSON.parse(xhr.responseText);
-                document.getElementById('upload-server-path').value = result.server_path;
-                // 显示完成状态
-                document.getElementById('upload-progress').classList.add('hidden');
-                document.getElementById('upload-done').classList.remove('hidden');
-                document.getElementById('upload-done-name').textContent = result.filename;
-                document.getElementById('upload-done-size').textContent = `${(result.size/1024/1024).toFixed(1)} MB`;
-                showToast('上传完成', 'success');
+                resolve(JSON.parse(xhr.responseText));
             } else {
-                const error = JSON.parse(xhr.responseText);
-                showToast('上传失败: ' + (error.error || error.detail || '未知错误'), 'error');
-                // 重置
-                document.getElementById('upload-progress').classList.add('hidden');
-                document.getElementById('upload-prompt').classList.remove('hidden');
+                try {
+                    const error = JSON.parse(xhr.responseText);
+                    reject(new Error(error.error || error.detail || '未知错误'));
+                } catch (_err) {
+                    reject(new Error('未知错误'));
+                }
             }
         };
-        
+
         xhr.onerror = function() {
-            showToast('上传请求失败', 'error');
-            document.getElementById('upload-progress').classList.add('hidden');
-            document.getElementById('upload-prompt').classList.remove('hidden');
+            reject(new Error('上传请求失败'));
         };
-        
+
         xhr.send(formData);
-    } catch (e) {
-        showToast('上传异常: ' + e.message, 'error');
+    });
+}
+
+async function handleFileSelect(files) {
+    if (!files || files.length === 0) return;
+
+    document.getElementById('upload-prompt').classList.add('hidden');
+    document.getElementById('upload-done').classList.add('hidden');
+    document.getElementById('upload-progress').classList.remove('hidden');
+    document.getElementById('upload-filename').textContent = `准备上传 ${files.length} 个文件`;
+    document.getElementById('upload-bar').style.width = '0%';
+    document.getElementById('upload-status').textContent = '上传中...';
+
+    uploadedServerPaths = [];
+    uploadedFilesSummary = [];
+    let failed = 0;
+
+    for (let i = 0; i < files.length; i++) {
+        try {
+            const result = await uploadSingleFile(files[i], i, files.length);
+            uploadedServerPaths.push(result.server_path);
+            uploadedFilesSummary.push(result);
+        } catch (e) {
+            failed += 1;
+            console.error('上传失败:', files[i].name, e);
+        }
+    }
+
+    if (uploadedServerPaths.length === 0) {
         document.getElementById('upload-progress').classList.add('hidden');
         document.getElementById('upload-prompt').classList.remove('hidden');
+        showToast('上传失败，未成功保存任何文件', 'error');
+        return;
     }
+
+    document.getElementById('upload-progress').classList.add('hidden');
+    document.getElementById('upload-done').classList.remove('hidden');
+    document.getElementById('upload-done-name').textContent = `已上传 ${uploadedFilesSummary.length} 个文件`;
+    const totalSize = uploadedFilesSummary.reduce((sum, item) => sum + (item.size || 0), 0);
+    document.getElementById('upload-done-size').textContent = `${(totalSize / 1024 / 1024).toFixed(1)} MB`;
+    document.getElementById('upload-done-list').innerHTML = uploadedFilesSummary
+        .map(item => `<div>${item.filename}</div>`)
+        .join('');
+    showToast(
+        failed > 0 ? `已上传 ${uploadedFilesSummary.length} 个文件，${failed} 个失败` : '上传完成',
+        failed > 0 ? 'warning' : 'success'
+    );
 }
 
 // 阶段筛选（服务端）：圆点循环切换，通过 URL 参数 sf_STEP=STATUS 触发服务端过滤
@@ -686,6 +901,12 @@ document.addEventListener('keydown', function(e) {
 document.addEventListener('DOMContentLoaded', function() {
     setupModalClickOutside('add-video-modal', closeAddVideoDialog);
     setupModalClickOutside('batch-delete-modal', closeBatchDeleteModal);
+    document.addEventListener('click', function(e) {
+        const wrap = document.getElementById('batch-info-menu-wrap');
+        if (wrap && !wrap.contains(e.target)) {
+            closeBatchInfoMenu();
+        }
+    });
 });
 </script>
 

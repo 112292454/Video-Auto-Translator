@@ -385,30 +385,32 @@ class TestProcessOrchestration:
         vp._run_download.assert_not_called()
 
     def test_explicit_steps_only(self, tmp_path):
-        """只传入 download 和 embed 时，中间阶段以直通模式执行"""
+        """只传入 download 和 embed 时，仅可直通阶段标记为 skipped。"""
         vp, db = _make_vp(tmp_path)
         result = vp.process(steps=['download', 'embed'])
         assert result is True
         # download 和 embed 必须被调用
         vp._run_download.assert_called_once()
         vp._run_embed.assert_called_once()
-        # 中间阶段也被执行（直通填充）
+        # 中间阶段也被执行；仅 split/optimize/translate 属于真正直通
         vp._run_whisper.assert_called_once()
         assert db.get_task("test_vid", TaskStep.DOWNLOAD).status == TaskStatus.COMPLETED
-        assert db.get_task("test_vid", TaskStep.WHISPER).status == TaskStatus.SKIPPED
+        assert db.get_task("test_vid", TaskStep.WHISPER).status == TaskStatus.COMPLETED
         assert db.get_task("test_vid", TaskStep.SPLIT).status == TaskStatus.SKIPPED
         assert db.get_task("test_vid", TaskStep.OPTIMIZE).status == TaskStatus.SKIPPED
         assert db.get_task("test_vid", TaskStep.TRANSLATE).status == TaskStatus.SKIPPED
         assert db.get_task("test_vid", TaskStep.EMBED).status == TaskStatus.COMPLETED
 
     def test_unavailable_video_skips_all(self, tmp_path):
-        """不可用视频应跳过所有处理，标记全部完成"""
+        """不可用视频应跳过所有处理，标记全部 skipped。"""
         vp, db = _make_vp(tmp_path, video_metadata={"unavailable": True})
         result = vp.process(steps=None)
         assert result is True
         # 所有 _run_* 不应被调用
         for step in DEFAULT_STAGE_SEQUENCE:
             getattr(vp, f"_run_{step.value}").assert_not_called()
+            task = db.get_task("test_vid", step)
+            assert task.status == TaskStatus.SKIPPED
 
     def test_empty_pending_returns_true(self, tmp_path):
         """所有步骤已完成时应直接返回 True"""
@@ -518,6 +520,28 @@ class TestPassthroughConfigBackupRestore:
         ) == original
 
 
+class TestPassthroughExecutionSemantics:
+    def test_non_passthrough_gap_stage_is_recorded_completed_for_download_split(self, tmp_path):
+        vp, db = _make_vp(tmp_path)
+
+        result = vp.process(steps=["download", "split"])
+
+        assert result is True
+        assert "whisper" not in vp._passthrough_stages
+        assert db.get_task("test_vid", TaskStep.WHISPER).status == TaskStatus.COMPLETED
+        assert db.get_task("test_vid", TaskStep.SPLIT).status == TaskStatus.COMPLETED
+
+    def test_non_passthrough_gap_stage_is_recorded_completed_for_translate_upload(self, tmp_path):
+        vp, db = _make_vp(tmp_path)
+
+        result = vp.process(steps=["translate", "upload"])
+
+        assert result is True
+        assert "embed" not in vp._passthrough_stages
+        assert db.get_task("test_vid", TaskStep.EMBED).status == TaskStatus.COMPLETED
+        assert db.get_task("test_vid", TaskStep.UPLOAD).status == TaskStatus.COMPLETED
+
+
 class TestConfigIsolationContracts:
     """VideoProcessor 不应污染调用方共享配置。"""
 
@@ -559,7 +583,7 @@ class TestConfigIsolationContracts:
         assert shared_config.translator.llm.optimize.custom_prompt == original_optimize_prompt
         for step in DEFAULT_STAGE_SEQUENCE:
             task = database.get_task("test_vid", step)
-            assert task.status == TaskStatus.COMPLETED
+            assert task.status == TaskStatus.SKIPPED
 
     def test_playlist_prompts_restored_when_no_steps_to_run(self, tmp_path):
         from vat.config import load_config
@@ -835,6 +859,24 @@ class TestDownloadStageContracts:
 
 class TestSchedulerDownloadDelay:
     """SingleGPUScheduler 视频间延迟"""
+
+    @patch('vat.pipeline.scheduler.run_video_batch')
+    def test_single_gpu_scheduler_delegates_to_shared_batch_runner(self, mock_run_batch, tmp_path):
+        from vat.pipeline.scheduler import SingleGPUScheduler
+        from vat.config import load_config
+
+        config = load_config()
+        config.storage.database_path = str(tmp_path / "test.db")
+        scheduler = SingleGPUScheduler(config, gpu_id=2)
+
+        scheduler.run(["v1", "v2"], steps=["whisper"], force=True)
+
+        mock_run_batch.assert_called_once()
+        kwargs = mock_run_batch.call_args.kwargs
+        assert kwargs["video_ids"] == ["v1", "v2"]
+        assert kwargs["steps"] == ["whisper"]
+        assert kwargs["force"] is True
+        assert kwargs["gpu_id"] == 2
 
     @patch('vat.pipeline.scheduler.VideoProcessor')
     @patch('time.sleep')

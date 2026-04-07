@@ -197,6 +197,15 @@ class TestTaskCRUD:
         pending = db.get_pending_steps("v1")
         assert pending == []
 
+    def test_get_pending_steps_treats_skipped_as_satisfied(self, db):
+        _add_video(db, "v1")
+        db.add_task(Task(video_id="v1", step=TaskStep.DOWNLOAD, status=TaskStatus.COMPLETED))
+        db.add_task(Task(video_id="v1", step=TaskStep.WHISPER, status=TaskStatus.SKIPPED))
+        pending = db.get_pending_steps("v1")
+        assert TaskStep.DOWNLOAD not in pending
+        assert TaskStep.WHISPER not in pending
+        assert TaskStep.SPLIT in pending
+
     def test_delete_tasks_for_video(self, db):
         _add_video(db, "v1")
         for step in [TaskStep.DOWNLOAD, TaskStep.WHISPER]:
@@ -364,6 +373,18 @@ class TestListVideosPaginated:
         assert result['total'] == 1
         assert result['videos'][0].id == "v1"
 
+    def test_sort_progress_counts_skipped_as_satisfied(self, db):
+        _add_video(db, "v_done")
+        _add_video(db, "v_skip")
+        db.add_task(Task(video_id="v_done", step=TaskStep.DOWNLOAD, status=TaskStatus.COMPLETED))
+        db.add_task(Task(video_id="v_skip", step=TaskStep.DOWNLOAD, status=TaskStatus.COMPLETED))
+        db.add_task(Task(video_id="v_skip", step=TaskStep.WHISPER, status=TaskStatus.SKIPPED))
+
+        result = db.list_videos_paginated(sort_by="progress", sort_order="desc", page=1, per_page=10)
+        ordered_ids = [video.id for video in result["videos"]]
+
+        assert ordered_ids.index("v_skip") < ordered_ids.index("v_done")
+
 
 # ==================== Batch Progress ====================
 
@@ -383,6 +404,15 @@ class TestBatchGetVideoProgress:
         progress = db.batch_get_video_progress(["v1"])
         assert progress["v1"]["completed"] == 2
         assert progress["v1"]["progress"] == 28  # 2/7*100 ≈ 28
+
+    def test_skipped_step_counts_toward_progress(self, db):
+        _add_video(db, "v1")
+        db.add_task(Task(video_id="v1", step=TaskStep.DOWNLOAD, status=TaskStatus.COMPLETED))
+        db.add_task(Task(video_id="v1", step=TaskStep.WHISPER, status=TaskStatus.SKIPPED))
+        progress = db.batch_get_video_progress(["v1"])
+        assert progress["v1"]["completed"] == 2
+        assert progress["v1"]["progress"] == 28
+        assert progress["v1"]["task_status"]["whisper"]["status"] == "skipped"
 
     def test_failed_video_has_blocked_steps(self, db):
         """失败视频的后续步骤应标记为 blocked"""
@@ -452,6 +482,19 @@ class TestBatchGetPlaylistProgress:
         processable = p['total'] - p['unavailable']
         assert processable == p['completed'] + p['partial_completed'] + p['failed'] + p['pending']
 
+    def test_skipped_step_counts_as_partial_completion(self, db):
+        db.add_playlist(Playlist(id="PL2", title="Test2", source_url="https://example.com"))
+        _add_video(db, "v_skip")
+        db.add_video_to_playlist("v_skip", "PL2", playlist_index=1)
+        db.add_task(Task(video_id="v_skip", step=TaskStep.DOWNLOAD, status=TaskStatus.COMPLETED))
+        db.add_task(Task(video_id="v_skip", step=TaskStep.WHISPER, status=TaskStatus.SKIPPED))
+
+        progress = db.batch_get_playlist_progress()
+        p = progress["PL2"]
+        assert p["completed"] == 0
+        assert p["partial_completed"] == 1
+        assert p["pending"] == 0
+
 
 # ==================== DB Version ====================
 
@@ -480,6 +523,11 @@ class TestIsStepCompleted:
 
     def test_no_task_returns_false(self, db):
         _add_video(db, "v1")
+        assert db.is_step_completed("v1", TaskStep.DOWNLOAD) is False
+
+    def test_skipped_returns_false(self, db):
+        _add_video(db, "v1")
+        db.add_task(Task(video_id="v1", step=TaskStep.DOWNLOAD, status=TaskStatus.SKIPPED))
         assert db.is_step_completed("v1", TaskStep.DOWNLOAD) is False
 
 

@@ -12,8 +12,12 @@ from dataclasses import dataclass
 
 from .base import BaseUploader
 from vat.utils.logger import setup_logger
+from vat.utils.resource_lock import resource_lock
 
 logger = setup_logger("uploader.bilibili")
+
+BiliBili = None
+Data = None
 
 try:
     from biliup.plugins.bili_webup import BiliBili, Data
@@ -66,7 +70,10 @@ class BilibiliUploader(BaseUploader):
         self,
         cookies_file: str,
         line: str = 'AUTO',
-        threads: int = 3
+        threads: int = 3,
+        lock_db_path: str = "",
+        upload_interval: int = 0,
+        max_concurrent_uploads: int = 1,
     ):
         """
         初始化B站上传器
@@ -82,9 +89,36 @@ class BilibiliUploader(BaseUploader):
         self.cookies_file = Path(cookies_file).expanduser()
         self.line = line
         self.threads = threads
+        self.lock_db_path = str(Path(lock_db_path).expanduser()) if lock_db_path else ""
+        self.upload_interval = int(upload_interval or 0)
+        self.max_concurrent_uploads = int(max_concurrent_uploads)
+        if self.max_concurrent_uploads < 1:
+            raise ValueError(
+                f"max_concurrent_uploads 必须 >= 1，得到 {self.max_concurrent_uploads}"
+            )
         self.cookie_data = None
         self._raw_cookie_data = None
         self._cookie_loaded = False
+
+    def _require_lock_db_path(self, method_name: str) -> None:
+        """真实视频上传必须显式提供锁库路径，避免出现无锁旁路。"""
+        if not self.lock_db_path:
+            raise RuntimeError(
+                f"BilibiliUploader.{method_name}() 需要 lock_db_path 才允许执行，"
+                "以保证 bilibili_upload 全局锁生效。"
+            )
+
+    def _upload_lock(self, method_name: str):
+        """构造 B站上传的跨进程全局锁。"""
+        self._require_lock_db_path(method_name)
+        return resource_lock(
+            db_path=self.lock_db_path,
+            resource_type='bilibili_upload',
+            cooldown_seconds=self.upload_interval,
+            timeout_seconds=1800,
+            lock_ttl_seconds=7200,
+            max_concurrent=self.max_concurrent_uploads,
+        )
     
     def _load_cookie(self):
         """加载cookie文件"""
@@ -152,6 +186,8 @@ class BilibiliUploader(BaseUploader):
         video_path = Path(video_path)
         if not video_path.exists():
             return UploadResult(success=False, error=f"视频文件不存在: {video_path}")
+
+        self._require_lock_db_path("upload")
         
         # 加载cookie
         try:
@@ -186,54 +222,55 @@ class BilibiliUploader(BaseUploader):
             if dynamic:
                 data.dynamic = dynamic
             
-            with BiliBili(data) as bili:
-                # 登录（biliup 要求原始 JSON 结构，含 cookie_info/token_info）
-                bili.login_by_cookies(self._raw_cookie_data)
-                if 'access_token' in self.cookie_data:
-                    bili.access_token = self.cookie_data['access_token']
-                
-                # 上传封面
-                if cover_path and Path(cover_path).exists():
-                    logger.info(f"上传封面: {cover_path}")
-                    try:
-                        cover_url = bili.cover_up(str(cover_path))
-                        data.cover = cover_url.replace('http:', '')
-                        logger.info(f"封面上传成功")
-                    except Exception as e:
-                        logger.warning(f"封面上传失败，继续上传视频: {e}")
-                
-                # 上传视频文件（含 B站风控重试：preupload 不返回 auth 时等待后重试）
-                logger.info("上传视频文件...")
-                max_retries = 3
-                retry_base_wait = 120  # 首次重试等待 120s，后续指数递增
-                for attempt in range(max_retries + 1):
-                    try:
-                        video_part = bili.upload_file(str(video_path), lines=self.line, tasks=self.threads)
-                        break
-                    except KeyError as ke:
-                        if attempt < max_retries:
-                            wait = retry_base_wait * (2 ** attempt)
-                            logger.warning(
-                                f"上传视频文件失败 (KeyError: {ke})，疑似B站风控。"
-                                f"等待 {wait}s 后重试 ({attempt + 1}/{max_retries})..."
-                            )
-                            time.sleep(wait)
-                        else:
-                            raise
-                video_part['title'] = 'P1'
-                data.append(video_part)
-                
-                # 使用 Web 端 API 提交（TV 端 API 已停用）
-                logger.info("提交视频（Web端API）...")
-                ret = bili.submit_web()
-                
-                if ret.get('code') == 0:
-                    resp_data = ret.get('data', {})
-                    bvid = resp_data.get('bvid', '')
-                    aid = resp_data.get('aid', 0)
-                    logger.info(f"上传成功: {title}, BV号: {bvid}, AV号: {aid}")
-                    return UploadResult(success=True, bvid=bvid, aid=aid)
-                else:
+            with self._upload_lock("upload"):
+                with BiliBili(data) as bili:
+                    # 登录（biliup 要求原始 JSON 结构，含 cookie_info/token_info）
+                    bili.login_by_cookies(self._raw_cookie_data)
+                    if 'access_token' in self.cookie_data:
+                        bili.access_token = self.cookie_data['access_token']
+
+                    # 上传封面
+                    if cover_path and Path(cover_path).exists():
+                        logger.info(f"上传封面: {cover_path}")
+                        try:
+                            cover_url = bili.cover_up(str(cover_path))
+                            data.cover = cover_url.replace('http:', '')
+                            logger.info(f"封面上传成功")
+                        except Exception as e:
+                            logger.warning(f"封面上传失败，继续上传视频: {e}")
+
+                    # 上传视频文件（含 B站风控重试：preupload 不返回 auth 时等待后重试）
+                    logger.info("上传视频文件...")
+                    max_retries = 3
+                    retry_base_wait = 120  # 首次重试等待 120s，后续指数递增
+                    for attempt in range(max_retries + 1):
+                        try:
+                            video_part = bili.upload_file(str(video_path), lines=self.line, tasks=self.threads)
+                            break
+                        except KeyError as ke:
+                            if attempt < max_retries:
+                                wait = retry_base_wait * (2 ** attempt)
+                                logger.warning(
+                                    f"上传视频文件失败 (KeyError: {ke})，疑似B站风控。"
+                                    f"等待 {wait}s 后重试 ({attempt + 1}/{max_retries})..."
+                                )
+                                time.sleep(wait)
+                            else:
+                                raise
+                    video_part['title'] = 'P1'
+                    data.append(video_part)
+
+                    # 使用 Web 端 API 提交（TV 端 API 已停用）
+                    logger.info("提交视频（Web端API）...")
+                    ret = bili.submit_web()
+
+                    if ret.get('code') == 0:
+                        resp_data = ret.get('data', {})
+                        bvid = resp_data.get('bvid', '')
+                        aid = resp_data.get('aid', 0)
+                        logger.info(f"上传成功: {title}, BV号: {bvid}, AV号: {aid}")
+                        return UploadResult(success=True, bvid=bvid, aid=aid)
+
                     error_msg = ret.get('message', '未知错误')
                     logger.error(f"上传失败: {error_msg}")
                     return UploadResult(success=False, error=error_msg)
@@ -1429,30 +1466,44 @@ class BilibiliUploader(BaseUploader):
         Returns:
             是否成功
         """
+        context = self._load_replace_video_context(aid)
+        if not context:
+            return False
+
+        new_filename = self._upload_replacement_file(new_video_path, context['old_videos'][0])
+        if not new_filename:
+            return False
+
+        return self._apply_replace_edit(
+            session=context['session'],
+            bili_jct=context['bili_jct'],
+            aid=aid,
+            archive=context['archive'],
+            old_videos=context['old_videos'],
+            new_filename=new_filename,
+        )
+
+    def _load_replace_video_context(self, aid: int) -> Optional[Dict[str, Any]]:
+        """加载 replace_video 所需的远端上下文。"""
         session = self._get_authenticated_session()
         bili_jct = self.cookie_data.get('bili_jct', '')
         assert bili_jct, "bili_jct 为空"
-        
-        # 1. 获取稿件当前信息
+
         detail = self.get_archive_detail(aid)
         if not detail:
-            return False
-        
+            return None
+
         archive = detail['archive']
         old_videos = detail['videos']
-        
         if not old_videos:
             logger.error(f"稿件 av{aid} 无视频信息")
-            return False
-        
-        # 创作中心 API 的 tag 字段对退回视频通常为空，desc 被截断到 250 字符。
-        # 必须从公共 API 补全这些字段（与 edit_video_info 一致）。
+            return None
+
         creator_desc = archive.get('desc', '')
         creator_tag = archive.get('tag', '')
-        
+
         pub_detail = self.get_video_detail(aid)
         if pub_detail:
-            # 补全 tags：公共 API 返回 tag 对象列表或逗号分隔字符串
             if not creator_tag:
                 pub_tags = pub_detail.get('tag', '')
                 if isinstance(pub_tags, list):
@@ -1462,59 +1513,69 @@ class BilibiliUploader(BaseUploader):
                 if pub_tags:
                     archive['tag'] = pub_tags
                     logger.info(f"  使用公共 API 补全 tags: {pub_tags[:80]}")
-            
-            # 补全 desc：公共 API 通常返回更完整的 desc
+
             pub_desc = pub_detail.get('desc', '')
             if len(pub_desc) > len(creator_desc):
                 archive['desc'] = pub_desc
                 logger.info(f"  使用公共 API 补全 desc ({len(pub_desc)} 字符，创作中心仅 {len(creator_desc)})")
-        
-        # 额外尝试：_get_full_desc 单独请求完整 desc（双重保险）
+
         if len(archive.get('desc', '')) <= 250:
             full_desc = self._get_full_desc(aid, session)
             if full_desc and len(full_desc) > len(archive.get('desc', '')):
                 archive['desc'] = full_desc
                 logger.info(f"  _get_full_desc 获取更完整 desc ({len(full_desc)} 字符)")
-        
+
         logger.info(f"替换视频 av{aid}: {archive.get('title', '')[:50]}")
-        logger.info(f"  新视频文件: {new_video_path}")
-        logger.info(f"  tag: {archive.get('tag', '')[:80] or '(空)'}")
-        logger.info(f"  desc 长度: {len(archive.get('desc', ''))} 字符")
-        
-        # 2. 上传新视频文件（只上传文件，不创建稿件）
+        return {
+            "session": session,
+            "bili_jct": bili_jct,
+            "archive": archive,
+            "old_videos": old_videos,
+        }
+
+    def _upload_replacement_file(self, new_video_path: Path, old_video: Dict[str, Any]) -> Optional[str]:
+        """上传替换视频文件，返回新 filename。"""
         try:
-            from biliup.plugins.bili_webup import BiliBili, Data
-            
+            self._require_lock_db_path("_upload_replacement_file")
             self._load_cookie()
             video_part = Data()
-            video_part.title = old_videos[0].get('title', '')
-            video_part.desc = old_videos[0].get('desc', '')
-            
-            with BiliBili(video_part) as bili:
-                bili.login_by_cookies(self._raw_cookie_data)
-                
-                # 上传视频文件
-                new_video_path = Path(new_video_path)
-                uploaded = bili.upload_file(str(new_video_path), lines=self.line, tasks=self.threads)
-                logger.info(f"  upload_file 返回值: {uploaded}")
-                
-                if not uploaded:
-                    logger.error(f"视频文件上传失败: 返回值为空")
-                    return False
-                
-                # biliup upload_file 返回 dict，filename 字段名可能是 'bili_filename' 或 'filename'
-                new_filename = uploaded.get('bili_filename') or uploaded.get('filename')
-                if not new_filename:
-                    logger.error(f"视频文件上传后无 filename 字段: {uploaded}")
-                    return False
-                
-                logger.info(f"  新视频上传成功: filename={new_filename}")
-                
+            video_part.title = old_video.get('title', '')
+            video_part.desc = old_video.get('desc', '')
+
+            with self._upload_lock("_upload_replacement_file"):
+                with BiliBili(video_part) as bili:
+                    bili.login_by_cookies(self._raw_cookie_data)
+
+                    new_video_path = Path(new_video_path)
+                    uploaded = bili.upload_file(str(new_video_path), lines=self.line, tasks=self.threads)
+                    logger.info(f"  upload_file 返回值: {uploaded}")
+
+                    if not uploaded:
+                        logger.error("视频文件上传失败: 返回值为空")
+                        return None
+
+                    new_filename = uploaded.get('bili_filename') or uploaded.get('filename')
+                    if not new_filename:
+                        logger.error(f"视频文件上传后无 filename 字段: {uploaded}")
+                        return None
+
+                    logger.info(f"  新视频上传成功: filename={new_filename}")
+                    return new_filename
         except Exception as e:
             logger.error(f"上传新视频文件异常: {e}")
-            return False
-        
-        # 3. 编辑稿件，替换视频 filename
+            return None
+
+    def _apply_replace_edit(
+        self,
+        *,
+        session,
+        bili_jct: str,
+        aid: int,
+        archive: Dict[str, Any],
+        old_videos: List[Dict[str, Any]],
+        new_filename: str,
+    ) -> bool:
+        """应用 replace_video 的 edit 阶段。"""
         try:
             edit_payload = {
                 'aid': aid,
@@ -1532,7 +1593,7 @@ class BilibiliUploader(BaseUploader):
                 }],
                 'csrf': bili_jct,
             }
-            
+
             resp = session.post(
                 f'https://member.bilibili.com/x/vu/web/edit?csrf={bili_jct}',
                 json=edit_payload,
@@ -1543,14 +1604,13 @@ class BilibiliUploader(BaseUploader):
                 timeout=15
             )
             result = resp.json()
-            
+
             if result.get('code') == 0:
                 logger.info(f"  ✅ 稿件 av{aid} 视频已替换，已重新提交审核")
                 return True
-            else:
-                logger.error(f"  编辑稿件失败: code={result.get('code')}, msg={result.get('message')}")
-                return False
-                
+
+            logger.error(f"  编辑稿件失败: code={result.get('code')}, msg={result.get('message')}")
+            return False
         except Exception as e:
             logger.error(f"编辑稿件异常: {e}")
             return False
@@ -1742,82 +1802,232 @@ class BilibiliUploader(BaseUploader):
                 'message': str,
             }
         """
-        from ..embedder.ffmpeg_wrapper import FFmpegWrapper
-        
         def _cb(msg):
             if callback:
                 callback(msg)
             logger.info(msg)
-        
+
         result = {
             'success': False, 'new_ranges': [], 'all_ranges': [],
             'masked_path': None, 'source': 'local', 'message': '',
+            'state': 'pending', 'last_successful_state': None,
         }
         
-        # Step 1: 获取退回信息
+        try:
+            violation_ctx = self._load_violation_context(
+                aid,
+                previous_ranges=previous_ranges,
+                callback=_cb,
+            )
+        except ValueError as e:
+            result['message'] = str(e)
+            return result
+
+        result['new_ranges'] = violation_ctx['new_ranges']
+        result['state'] = 'violation_info_loaded'
+        result['last_successful_state'] = 'violation_info_loaded'
+
+        try:
+            source_ctx = self._resolve_violation_source_video(
+                aid,
+                video_path=video_path,
+                callback=_cb,
+            )
+        except RuntimeError as e:
+            result['message'] = str(e)
+            return result
+
+        result['source'] = source_ctx['source_type']
+        tmp_download = source_ctx['tmp_download']
+
+        try:
+            mask_ctx = self._render_violation_mask(
+                source_video=source_ctx['source_video'],
+                all_ranges=violation_ctx['all_ranges'],
+                mask_text=mask_text,
+                margin_sec=margin_sec,
+                callback=_cb,
+            )
+        except RuntimeError as e:
+            result['message'] = str(e)
+            if tmp_download and tmp_download.exists():
+                tmp_download.unlink(missing_ok=True)
+            return result
+
+        masked_path = mask_ctx['masked_path']
+        result['all_ranges'] = mask_ctx['all_ranges']
+        result['masked_path'] = str(masked_path)
+        result['state'] = 'masked_video_ready'
+        result['last_successful_state'] = 'masked_video_ready'
+        
+        # Step 5: 上传替换（除非 dry_run）
+        if dry_run:
+            _cb(f"  dry-run 模式，跳过上传。遮罩文件: {masked_path}")
+            result['success'] = True
+            result['message'] = 'dry-run 完成'
+            if tmp_download and tmp_download.exists():
+                tmp_download.unlink(missing_ok=True)
+            return result
+
+        submit_result = self._submit_violation_replacement(aid, masked_path, callback=_cb)
+        result.update(submit_result)
+
+        if result['success']:
+            # 清理遮罩临时文件
+            masked_path.unlink(missing_ok=True)
+            result['masked_path'] = None
+
+        # 清理下载的临时文件
+        if tmp_download and tmp_download.exists():
+            tmp_download.unlink(missing_ok=True)
+
+        return result
+
+    def _load_violation_context(
+        self,
+        aid: int,
+        previous_ranges: Optional[List[tuple]] = None,
+        callback: Optional[callable] = None,
+    ) -> Dict[str, Any]:
+        """加载本轮违规修复的上下文，包括新违规段和累积段。"""
+        def _cb(msg):
+            if callback:
+                callback(msg)
+            else:
+                logger.info(msg)
+
         _cb(f"获取 av{aid} 审核退回信息...")
         rejected = self.get_rejected_videos()
         target = [v for v in rejected if v['aid'] == aid]
-        
+
         if not target:
-            result['message'] = f"未找到 aid={aid} 的退回稿件"
-            return result
-        
-        t = target[0]
-        _cb(f"  标题: {t['title'][:60]}")
-        
-        # 收集本次新违规时间段
+            raise ValueError(f"未找到 aid={aid} 的退回稿件")
+
+        target_item = target[0]
+        _cb(f"  标题: {target_item['title'][:60]}")
+
         new_ranges = []
-        for p in t['problems']:
-            new_ranges.extend(p['time_ranges'])
-            _cb(f"  违规: {p['reason'][:50]}  时间: {p['violation_time']}")
-            if p['is_full_video']:
-                result['message'] = "全片违规，无法通过遮罩修复"
-                return result
-        
+        for problem in target_item['problems']:
+            new_ranges.extend(problem['time_ranges'])
+            _cb(f"  违规: {problem['reason'][:50]}  时间: {problem['violation_time']}")
+            if problem['is_full_video']:
+                raise ValueError("全片违规，无法通过遮罩修复")
+
         if not new_ranges:
-            result['message'] = "无具体违规时间段，无法自动修复"
-            return result
-        
-        result['new_ranges'] = new_ranges
-        
-        # Step 2: 合并历史 mask ranges + 本次新 ranges
+            raise ValueError("无具体违规时间段，无法自动修复")
+
         all_ranges = list(previous_ranges or []) + new_ranges
         _cb(f"  本次新违规: {new_ranges}")
         if previous_ranges:
             _cb(f"  历史已 mask: {previous_ranges}")
             _cb(f"  合并后总计: {len(all_ranges)} 段")
-        
-        # Step 3: 确定视频源
+
+        return {
+            'target': target_item,
+            'new_ranges': new_ranges,
+            'all_ranges': all_ranges,
+        }
+
+    def _resolve_violation_source_video(
+        self,
+        aid: int,
+        video_path: Optional[Path] = None,
+        callback: Optional[callable] = None,
+    ) -> Dict[str, Any]:
+        """决定本轮违规修复使用的源视频。"""
+        def _cb(msg):
+            if callback:
+                callback(msg)
+            else:
+                logger.info(msg)
+
+        import shutil
         import tempfile
-        source_video = None
-        source_type = 'local'
-        tmp_download = None
-        
+
         if video_path and Path(video_path).exists():
             source_video = Path(video_path)
             _cb(f"  使用本地文件: {source_video} ({source_video.stat().st_size / 1024 / 1024:.0f}MB)")
-        else:
-            # 降级：从 B站下载
-            source_type = 'bilibili'
-            _cb("  ⚠️ 本地文件不可用，从 B站下载（质量会降低）...")
-            tmp_dir = Path(tempfile.mkdtemp(prefix=f"bili_fix_{aid}_"))
-            tmp_download = tmp_dir / f"av{aid}_source.mp4"
-            
-            if not self.download_video(aid, tmp_download):
-                result['message'] = "从 B站下载视频失败"
-                return result
-            
-            source_video = tmp_download
-            _cb(f"  B站下载完成: {source_video.stat().st_size / 1024 / 1024:.0f}MB")
-        
-        result['source'] = source_type
-        
-        # Step 4: ffmpeg 遮罩
+            return {
+                'source_video': source_video,
+                'source_type': 'local',
+                'tmp_download': None,
+            }
+
+        _cb("  ⚠️ 本地文件不可用，从 B站下载（质量会降低）...")
+        tmp_dir = Path(tempfile.mkdtemp(prefix=f"bili_fix_{aid}_"))
+        tmp_download = tmp_dir / f"av{aid}_source.mp4"
+
+        if not self.download_video(aid, tmp_download):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise RuntimeError("从 B站下载视频失败")
+
+        _cb(f"  B站下载完成: {tmp_download.stat().st_size / 1024 / 1024:.0f}MB")
+        return {
+            'source_video': tmp_download,
+            'source_type': 'bilibili',
+            'tmp_download': tmp_download,
+        }
+
+    def _submit_violation_replacement(
+        self,
+        aid: int,
+        masked_path: Path,
+        callback: Optional[callable] = None,
+    ) -> Dict[str, Any]:
+        """提交违规修复后的替换视频，并返回显式阶段结果。"""
+        def _cb(msg):
+            if callback:
+                callback(msg)
+            else:
+                logger.info(msg)
+
+        _cb("上传替换...")
+        import time as _time
+
+        upload_start = _time.monotonic()
+        replace_ok = self.replace_video(aid, masked_path)
+        upload_duration = _time.monotonic() - upload_start
+
+        if replace_ok:
+            _cb(f"  ✅ av{aid} 修复完成")
+            return {
+                'success': True,
+                'state': 'replacement_submitted',
+                'last_successful_state': 'replacement_submitted',
+                'message': '修复完成，已重新提交审核',
+                'upload_duration': upload_duration,
+            }
+
+        _cb("  ❌ 上传替换失败")
+        return {
+            'success': False,
+            'state': 'failed',
+            'last_successful_state': 'masked_video_ready',
+            'message': '上传替换失败，遮罩文件已保留',
+            'upload_duration': upload_duration,
+        }
+
+    def _render_violation_mask(
+        self,
+        source_video: Path,
+        all_ranges: List[tuple],
+        mask_text: str,
+        margin_sec: float,
+        callback: Optional[callable] = None,
+    ) -> Dict[str, Any]:
+        """执行违规遮罩渲染，并返回供持久化的原始 ranges。"""
+        from ..embedder.ffmpeg_wrapper import FFmpegWrapper
+
+        def _cb(msg):
+            if callback:
+                callback(msg)
+            else:
+                logger.info(msg)
+
         _cb("开始遮罩处理...")
         ffmpeg = FFmpegWrapper()
         masked_path = source_video.parent / f"{source_video.stem}_masked{source_video.suffix}"
-        
+
         ok = ffmpeg.mask_violation_segments(
             video_path=source_video,
             output_path=masked_path,
@@ -1825,280 +2035,24 @@ class BilibiliUploader(BaseUploader):
             mask_text=mask_text,
             margin_sec=margin_sec,
         )
-        
         if not ok:
-            result['message'] = "遮罩处理失败"
-            return result
-        
+            raise RuntimeError("遮罩处理失败")
+
         out_size = masked_path.stat().st_size / 1024 / 1024
         _cb(f"  遮罩完成: {masked_path.name} ({out_size:.0f}MB)")
-        
-        # 保存原始违规范围（不含 margin），供下次累积使用
-        # margin 仅在 mask_violation_segments 内部动态应用，不持久化
+
         video_info = ffmpeg.get_video_info(source_video) or {}
-        raw_merged = ffmpeg._merge_ranges(all_ranges, 0, 
-                                          video_info.get('duration', 0))
-        result['all_ranges'] = raw_merged
-        result['masked_path'] = str(masked_path)
-        
-        # Step 5: 上传替换（除非 dry_run）
-        if dry_run:
-            _cb(f"  dry-run 模式，跳过上传。遮罩文件: {masked_path}")
-            result['success'] = True
-            result['message'] = 'dry-run 完成'
-            return result
-        
-        _cb("上传替换...")
-        import time as _time
-        _upload_start = _time.monotonic()
-        replace_ok = self.replace_video(aid, masked_path)
-        result['upload_duration'] = _time.monotonic() - _upload_start
-        
-        if replace_ok:
-            result['success'] = True
-            result['message'] = '修复完成，已重新提交审核'
-            _cb(f"  ✅ av{aid} 修复完成")
-            # 清理遮罩临时文件
-            masked_path.unlink(missing_ok=True)
-            result['masked_path'] = None
-        else:
-            result['message'] = '上传替换失败，遮罩文件已保留'
-            _cb(f"  ❌ 上传替换失败")
-        
-        # 清理下载的临时文件
-        if tmp_download and tmp_download.exists():
-            tmp_download.unlink(missing_ok=True)
-        
-        return result
+        raw_merged = ffmpeg._merge_ranges(all_ranges, 0, video_info.get('duration', 0))
+
+        return {
+            'masked_path': masked_path,
+            'all_ranges': raw_merged,
+        }
 
 
 def season_sync(db, uploader: BilibiliUploader, playlist_id: str) -> Dict[str, Any]:
-    """
-    批量将已上传但未入集的视频添加到 B站 合集，然后按 #数字 排序。
-    同时执行诊断检查，发现并汇报异常状态的视频。
-    
-    核心同步逻辑：
-    - metadata 中有 bilibili_aid（已上传到B站）
-    - metadata 中有 bilibili_target_season_id（配置了目标合集）
-    - bilibili_season_added != True（尚未成功添加到合集）
-    
-    诊断检查：
-    - upload_completed_no_aid: upload task 已完成但 metadata 无 bilibili_aid
-      （上传成功但 DB 未记录 aid，可能是上传过程中崩溃）
-    - aid_not_found_on_bilibili: 有 bilibili_aid 但 B站两个 API 都查不到
-      （视频可能已被删除，或 aid 记录错误）
-    
-    Args:
-        db: 数据库实例
-        uploader: B站上传器实例（已认证）
-        playlist_id: Playlist ID，限定处理范围
-        
-    Returns:
-        {
-            'total': int,       # 待处理总数
-            'success': int,     # 成功数
-            'failed': int,      # 失败数
-            'skipped': int,     # 跳过数（已在合集中）
-            'season_ids': set,  # 涉及的合集ID（用于排序）
-            'failed_videos': list,  # 失败的 video_id 列表
-            'diagnostics': {    # 诊断结果
-                'upload_completed_no_aid': list,  # (video_id, title) 列表
-                'aid_not_found_on_bilibili': list,  # (video_id, aid, title) 列表
-            }
-        }
-    """
-    from vat.services.playlist_service import PlaylistService
-    from vat.models import TaskStep, TaskStatus
-    
-    playlist_service = PlaylistService(db)
-    videos = playlist_service.get_playlist_videos(playlist_id)
-    
-    # === 诊断：upload task 已完成但无 bilibili_aid ===
-    upload_completed_no_aid = []
-    for v in videos:
-        meta = v.metadata or {}
-        if not meta.get('bilibili_aid'):
-            if db.is_step_completed(v.id, TaskStep.UPLOAD):
-                upload_completed_no_aid.append((v.id, v.title[:40] if v.title else v.id))
-    
-    if upload_completed_no_aid:
-        logger.warning(
-            f"[诊断] {len(upload_completed_no_aid)} 个视频 upload 已完成但无 bilibili_aid"
-            f"（上传成功但 DB 未记录 aid，需手动核实）:"
-        )
-        for vid, title in upload_completed_no_aid:
-            logger.warning(f"  - {vid}: {title}")
-    
-    # === 筛选待同步的视频 ===
-    pending = []
-    for v in videos:
-        meta = v.metadata or {}
-        aid = meta.get('bilibili_aid')
-        target_season = meta.get('bilibili_target_season_id')
-        already_added = meta.get('bilibili_season_added', False)
-        
-        if aid and target_season and not already_added:
-            pending.append((v, int(aid), int(target_season)))
-    
-    result = {
-        'total': len(pending),
-        'success': 0,
-        'failed': 0,
-        'skipped': 0,
-        'season_ids': set(),
-        'failed_videos': [],
-        'diagnostics': {
-            'upload_completed_no_aid': upload_completed_no_aid,
-            'aid_not_found_on_bilibili': [],
-        },
-    }
-    
-    if not pending:
-        logger.info(f"Playlist {playlist_id}: 没有待同步的视频")
-    else:
-        logger.info(f"Playlist {playlist_id}: 找到 {len(pending)} 个待同步视频")
-        
-        for i, (video, aid, season_id) in enumerate(pending):
-            result['season_ids'].add(season_id)
-            try:
-                add_result = uploader.add_to_season(aid, season_id)
-                if add_result:
-                    result['success'] += 1
-                    # 更新 DB 标记
-                    updated_meta = dict(video.metadata or {})
-                    updated_meta['bilibili_season_added'] = True
-                    db.update_video(video.id, metadata=updated_meta)
-                    logger.info(f"✓ {video.title or video.id} -> 合集 {season_id}")
-                else:
-                    result['failed'] += 1
-                    result['failed_videos'].append(video.id)
-                    logger.warning(f"✗ {video.title or video.id} -> 合集 {season_id} 失败")
-            except Exception as e:
-                result['failed'] += 1
-                result['failed_videos'].append(video.id)
-                logger.error(f"✗ {video.title or video.id} -> 合集 {season_id} 异常: {e}")
-            # B站合集编辑 API 有频率限制（code=20111），请求间需间隔避免触发
-            if i < len(pending) - 1:
-                time.sleep(3)
-    
-    # === 诊断：检测有 aid 但 B站找不到的视频 ===
-    # 从失败列表中，尝试区分"B站找不到"和"添加接口报错"两种情况
-    # 对失败的视频，主动验证 aid 是否在 B站 存在
-    aid_not_found = []
-    for vid_id in result['failed_videos']:
-        v = next((v for v in videos if v.id == vid_id), None)
-        if not v:
-            continue
-        meta = v.metadata or {}
-        aid = meta.get('bilibili_aid')
-        if not aid:
-            continue
-        # 用创作中心 API 验证（比公共 API 更可靠，支持未发布/审核中视频）
-        try:
-            session = uploader._get_authenticated_session()
-            resp = session.get(
-                'https://member.bilibili.com/x/client/archive/view',
-                params={'aid': int(aid)},
-                timeout=10
-            )
-            data = resp.json()
-            if data.get('code') != 0:
-                aid_not_found.append((vid_id, int(aid), v.title[:40] if v.title else vid_id))
-        except Exception:
-            pass  # 网络异常不算"找不到"
-    
-    if aid_not_found:
-        result['diagnostics']['aid_not_found_on_bilibili'] = aid_not_found
-        logger.warning(
-            f"[诊断] {len(aid_not_found)} 个视频有 bilibili_aid 但 B站查不到"
-            f"（可能已被删除或 aid 记录错误）:"
-        )
-        for vid, aid, title in aid_not_found:
-            logger.warning(f"  - {vid} (av{aid}): {title}")
-    
-    # === 一致性校验：检测 DB 标记 season_added=True 但实际不在合集的视频 ===
-    # 场景：sync_season_episode_titles 删后重加失败、B站侧移除、其他异常
-    # 对每个涉及的合集，获取实际视频列表，与 DB 标记对比，不一致的自动重新添加
-    all_season_ids = set()
-    for v in videos:
-        meta = v.metadata or {}
-        sid = meta.get('bilibili_target_season_id')
-        if sid and meta.get('bilibili_aid') and meta.get('bilibili_season_added'):
-            all_season_ids.add(int(sid))
-    # 也包含本轮新添加涉及的合集
-    all_season_ids.update(result['season_ids'])
-    
-    desync_fixed = 0
-    desync_failed = 0
-    for sid in all_season_ids:
-        try:
-            season_data = uploader.get_season_episodes(sid)
-            if not season_data:
-                continue
-            actual_aids = {ep['aid'] for ep in season_data.get('episodes', [])}
-            
-            # 找 DB 标记 season_added=True 但实际不在合集的视频
-            for v in videos:
-                meta = v.metadata or {}
-                if (meta.get('bilibili_season_added') and 
-                    meta.get('bilibili_target_season_id') and 
-                    int(meta['bilibili_target_season_id']) == sid):
-                    aid = meta.get('bilibili_aid')
-                    if aid and aid not in actual_aids:
-                        title = (v.title or v.id)[:40]
-                        logger.warning(
-                            f"[一致性修复] {v.id} (av{aid}) DB 标记已入集但实际不在合集 {sid}，重新添加..."
-                        )
-                        if uploader.add_to_season(int(aid), sid):
-                            desync_fixed += 1
-                            logger.info(f"  ✓ 重新添加成功: {title}")
-                        else:
-                            desync_failed += 1
-                            # 修正 DB 标记，避免下次 sync 仍然跳过
-                            updated_meta = dict(meta)
-                            updated_meta['bilibili_season_added'] = False
-                            db.update_video(v.id, metadata=updated_meta)
-                            logger.error(f"  ✗ 重新添加失败: {title}（已修正 DB 标记为 False）")
-                        time.sleep(3)
-        except Exception as e:
-            logger.warning(f"一致性校验合集 {sid} 异常: {e}")
-    
-    if desync_fixed or desync_failed:
-        result['diagnostics']['desync_fixed'] = desync_fixed
-        result['diagnostics']['desync_failed'] = desync_failed
-        logger.info(
-            f"[一致性校验] 修复 {desync_fixed} 个不一致视频"
-            f"{f'，{desync_failed} 个修复失败' if desync_failed else ''}"
-        )
-    
-    # 对涉及的每个合集执行排序
-    for season_id in all_season_ids:
-        try:
-            if uploader.auto_sort_season(season_id):
-                logger.info(f"✓ 合集 {season_id} 排序完成")
-            else:
-                logger.warning(f"⚠ 合集 {season_id} 排序失败")
-        except Exception as e:
-            logger.warning(f"⚠ 合集 {season_id} 排序异常: {e}")
-    
-    # 汇总
-    diag = result['diagnostics']
-    diag_msgs = []
-    if diag['upload_completed_no_aid']:
-        diag_msgs.append(f"{len(diag['upload_completed_no_aid'])} 个 upload 完成但无 aid")
-    if diag['aid_not_found_on_bilibili']:
-        diag_msgs.append(f"{len(diag['aid_not_found_on_bilibili'])} 个 aid 在B站查不到")
-    if diag.get('desync_fixed'):
-        diag_msgs.append(f"{diag['desync_fixed']} 个不一致视频已修复")
-    if diag.get('desync_failed'):
-        diag_msgs.append(f"{diag['desync_failed']} 个不一致视频修复失败")
-    
-    diag_str = f"，诊断问题: {'; '.join(diag_msgs)}" if diag_msgs else ""
-    logger.info(
-        f"Season sync 完成: {result['success']} 成功, "
-        f"{result['failed']} 失败, {result['skipped']} 跳过{diag_str}"
-    )
-    return result
+    from vat.services.bilibili_workflows import season_sync as _season_sync
+    return _season_sync(db, uploader, playlist_id)
 
 
 def resync_video_info(
@@ -2108,143 +2062,8 @@ def resync_video_info(
     aid: int,
     callback: Optional[callable] = None,
 ) -> Dict[str, Any]:
-    """
-    从 DB 和模板重新渲染视频元信息（title/desc/tags/tid）并同步到 B站。
-    
-    用于修正历史不一致（如 upload_order_index 变更后标题编号不对、
-    翻译更新后需要同步、fix-violation 后恢复正确元信息等）。
-    
-    流程：
-    1. 通过 aid 在 DB 中查找对应视频
-    2. 获取 playlist 信息和 upload_order_index
-    3. 用模板渲染 title/desc
-    4. 从翻译结果获取 tags/tid
-    5. 调用 edit_video_info 更新到 B站
-    
-    Args:
-        db: Database 实例
-        uploader: BilibiliUploader 实例
-        config: 配置对象
-        aid: B站稿件 AV号
-        callback: 日志回调（可选）
-        
-    Returns:
-        {'success': bool, 'title': str, 'message': str}
-    """
-    import json
-    import sqlite3
-    from .template import render_upload_metadata
-    
-    _cb = callback or (lambda msg: None)
-    result = {'success': False, 'title': '', 'message': ''}
-    
-    # 1. 通过 aid 在 DB 中查找视频
-    conn = sqlite3.connect(str(db.db_path))
-    c = conn.cursor()
-    c.execute("SELECT id, metadata FROM videos WHERE metadata LIKE ?", (f'%{aid}%',))
-    rows = c.fetchall()
-    conn.close()
-    
-    video_id = None
-    for (vid, meta_str) in rows:
-        if not meta_str:
-            continue
-        meta = json.loads(meta_str)
-        if str(meta.get('bilibili_aid')) == str(aid):
-            video_id = vid
-            break
-    
-    if not video_id:
-        result['message'] = f'DB 中未找到 av{aid} 对应的视频记录'
-        _cb(result['message'])
-        return result
-    
-    video = db.get_video(video_id)
-    if not video:
-        result['message'] = f'无法加载视频 {video_id}'
-        _cb(result['message'])
-        return result
-    
-    meta = video.metadata or {}
-    translated = meta.get('translated', {})
-    if not translated:
-        result['message'] = f'视频 {video_id} 缺少翻译数据，无法渲染模板'
-        _cb(result['message'])
-        return result
-    
-    # 2. 获取 playlist 信息
-    video_playlists = db.get_video_playlists(video_id)
-    playlist_info = None
-    if video_playlists:
-        # 取第一个 playlist（单 playlist 场景）
-        pl_id = video_playlists[0]
-        playlist = db.get_playlist(pl_id)
-        if playlist:
-            pl_upload_config = (playlist.metadata or {}).get('upload_config', {})
-            pv_info = db.get_playlist_video_info(pl_id, video_id)
-            upload_order_index = pv_info.get('upload_order_index', 0) if pv_info else 0
-            if not upload_order_index:
-                # fallback: video.metadata（不推荐，但总比 0 好）
-                upload_order_index = meta.get('upload_order_index', 0) or 0
-            
-            playlist_info = {
-                'name': playlist.title,
-                'id': pl_id,
-                'index': upload_order_index,
-                'uploader_name': pl_upload_config.get('uploader_name', ''),
-            }
-    
-    # 3. 渲染模板
-    bilibili_config = config.uploader.bilibili
-    templates = {}
-    if bilibili_config.templates:
-        templates = {
-            'title': bilibili_config.templates.title,
-            'description': bilibili_config.templates.description,
-            'custom_vars': bilibili_config.templates.custom_vars,
-        }
-    
-    rendered = render_upload_metadata(video, templates, playlist_info)
-    new_title = rendered['title'][:80]
-    new_desc = rendered['description'][:2000]
-    
-    # 4. tags 和 tid
-    # 合并翻译生成的标签和配置默认标签，去重
-    all_tags = []
-    for t in (translated.get('tags_translated', []) or []):
-        if t and t not in all_tags:
-            all_tags.append(t)
-    for t in (translated.get('tags_generated', []) or []):
-        if t and t not in all_tags:
-            all_tags.append(t)
-    for t in (bilibili_config.default_tags or []):
-        if t and t not in all_tags:
-            all_tags.append(t)
-    new_tags = all_tags[:12] if all_tags else None
-    new_tid = translated.get('recommended_tid') or bilibili_config.default_tid
-    
-    _cb(f"渲染结果: title={new_title[:50]}...")
-    _cb(f"  desc={len(new_desc)}字, tags={new_tags}, tid={new_tid}")
-    
-    # 5. 调用 edit_video_info 更新
-    ok = uploader.edit_video_info(
-        aid=aid,
-        title=new_title,
-        desc=new_desc,
-        tags=new_tags,
-        tid=new_tid,
-    )
-    
-    if ok:
-        result['success'] = True
-        result['title'] = new_title
-        result['message'] = f'av{aid} 元信息已同步'
-        _cb(f"  ✅ {result['message']}")
-    else:
-        result['message'] = f'av{aid} edit_video_info 调用失败'
-        _cb(f"  ❌ {result['message']}")
-    
-    return result
+    from vat.services.bilibili_workflows import resync_video_info as _resync_video_info
+    return _resync_video_info(db, uploader, config, aid, callback=callback)
 
 
 def resync_season_video_infos(
@@ -2255,99 +2074,10 @@ def resync_season_video_infos(
     delay_seconds: float = 1.0,
     callback: Optional[callable] = None,
 ) -> Dict[str, Any]:
-    """
-    按合集批量刷新视频元信息。
-
-    复用 ``resync_video_info`` 的 DB 模板渲染与 ``edit_video_info`` 调用链，
-    顺序处理合集中的每个视频，并在请求之间加入短暂等待，避免频繁编辑触发限流。
-
-    Args:
-        db: Database 实例
-        uploader: BilibiliUploader 实例
-        config: 配置对象
-        season_id: B站合集 ID
-        delay_seconds: 相邻视频之间的等待秒数
-        callback: 日志回调（可选）
-
-    Returns:
-        {
-            'success': bool,         # 批处理是否成功执行到结束；单条失败会体现在 failed 中
-            'season_id': int,
-            'refreshed': int,        # 成功同步数量
-            'failed': int,           # 同步失败数量
-            'skipped': int,          # 缺少 aid 等被跳过数量
-            'details': list,         # 每个条目的结果
-            'message': str,
-        }
-    """
-    _cb = callback or (lambda msg: None)
-    result = {
-        'success': False,
-        'season_id': season_id,
-        'refreshed': 0,
-        'failed': 0,
-        'skipped': 0,
-        'details': [],
-        'message': '',
-    }
-
-    season_info = uploader.get_season_episodes(season_id)
-    if not season_info:
-        result['message'] = '无法获取合集信息'
-        _cb(result['message'])
-        return result
-
-    episodes = season_info.get('episodes', [])
-    if not episodes:
-        result['success'] = True
-        result['message'] = f'合集 {season_id} 中暂无视频'
-        _cb(result['message'])
-        return result
-
-    total = len(episodes)
-    _cb(f"开始同步合集 {season_id} 元信息，共 {total} 个视频")
-
-    for idx, ep in enumerate(episodes):
-        aid = ep.get('aid')
-        if not aid:
-            result['skipped'] += 1
-            result['details'].append({
-                'aid': None,
-                'success': False,
-                'title': '',
-                'message': '合集条目缺少 aid，已跳过',
-            })
-            _cb(f"[{idx + 1}/{total}] 缺少 aid，跳过")
-        else:
-            _cb(f"[{idx + 1}/{total}] 开始同步 av{aid}")
-            try:
-                item = resync_video_info(db, uploader, config, int(aid), callback=_cb)
-            except Exception as e:
-                logger.error(f"批量同步合集 {season_id} 的 av{aid} 异常: {e}", exc_info=True)
-                item = {'success': False, 'title': '', 'message': str(e)}
-
-            if item.get('success'):
-                result['refreshed'] += 1
-            else:
-                result['failed'] += 1
-
-            result['details'].append({
-                'aid': int(aid),
-                'success': bool(item.get('success')),
-                'title': item.get('title', ''),
-                'message': item.get('message', ''),
-            })
-
-        if idx < total - 1 and delay_seconds > 0:
-            time.sleep(delay_seconds)
-
-    result['success'] = True
-    result['message'] = (
-        f"合集 {season_id} 元信息同步完成：成功 {result['refreshed']}，"
-        f"失败 {result['failed']}，跳过 {result['skipped']}"
+    from vat.services.bilibili_workflows import resync_season_video_infos as _resync_season_video_infos
+    return _resync_season_video_infos(
+        db, uploader, config, season_id, delay_seconds=delay_seconds, callback=callback
     )
-    _cb(result['message'])
-    return result
 
 
 def create_bilibili_uploader(config: Any) -> BilibiliUploader:
@@ -2363,5 +2093,8 @@ def create_bilibili_uploader(config: Any) -> BilibiliUploader:
     return BilibiliUploader(
         cookies_file=config.uploader.bilibili.cookies_file,
         line=config.uploader.bilibili.line,
-        threads=config.uploader.bilibili.threads
+        threads=config.uploader.bilibili.threads,
+        lock_db_path=config.storage.database_path,
+        upload_interval=config.uploader.bilibili.upload_interval,
+        max_concurrent_uploads=config.concurrency.max_concurrent_uploads,
     )

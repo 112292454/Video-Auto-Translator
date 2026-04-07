@@ -21,15 +21,17 @@ from ..database import Database
 from ..config import Config
 from ..downloaders import YouTubeDownloader, BaseDownloader, LocalImporter, DirectURLDownloader
 from ..asr import WhisperASR, ASRData, ASRDataSeg, write_srt, write_ass, split_by_llm, ASRPostProcessor
-from ..asr.vocal_separation import VocalSeparator, VocalSeparationResult
 from ..translator import LLMTranslator
 from ..embedder import FFmpegWrapper
+from ..media import extract_audio_ffmpeg
 from ..utils.cache_metadata import CacheMetadata, WHISPER_KEY_CONFIGS, SPLIT_KEY_CONFIGS
 from ..utils.cache import disable_cache, enable_cache
 from ..utils.logger import setup_logger, set_video_id
 from .exceptions import PipelineError, ASRError, TranslateError, EmbedError, DownloadError, UploadError
 from .progress import ProgressTracker, ProgressEvent
-from ..utils.resource_lock import resource_lock
+
+
+PASSTHROUGH_CAPABLE_STEPS = {"split", "optimize", "translate"}
 
 class VideoProcessor:
     """单个视频的完整处理流程"""
@@ -174,6 +176,9 @@ class VideoProcessor:
                 video_format=self.config.downloader.youtube.format,
                 cookies_file=self.config.downloader.youtube.cookies_file,
                 remote_components=self.config.downloader.youtube.remote_components,
+                lock_db_path=str(self.db.db_path),
+                download_cooldown=self.config.downloader.youtube.download_delay,
+                max_concurrent_downloads=self.config.concurrency.max_concurrent_downloads,
             )
         elif st == SourceType.LOCAL:
             return LocalImporter()
@@ -268,14 +273,14 @@ class VideoProcessor:
         first_idx = stage_order[sorted_steps[0]]
         last_idx = stage_order[sorted_steps[-1]]
         
-        # 构建完整的阶段列表（包含中间需要直通的阶段）
+        # 构建完整的阶段列表（包含中间需要补执行/直通的阶段）
         full_steps = []
         passthrough_steps = set()
         
         for i in range(first_idx, last_idx + 1):
             stage_name = DEFAULT_STAGE_SEQUENCE[i].value
             full_steps.append(stage_name)
-            if stage_name not in user_steps:
+            if stage_name not in user_steps and stage_name in PASSTHROUGH_CAPABLE_STEPS:
                 passthrough_steps.add(stage_name)
         
         # 记录直通阶段以便后续处理
@@ -411,13 +416,13 @@ class VideoProcessor:
             # 规则：视频只属于 1 个 playlist 时自动应用；属于多个时警告并保持当前配置
             self._auto_apply_playlist_prompts()
 
-            # 检查视频是否为不可用（如会员限定），若是则直接标记所有阶段完成并跳过
+            # 检查视频是否为不可用（如会员限定），若是则直接标记所有阶段跳过并终止
             video_metadata = self.video.metadata or {}
             if video_metadata.get('unavailable', False):
-                self.progress_callback("视频不可用（会员限定等），跳过处理，标记所有阶段为完成")
+                self.progress_callback("视频不可用（会员限定等），跳过处理，标记所有阶段为 skipped")
                 for step in DEFAULT_STAGE_SEQUENCE:
-                    if not self.db.is_step_completed(self.video_id, step):
-                        self.db.update_task_status(self.video_id, step, TaskStatus.COMPLETED)
+                    if not self.db.is_step_satisfied(self.video_id, step):
+                        self.db.update_task_status(self.video_id, step, TaskStatus.SKIPPED)
                 return True
 
             # 重新处理时清空之前的 processing_notes（避免累积旧警告）
@@ -468,7 +473,7 @@ class VideoProcessor:
                     is_passthrough = step_name in self._passthrough_stages
                     
                     # 检查是否已完成（force=True 时跳过检查，直通阶段总是执行）
-                    if not self.force and not is_passthrough and self.db.is_step_completed(self.video_id, step):
+                    if not self.force and not is_passthrough and self.db.is_step_satisfied(self.video_id, step):
                         self.progress_callback(f"跳过已完成步骤: {step.value}")
                         # 标记为已完成（用于进度计算）
                         self._progress_tracker.complete_stage(step.value)
@@ -480,7 +485,7 @@ class VideoProcessor:
                     # 日志提示
                     if is_passthrough:
                         self._progress_with_tracker(f"直通模式执行步骤: {step.value}")
-                    elif self.force and self.db.is_step_completed(self.video_id, step):
+                    elif self.force and self.db.is_step_satisfied(self.video_id, step):
                         self._progress_with_tracker(f"强制重新执行步骤: {step.value}")
                     else:
                         self._progress_with_tracker(f"开始执行步骤: {step.value}")
@@ -928,6 +933,8 @@ class VideoProcessor:
                     
                     # 执行人声分离
                     try:
+                        from ..asr.vocal_separation import VocalSeparator
+
                         separator = VocalSeparator(
                             models_dir=self.config.storage.models_dir,
                             model_filename=vocal_sep_config.model_filename,
@@ -1128,20 +1135,13 @@ class VideoProcessor:
             video_path: 视频文件路径
             audio_path: 输出音频路径
         """
-        import subprocess
-        
-        # aresample=async=1: 对直播录制视频中的音频时间戳间隙填充静音，
-        # 确保 WAV 时长与 MP4 视频流一致，避免字幕时间轴累进偏移
-        cmd = [
-            'ffmpeg', '-y', '-i', str(video_path),
-            '-vn', '-af', 'aresample=async=1',
-            '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2',
-            str(audio_path)
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"音频提取失败: {result.stderr}")
+        extract_audio_ffmpeg(
+            video_path,
+            audio_path,
+            sample_rate=44100,
+            channels=2,
+            codec='pcm_s16le',
+        )
     
     def _run_split(self) -> bool:
         """
@@ -2051,29 +2051,23 @@ class VideoProcessor:
             uploader = BilibiliUploader(
                 cookies_file=str(cookie_file),
                 line=self.config.uploader.bilibili.line,
-                threads=self.config.uploader.bilibili.threads
+                threads=self.config.uploader.bilibili.threads,
+                lock_db_path=str(self.db.db_path),
+                upload_interval=self.config.uploader.bilibili.upload_interval,
+                max_concurrent_uploads=self.config.concurrency.max_concurrent_uploads,
             )
-            
-            # 获取跨进程上传锁（同一时间只允许一个进程上传，防止 B站风控）
-            upload_cooldown = self.config.uploader.bilibili.upload_interval
-            with resource_lock(
-                db_path=str(self.db.db_path),
-                resource_type='bilibili_upload',
-                cooldown_seconds=upload_cooldown,
-                timeout_seconds=1200,
-                lock_ttl_seconds=3600,
-            ):
-                result = uploader.upload(
-                    video_path=final_video,
-                    title=title[:80],  # B站标题限制80字符
-                    description=description[:2000],  # B站简介限制2000字符
-                    tid=tid,
-                    tags=tags,
-                    copyright=copyright_type,
-                    source=source_url,
-                    cover_path=cover_path,
-                    dtime=self._upload_dtime,
-                )
+
+            result = uploader.upload(
+                video_path=final_video,
+                title=title[:80],  # B站标题限制80字符
+                description=description[:2000],  # B站简介限制2000字符
+                tid=tid,
+                tags=tags,
+                copyright=copyright_type,
+                source=source_url,
+                cover_path=cover_path,
+                dtime=self._upload_dtime,
+            )
             
             # 清理临时封面文件
             if temp_cover_file:
@@ -2309,6 +2303,32 @@ def detect_source_type(source: str) -> SourceType:
     )
 
 
+def resolve_video_identity_from_source(
+    source: str,
+    source_type: SourceType,
+) -> tuple[str, str]:
+    """标准化 source 并计算稳定 video_id。"""
+    normalized_source = source.strip()
+    if source_type == SourceType.LOCAL:
+        from vat.downloaders.local import generate_content_based_id
+
+        source_path = Path(normalized_source).expanduser().resolve()
+        assert source_path.exists(), f"本地视频文件不存在: {source}"
+        normalized_source = str(source_path)
+        video_id = generate_content_based_id(source_path)
+        return normalized_source, video_id
+
+    if source_type == SourceType.YOUTUBE:
+        from vat.downloaders import YouTubeDownloader
+
+        extracted_video_id = YouTubeDownloader().extract_video_id(normalized_source)
+        if extracted_video_id:
+            return normalized_source, extracted_video_id
+
+    video_id = hashlib.md5(normalized_source.encode()).hexdigest()[:16]
+    return normalized_source, video_id
+
+
 def create_video_from_source(
     source: str,
     db: Database,
@@ -2326,18 +2346,7 @@ def create_video_from_source(
     Returns:
         视频 ID
     """
-    # 生成视频 ID
-    if source_type == SourceType.LOCAL:
-        # 本地文件：基于内容哈希
-        from vat.downloaders.local import generate_content_based_id
-        source_path = Path(source).resolve()
-        assert source_path.exists(), f"本地视频文件不存在: {source}"
-        video_id = generate_content_based_id(source_path)
-        # 规范化为绝对路径
-        source = str(source_path)
-    else:
-        # URL 类型：基于 URL 哈希
-        video_id = hashlib.md5(source.encode()).hexdigest()[:16]
+    source, video_id = resolve_video_identity_from_source(source, source_type)
     
     # 检查视频是否已存在，清理旧任务记录避免重复
     existing = db.get_video(video_id)

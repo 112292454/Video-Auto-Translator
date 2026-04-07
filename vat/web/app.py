@@ -10,31 +10,22 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 from fastapi import FastAPI, Request, Query, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 
-from vat.database import Database
-from vat.config import load_config
 from vat.models import TaskStep, TaskStatus, DEFAULT_STAGE_SEQUENCE
-from vat.web.deps import get_db
+from vat.web.deps import get_db, get_web_config, set_web_config_path
 from vat.web.jobs import JobStatus
 
 # 导入路由
-from vat.web.routes import videos_router, playlists_router, tasks_router, files_router, prompts_router, bilibili_router, watch_router, database_router
-
-
-def _start_auto_sync_thread() -> None:
-    """启动应用启动后的后台 Playlist 自动同步检查线程"""
-    import threading
-    threading.Thread(target=_auto_sync_stale_playlists, daemon=True, name="auto-sync-check").start()
-
+from vat.web.routes import videos_router, playlists_router, tasks_router, files_router, prompts_router, bilibili_router, watch_router, database_router, test_center_router
+from vat.web.routes.tasks import get_job_manager
 
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
     """FastAPI lifespan 钩子：替代已弃用的 on_event('startup')"""
-    _start_auto_sync_thread()
     yield
 
 
@@ -88,6 +79,7 @@ app.include_router(prompts_router)
 app.include_router(bilibili_router)
 app.include_router(watch_router)
 app.include_router(database_router)
+app.include_router(test_center_router)
 
 # 模板目录
 templates_dir = Path(__file__).parent / "templates"
@@ -123,7 +115,7 @@ templates.env.filters["format_datetime"] = format_datetime
 @app.get("/api/thumbnail/{video_id}")
 async def serve_thumbnail(video_id: str):
     """返回视频封面：优先本地文件，回退到 metadata 中的远程 thumbnail URL（302 重定向）"""
-    config = load_config()
+    config = get_web_config()
     base_dir = Path(config.storage.output_dir) / video_id
     # 按优先级查找本地封面
     for name in ["thumbnail", "cover"]:
@@ -154,7 +146,7 @@ async def upload_video_file(file: UploadFile = File(...)):
     上传后保存到 {output_dir}/_uploads/{timestamp}_{filename}，
     返回服务器路径供前端创建 LOCAL 类型视频记录。
     """
-    config = load_config()
+    config = get_web_config()
     upload_dir = Path(config.storage.output_dir) / "_uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
     
@@ -188,6 +180,12 @@ async def upload_video_file(file: UploadFile = File(...)):
         "filename": file.filename,
         "size": file_size,
     }
+
+
+@app.api_route("/favicon.ico", methods=["GET", "HEAD"])
+async def favicon():
+    """避免浏览器自动请求 favicon 时产生 404 噪音。"""
+    return Response(status_code=204)
 
 
 # ==================== 页面路由 ====================
@@ -240,7 +238,7 @@ async def index(
         from vat.web.routes.tasks import get_job_manager
         try:
             jm = get_job_manager()
-            exclude_ids = jm.get_running_video_ids() or None
+            exclude_ids = jm.get_running_and_queued_video_ids() or None
         except Exception:
             pass
     
@@ -300,8 +298,7 @@ async def index(
     # 统计信息（SQL 层面计算，不依赖当前页数据）
     stats = db.get_statistics()
     
-    return templates.TemplateResponse("index.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "index.html", {
         "videos": video_list,
         "stats": stats,
         "current_page": page,
@@ -376,10 +373,7 @@ async def video_detail(request: Request, video_id: str, from_playlist: Optional[
     # 查找正在处理该视频的活跃 job（复用与 get_job_manager 相同的路径）
     active_job_id = None
     try:
-        from vat.web.jobs import JobManager
-        config = load_config()
-        log_dir = Path(config.storage.database_path).parent / "job_logs"
-        job_mgr = JobManager(config.storage.database_path, str(log_dir))
+        job_mgr = get_job_manager()
         active_job = job_mgr.get_running_job_for_video(video_id)
         if active_job:
             active_job_id = active_job.job_id
@@ -401,8 +395,7 @@ async def video_detail(request: Request, video_id: str, from_playlist: Optional[
                     })
             files_list.sort(key=lambda x: x["name"])
     
-    return templates.TemplateResponse("video_detail.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "video_detail.html", {
         "video": video,
         "translated_info": translated_info,
         "task_timeline": task_timeline,
@@ -438,6 +431,8 @@ async def playlists_page(request: Request):
             "id": pl.id,
             "title": pl.title,
             "channel": pl.channel,
+            "is_manual": (pl.metadata or {}).get("list_kind") == "manual",
+            "description": (pl.metadata or {}).get("description", ""),
             "video_count": total,
             "completed": progress.get('completed', 0),
             "partial_completed": progress.get('partial_completed', 0),
@@ -448,8 +443,7 @@ async def playlists_page(request: Request):
             "last_synced_at": pl.last_synced_at
         })
     
-    return templates.TemplateResponse("playlists.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "playlists.html", {
         "playlists": playlist_list
     })
 
@@ -460,6 +454,8 @@ async def playlist_detail_page(
     playlist_id: str,
     page: int = Query(1, ge=1),
     per_page: int = Query(100, ge=1, le=500),
+    sort: Optional[str] = None,
+    order: Optional[str] = None,
     hide_processing: Optional[int] = None,  # 1=隐藏正在被 task 处理的视频
 ):
     """Playlist 详情页（分页）"""
@@ -478,14 +474,18 @@ async def playlist_detail_page(
         from vat.web.routes.tasks import get_job_manager
         try:
             jm = get_job_manager()
-            processing_video_ids = jm.get_running_video_ids() or set()
+            processing_video_ids = jm.get_running_and_queued_video_ids() or set()
         except Exception:
             pass
     
-    # 获取全量视频列表（轻量：仅模型对象，不含进度）
-    all_videos = playlist_service.get_playlist_videos(playlist_id)
-    
-    # 过滤掉正在被 task 处理的视频
+    valid_sorts = {'playlist_index', 'title', 'upload_date', 'duration', 'created_at'}
+    sort_by = sort if sort in valid_sorts else 'upload_date'
+    sort_order = order if order in ('asc', 'desc') else 'asc'
+    all_videos = playlist_service.get_playlist_videos(
+        playlist_id,
+        order_by=sort_by,
+        sort_order=sort_order,
+    )
     if processing_video_ids:
         all_videos = [v for v in all_videos if v.id not in processing_video_ids]
     
@@ -495,8 +495,17 @@ async def playlist_detail_page(
         'total': len(all_videos), 'completed': 0, 'partial_completed': 0, 'failed': 0, 'unavailable': 0, 'pending': len(all_videos)
     })
     
+    # 范围处理始终使用稳定的上传日期顺序，不随页面展示排序改变语义
+    range_videos = playlist_service.get_playlist_videos(
+        playlist_id,
+        order_by='upload_date',
+        sort_order='asc',
+    )
+    if processing_video_ids:
+        range_videos = [v for v in range_videos if v.id not in processing_video_ids]
+
     # 全量 ID 列表（供 JS 批量操作使用）
-    all_video_ids = [v.id for v in all_videos]
+    all_video_ids = [v.id for v in range_videos]
     
     # 构建全量视频基础数据（供 JS 范围选择使用，仅含 id/pending/unavailable）
     # 用轻量 SQL 查询已完成的 video_id 集合，避免对 2900+ 视频全量查进度
@@ -507,7 +516,7 @@ async def playlist_detail_page(
             cursor = conn.cursor()
             cursor.execute(f"""
                 SELECT video_id, 
-                       SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as done
+                       SUM(CASE WHEN status IN ('completed', 'skipped') THEN 1 ELSE 0 END) as done
                 FROM (
                     SELECT video_id, step, status,
                            ROW_NUMBER() OVER (PARTITION BY video_id, step ORDER BY id DESC) as rn
@@ -519,7 +528,7 @@ async def playlist_detail_page(
             completed_video_ids = {row['video_id'] for row in cursor.fetchall()}
     
     all_video_data = []
-    for v in all_videos:
+    for v in range_videos:
         metadata = v.metadata or {}
         unavailable = metadata.get("unavailable", False)
         pending = v.id not in completed_video_ids and not unavailable
@@ -559,6 +568,7 @@ async def playlist_detail_page(
         video_list.append({
             "id": v.id,
             "title": v.title,
+            "source_type": v.source_type.value,
             "playlist_index": v.playlist_index,
             "global_index": start + idx + 1,
             "pending_count": pending_count,
@@ -572,8 +582,7 @@ async def playlist_detail_page(
             "has_warnings": bool(v.processing_notes),
         })
     
-    return templates.TemplateResponse("playlist_detail.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "playlist_detail.html", {
         "playlist": pl,
         "videos": video_list,
         "all_video_ids": all_video_ids,
@@ -583,6 +592,8 @@ async def playlist_detail_page(
         "per_page": per_page,
         "total": total,
         "total_pages": total_pages,
+        "sort_by": sort_by,
+        "sort_order": sort_order,
         "hide_processing": 1 if hide_processing else 0,
     })
 
@@ -592,13 +603,7 @@ async def playlist_detail_page(
 @app.get("/tasks", response_class=HTMLResponse)
 async def tasks_page(request: Request):
     """任务列表页"""
-    from vat.web.jobs import JobManager
-    from vat.config import load_config
-    from pathlib import Path
-    
-    config = load_config()
-    log_dir = Path(config.storage.database_path).parent / "job_logs"
-    job_manager = JobManager(config.storage.database_path, str(log_dir))
+    job_manager = get_job_manager()
     
     # 先更新所有 running 状态 job 的实际状态（含孤儿 task 清理）
     jobs = job_manager.list_jobs(limit=50)
@@ -611,8 +616,7 @@ async def tasks_page(request: Request):
     jobs = job_manager.list_jobs(limit=50)
     task_list = [j.to_dict() for j in jobs]
     
-    return templates.TemplateResponse("tasks.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "tasks.html", {
         "tasks": task_list
     })
 
@@ -675,8 +679,7 @@ def _render_task_new_page(
             "progress_text": f"{completed}/7 ({int(completed/7*100)}%)"
         })
     
-    return templates.TemplateResponse("task_new.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "task_new.html", {
         "videos": video_list,
         "playlist_id": playlist_id,
         "playlist_title": playlist_title,
@@ -728,13 +731,7 @@ async def task_new_page_post(request: Request):
 @app.get("/tasks/{task_id}", response_class=HTMLResponse)
 async def task_detail_page(request: Request, task_id: str):
     """任务详情页"""
-    from vat.web.jobs import JobManager
-    from vat.config import load_config
-    from pathlib import Path
-    
-    config = load_config()
-    log_dir = Path(config.storage.database_path).parent / "job_logs"
-    job_manager = JobManager(config.storage.database_path, str(log_dir))
+    job_manager = get_job_manager()
     
     # 更新任务状态
     job_manager.update_job_status(task_id)
@@ -756,58 +753,21 @@ async def task_detail_page(request: Request, task_id: str):
     task_dict = job.to_dict()
     task_dict["video_info_list"] = video_info_list
     
-    return templates.TemplateResponse("task_detail.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "task_detail.html", {
         "task": task_dict
     })
-
-
-# ==================== API 路由 ====================
-
-@app.get("/api/videos")
-async def api_list_videos():
-    """API: 获取视频列表"""
-    db = get_db()
-    videos = db.list_videos()
-    return [{"id": v.id, "title": v.title, "source_type": v.source_type.value} for v in videos]
-
-
-@app.get("/api/video/{video_id}")
-async def api_get_video(video_id: str):
-    """API: 获取视频详情"""
-    db = get_db()
-    video = db.get_video(video_id)
-    if not video:
-        return JSONResponse({"error": "Video not found"}, status_code=404)
-    
-    tasks = db.get_tasks(video_id)
-    return {
-        "id": video.id,
-        "title": video.title,
-        "source_type": video.source_type.value,
-        "source_url": video.source_url,
-        "metadata": video.metadata,
-        "tasks": [
-            {
-                "step": t.step.value,
-                "status": t.status.value,
-                "error_message": t.error_message
-            } for t in tasks
-        ]
-    }
-
-
-@app.get("/api/stats")
-async def api_stats():
-    """API: 获取统计信息"""
-    db = get_db()
-    return db.get_statistics()
 
 
 @app.get("/prompts", response_class=HTMLResponse)
 async def prompts_page(request: Request):
     """Custom Prompts 管理页"""
-    return templates.TemplateResponse("prompts.html", {"request": request})
+    return templates.TemplateResponse(request, "prompts.html", {})
+
+
+@app.get("/test", response_class=HTMLResponse)
+async def test_center_page(request: Request):
+    """测试中心页面"""
+    return templates.TemplateResponse(request, "test_center.html", {})
 
 
 # ==================== Watch 页面路由 ====================
@@ -822,7 +782,7 @@ async def watch_page(request: Request):
     playlist_list = [{"id": p.id, "title": p.title, "channel": p.channel} for p in playlists]
     
     # 获取 watch 默认配置
-    config = load_config()
+    config = get_web_config()
     watch_defaults = {
         "interval": config.watch.default_interval,
         "stages": config.watch.default_stages,
@@ -830,72 +790,28 @@ async def watch_page(request: Request):
         "max_retries": config.watch.max_retries,
     }
     
-    return templates.TemplateResponse("watch.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "watch.html", {
         "playlists": playlist_list,
         "watch_defaults": watch_defaults,
     })
 
-
-# ==================== 启动自动同步 ====================
-
-def _auto_sync_stale_playlists():
-    """检查并自动同步超过 7 天未更新的 playlist（后台线程）"""
-    import threading
-    from datetime import timedelta
-    from vat.services import PlaylistService
-    
-    config = load_config()
-    db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
-    playlists = db.list_playlists()
-    
-    if not playlists:
-        return
-    
-    now = datetime.now()
-    stale_threshold = timedelta(days=7)
-    stale_playlists = []
-    
-    for pl in playlists:
-        if not pl.last_synced_at or (now - pl.last_synced_at) > stale_threshold:
-            stale_playlists.append(pl)
-    
-    if not stale_playlists:
-        return
-    
-    import logging
-    logger = logging.getLogger("vat.web.auto_sync")
-    logger.info(f"发现 {len(stale_playlists)} 个超过 7 天未同步的 Playlist，启动后台同步...")
-    
-    def sync_one(pl):
-        try:
-            sync_db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
-            service = PlaylistService(sync_db, config)
-            result = service.sync_playlist(
-                pl.source_url,
-                auto_add_videos=True,
-                fetch_upload_dates=True,
-                progress_callback=lambda msg: logger.info(f"[{pl.title}] {msg}")
-            )
-            logger.info(f"[{pl.title}] 同步完成: 新增 {result.new_count}, 已存在 {result.existing_count}")
-        except Exception as e:
-            logger.error(f"[{pl.title}] 自动同步失败: {e}")
-    
-    for pl in stale_playlists:
-        t = threading.Thread(target=sync_one, args=(pl,), daemon=True, name=f"auto-sync-{pl.id}")
-        t.start()
-
 # ==================== 启动入口 ====================
 
-def run_server(host: str | None = None, port: int | None = None):
+def run_server(
+    host: str | None = None,
+    port: int | None = None,
+    config_path: str | None = None,
+):
     """启动服务器
     
     Args:
         host: 监听地址，None 时从配置文件读取
         port: 监听端口，None 时从配置文件读取
+        config_path: 配置文件路径，None 时按默认优先级加载
     """
     import uvicorn
-    config = load_config()
+    set_web_config_path(config_path)
+    config = get_web_config()
     host = host or config.web.host
     port = port or config.web.port
     uvicorn.run(app, host=host, port=port)
@@ -906,7 +822,7 @@ def run_server(host: str | None = None, port: int | None = None):
 @app.get("/database", response_class=HTMLResponse)
 async def database_page(request: Request):
     """数据库可视化浏览页"""
-    return templates.TemplateResponse("database.html", {"request": request})
+    return templates.TemplateResponse(request, "database.html", {})
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import signal
 import subprocess
 import json
 import sqlite3
+import sys
 from typing import Optional, List, Dict
 from dataclasses import dataclass
 from datetime import datetime
@@ -18,6 +19,7 @@ from contextlib import contextmanager
 from vat.utils.logger import setup_logger
 
 logger = setup_logger("web.jobs")
+RESULT_JSON_MARKER = "[RESULT_JSON]"
 
 
 class JobStatus(Enum):
@@ -41,6 +43,7 @@ TOOLS_TASK_TYPES = {
     'sync-db',
     'season-sync',
     'watch',
+    'test-center',
 }
 
 
@@ -105,9 +108,10 @@ class JobManager:
     任务通过子进程执行，与 Web 服务器生命周期解耦
     """
     
-    def __init__(self, db_path: str, log_dir: str):
+    def __init__(self, db_path: str, log_dir: str, config_path: Optional[str] = None):
         self.db_path = db_path
         self.log_dir = Path(log_dir)
+        self.config_path = config_path
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._init_table()
     
@@ -253,7 +257,55 @@ class JobManager:
         
         logger.info(f"任务已提交: {job_id}, type={task_type}, 步骤: {steps}")
         return job_id
-    
+
+    def submit_process_job(
+        self,
+        *,
+        video_ids: List[str],
+        steps: List[str],
+        gpu_device: str = "auto",
+        force: bool = False,
+        concurrency: int = 1,
+        playlist_id: Optional[str] = None,
+        upload_cron: Optional[str] = None,
+        upload_batch_size: int = 1,
+        upload_mode: str = 'cron',
+        fail_fast: bool = False,
+        delay_start: int = 0,
+    ) -> str:
+        """通过显式 process 边界提交视频处理任务。"""
+        return self.submit_job(
+            video_ids=video_ids,
+            steps=steps,
+            gpu_device=gpu_device,
+            force=force,
+            concurrency=concurrency,
+            playlist_id=playlist_id,
+            upload_cron=upload_cron,
+            upload_batch_size=upload_batch_size,
+            upload_mode=upload_mode,
+            fail_fast=fail_fast,
+            delay_start=delay_start,
+            task_type='process',
+        )
+
+    def submit_tools_job(
+        self,
+        *,
+        task_type: str,
+        task_params: Optional[Dict] = None,
+        steps: Optional[List[str]] = None,
+    ) -> str:
+        """通过显式 tools 边界提交非 process 任务。"""
+        if task_type not in TOOLS_TASK_TYPES:
+            raise ValueError(f"Unknown tools task_type: {task_type}")
+        return self.submit_job(
+            video_ids=[],
+            steps=steps or [task_type],
+            task_type=task_type,
+            task_params=task_params,
+        )
+
     def _start_job_process(
         self,
         job_id: str,
@@ -274,11 +326,11 @@ class JobManager:
         """
         params = task_params or {}
         if task_type != 'process':
-            cmd = self._build_tools_command(task_type, params)
+            cmd = self._build_tools_command(task_type, params, self.config_path)
         else:
             cmd = self._build_process_command(
                 video_ids, steps, gpu_device, force, concurrency,
-                upload_cron, fail_fast, params
+                upload_cron, fail_fast, params, self.config_path
             )
         
         logger.info(f"启动命令: {' '.join(cmd)}")
@@ -336,6 +388,7 @@ class JobManager:
         upload_cron: Optional[str],
         fail_fast: bool,
         task_params: Dict,
+        config_path: Optional[str] = None,
     ) -> List[str]:
         """构建 vat process 命令
         
@@ -344,7 +397,10 @@ class JobManager:
         - upload_batch_size: 每次上传批次大小
         - upload_mode: 定时上传模式 (cron/dtime)
         """
-        cmd = ["python", "-m", "vat", "process"]
+        cmd = [sys.executable, "-m", "vat"]
+        if config_path:
+            cmd.extend(["-c", config_path])
+        cmd.append("process")
         
         for vid in video_ids:
             cmd.extend(["-v", vid])
@@ -390,13 +446,23 @@ class JobManager:
         return cmd
     
     @staticmethod
-    def _build_tools_command(task_type: str, params: Dict) -> List[str]:
+    def _build_tools_command(
+        task_type: str,
+        params: Dict,
+        config_path: Optional[str] = None,
+    ) -> List[str]:
         """根据 task_type 和 params 构建 vat tools <subcommand> 命令
-        
+
         每个 task_type 对应一个 vat tools 子命令，参数从 params dict 映射到 CLI 选项。
         """
-        cmd = ["python", "-m", "vat", "tools", task_type]
-        
+        if task_type not in TOOLS_TASK_TYPES:
+            raise ValueError(f"Unknown tools task_type: {task_type}")
+
+        cmd = [sys.executable, "-m", "vat"]
+        if config_path:
+            cmd.extend(["-c", config_path])
+        cmd.extend(["tools", task_type])
+
         # 通用映射：params 中的 key 转换为 CLI 选项
         # 布尔值 True → --flag，False → 不加
         # 其他值 → --key value
@@ -449,8 +515,14 @@ class JobManager:
                 'force': '--force',
                 'fail_fast': '--fail-fast',
             },
+            'test-center': {
+                'kind': '--kind',
+                'target_id': '--target-id',
+                'video_id': '--video-id',
+                'path': '--path',
+            },
         }
-        
+
         mapping = PARAM_MAP.get(task_type, {})
         for key, flag in mapping.items():
             value = params.get(key)
@@ -465,7 +537,7 @@ class JobManager:
                     cmd.extend([flag, str(item)])
             else:
                 cmd.extend([flag, str(value)])
-        
+
         return cmd
     
     def get_job(self, job_id: str) -> Optional[WebJob]:
@@ -490,6 +562,43 @@ class JobManager:
             """, (limit,))
             
             return [self._row_to_job(row) for row in cursor.fetchall()]
+
+    def find_latest_job(
+        self,
+        task_type: str,
+        task_params_subset: Optional[Dict] = None,
+        statuses: Optional[List[JobStatus]] = None,
+        limit: Optional[int] = None,
+    ) -> Optional[WebJob]:
+        """
+        按 task_type + task_params 子集查找最近的任务。
+
+        用于 Web 路由按业务 scope（如 playlist_id）反查后台任务，
+        逐步替代进程内状态字典。
+        """
+        expected_params = task_params_subset or {}
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            query = "SELECT * FROM web_jobs WHERE task_type = ?"
+            params = [task_type]
+
+            if statuses:
+                placeholders = ",".join("?" for _ in statuses)
+                query += f" AND status IN ({placeholders})"
+                params.extend(status.value for status in statuses)
+
+            query += " ORDER BY created_at DESC"
+            if limit is not None:
+                query += " LIMIT ?"
+                params.append(limit)
+
+            cursor.execute(query, params)
+            for row in cursor.fetchall():
+                job = self._row_to_job(row)
+                actual_params = job.task_params or {}
+                if all(actual_params.get(key) == value for key, value in expected_params.items()):
+                    return job
+        return None
     
     def cancel_job(self, job_id: str) -> bool:
         """发起取消请求，不在调用线程中阻塞等待子进程退出。"""
@@ -886,6 +995,83 @@ class JobManager:
                     if vid not in completed_vids:
                         result.add(vid)
         return result
+
+    def get_running_and_queued_video_ids(self) -> set:
+        """获取首页/列表页应隐藏的视频 ID 集合。
+
+        包含两部分：
+        1. 现有 running process job 中尚未完成处理的视频；
+        2. running job 的 task_params 中显式声明的待处理视频列表。
+        """
+        result = set(self.get_running_video_ids())
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT task_params FROM web_jobs WHERE status = 'running'
+            """)
+            for row in cursor.fetchall():
+                task_params = self._load_task_params(row['task_params'])
+                result.update(self._extract_task_param_video_ids(task_params))
+
+        return result
+
+    @staticmethod
+    def _load_task_params(task_params_raw) -> Dict:
+        """安全解析 task_params JSON。"""
+        if not task_params_raw:
+            return {}
+
+        if isinstance(task_params_raw, dict):
+            return task_params_raw
+
+        try:
+            parsed = json.loads(task_params_raw)
+        except Exception:
+            return {}
+
+        return parsed if isinstance(parsed, dict) else {}
+
+    @classmethod
+    def _extract_task_param_video_ids(cls, task_params: Optional[Dict]) -> set:
+        """从 task_params 中提取待处理视频 ID 列表。"""
+        if not isinstance(task_params, dict):
+            return set()
+
+        result = set()
+        for key in (
+            "todo_video_ids",
+            "pending_video_ids",
+            "queued_video_ids",
+            "candidate_video_ids",
+            "video_ids",
+        ):
+            result.update(cls._normalize_video_id_list(task_params.get(key)))
+
+        todo_list = task_params.get("todo_list")
+        if isinstance(todo_list, list):
+            for item in todo_list:
+                if isinstance(item, str) and item:
+                    result.add(item)
+                    continue
+                if isinstance(item, dict):
+                    video_id = item.get("video_id") or item.get("id")
+                    if isinstance(video_id, str) and video_id:
+                        result.add(video_id)
+
+        return result
+
+    @staticmethod
+    def _normalize_video_id_list(raw_value) -> set:
+        """将 JSON 字段中的视频 ID 列表标准化为 set[str]。"""
+        if not isinstance(raw_value, list):
+            return set()
+
+        result = set()
+        for item in raw_value:
+            if isinstance(item, str) and item:
+                result.add(item)
+        return result
     
     @staticmethod
     def _is_video_completed_in_job(cursor, video_id: str, steps: List[str]) -> bool:
@@ -897,7 +1083,7 @@ class JobManager:
             steps: job 请求的步骤列表（如 ['download', 'whisper', ...]）
         
         Returns:
-            True 表示该视频的所有请求步骤最新记录均为 completed
+            True 表示该视频的所有请求步骤最新记录均为 satisfied（completed/skipped）
         """
         if not steps:
             return True
@@ -908,7 +1094,7 @@ class JobManager:
                        ROW_NUMBER() OVER (PARTITION BY step ORDER BY id DESC) as rn
                 FROM tasks
                 WHERE video_id = ? AND step IN ({placeholders})
-            ) WHERE rn = 1 AND status = 'completed'
+            ) WHERE rn = 1 AND status IN ('completed', 'skipped')
         """, [video_id] + list(steps))
         row = cursor.fetchone()
         return row['completed_count'] >= len(steps)
@@ -938,7 +1124,7 @@ class JobManager:
                        ROW_NUMBER() OVER (PARTITION BY video_id, step ORDER BY id DESC) as rn
                 FROM tasks
                 WHERE video_id IN ({vid_ph}) AND step IN ({step_ph})
-            ) WHERE rn = 1 AND status = 'completed'
+            ) WHERE rn = 1 AND status IN ('completed', 'skipped')
             GROUP BY video_id
             HAVING completed_count >= ?
         """, list(video_ids) + list(steps) + [num_steps])
@@ -961,7 +1147,31 @@ class JobManager:
                 return [line.rstrip() for line in lines[-tail_lines:]]
         except Exception as e:
             return [f"读取日志失败: {e}"]
-    
+
+    def get_result_payload(self, job_id: str) -> Optional[Dict]:
+        """从 job 日志中的 [RESULT_JSON] 标记解析结构化结果。"""
+        job = self.get_job(job_id)
+        if not job or not job.log_file:
+            return None
+
+        log_path = Path(job.log_file)
+        if not log_path.exists():
+            return None
+
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                for raw_line in reversed(f.readlines()):
+                    line = raw_line.strip()
+                    if not line.startswith(RESULT_JSON_MARKER):
+                        continue
+                    payload_text = line[len(RESULT_JSON_MARKER):].strip()
+                    if not payload_text:
+                        return None
+                    return json.loads(payload_text)
+        except Exception as exc:
+            logger.warning(f"解析 job 结果失败: job={job_id}, error={exc}")
+        return None
+
     def delete_job(self, job_id: str) -> bool:
         """删除任务记录（仅删除已完成/失败/取消的任务）"""
         job = self.get_job(job_id)

@@ -12,6 +12,36 @@ Supports both **CLI** and **Web UI**. The CLI is the core capability layer; the 
 
 ---
 
+## First Successful Run (Minimum Local-File Path)
+
+If this is your first time using VAT, do not start with playlists, watch mode, upload, or WebUI. First make sure one local video can run through the minimum path:
+
+```bash
+git clone <repo-url> && cd vat
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+
+# Generate a starter config safe for new users
+vat init
+
+# Edit config/config.yaml and change at least:
+# 1) storage.work_dir / output_dir / database_path / models_dir
+# 2) llm.api_key / llm.base_url (or set VAT_LLM_APIKEY)
+# 3) keep download/upload cookies empty unless you actually need those stages
+
+vat pipeline --url "/path/to/video.mp4" --title "demo"
+```
+
+Notes:
+- Recommended environment: Linux + Python 3.10+ + CUDA GPU + system-level `ffmpeg`
+- For the first run, prefer a local video so download / playlist / upload / WebUI are not mixed into the same debugging session
+- On the first ASR run, the Whisper model is downloaded into `storage.models_dir/asr.models_subdir` (default: `./models/whisper`); this requires working network access to HuggingFace, or a pre-populated local model cache in that directory
+- For fuller details, see [Quick Start](#quick-start) and [CLI Usage](#cli-usage)
+
+---
+
 ## Development & Runtime Environment
 
 > ⚠️ VAT is primarily developed and tested on **Linux multi-GPU servers** (Ubuntu 22.04, CUDA 12.x, multiple RTX 4090s).
@@ -190,10 +220,10 @@ Place fonts in `vat/resources/fonts/`. Most Ubuntu systems already include NotoS
 # Set LLM API Key (environment variable)
 export VAT_LLM_APIKEY="your-api-key"
 
-# Generate config file
+# Generate a starter config (you still need to edit it for your machine)
 vat init
 
-# Edit configuration (paths, models, translation params, etc.)
+# Edit configuration (at minimum: paths and LLM settings)
 nano config/config.yaml
 ```
 
@@ -212,6 +242,8 @@ Key configuration items:
 | `translator.llm.enable_reflect` | Enable reflective translation |
 
 Each stage (split, translate, optimize) supports independent `api_key` / `base_url` / `model` overrides; empty values inherit from global config.
+
+> `vat init` generates a **starter config safe for new users**, not a dump of the author's production machine settings. You still need to adjust paths, LLM settings, and fill cookies only if you actually use download/upload.
 
 Proxy also supports per-stage overrides: `proxy.http_proxy` is the global default; use `proxy.llm`, `proxy.translate`, `proxy.downloader`, etc. to specify independent proxies per component. LLM stage fallback chain: stage-specific → `proxy.llm` → `proxy.http_proxy`.
 
@@ -342,11 +374,12 @@ See [Watch Mode Spec](docs/WATCH_MODE_SPEC.md) for detailed design.
 | `vat tools season-sync --playlist ID` | Season sync (add + sort) |
 | `vat tools update-info --playlist ID` | Batch update uploaded video title/desc |
 | `vat tools sync-db --season S --playlist ID` | Sync Bilibili season info back to DB |
+| `vat tools test-center --kind whisper` | Background self-check task used by the WebUI test center |
 | `vat watch -p PLAYLIST_ID` | Auto-monitor Playlist and process new videos (persistent) |
 | `vat watch -p PL1 -p PL2 -i 30` | Monitor multiple Playlists, 30-min interval |
 | `vat watch -p PLAYLIST_ID --once` | Single check then exit (can combine with system cron) |
 
-> `vat tools` subcommands share functionality with other CLI commands but output standardized progress markers (`[N%]`/`[SUCCESS]`/`[FAILED]`) for WebUI JobManager subprocess scheduling and monitoring.
+> `vat tools` subcommands share functionality with other CLI commands but output standardized markers (`[N%]`/`[RESULT_JSON]`/`[SUCCESS]`/`[FAILED]`) for WebUI JobManager subprocess scheduling and monitoring.
 
 ### Output Files
 

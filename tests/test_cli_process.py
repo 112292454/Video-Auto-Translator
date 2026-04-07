@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 
 from click.testing import CliRunner
 
-from vat.cli.commands import process as process_cmd, translate as translate_cmd, parse_stages
+from vat.cli.commands import process as process_cmd, translate as translate_cmd, parse_stages, status as status_cmd
 from vat.config import Config
 from vat.models import TaskStep
 
@@ -235,6 +235,34 @@ class TestParseStagesContracts:
 
 
 class TestProcessStageContracts:
+    def test_process_command_delegates_normal_path_to_shared_batch_runner(self, monkeypatch):
+        config = _minimal_config()
+        fake_db = MagicMock()
+        fake_db.get_video.return_value = SimpleNamespace(id="v1", title="title-v1")
+        observed = {}
+
+        monkeypatch.setattr("vat.cli.commands.get_config", lambda path: config)
+        monkeypatch.setattr("vat.cli.commands.get_logger", lambda: MagicMock())
+        monkeypatch.setattr("vat.cli.commands.Database", lambda *args, **kwargs: fake_db)
+        monkeypatch.setattr(
+            "vat.cli.commands.run_video_batch",
+            lambda **kwargs: observed.update(kwargs) or SimpleNamespace(failed_video_ids=[], stopped_early=False),
+        )
+
+        result = CliRunner().invoke(
+            process_cmd,
+            ["-v", "v1", "-s", "whisper", "-c", "2", "-g", "cuda:1", "--fail-fast"],
+            obj={"config_path": "unused.yaml"},
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert observed["video_ids"] == ["v1"]
+        assert observed["steps"] == ["whisper"]
+        assert observed["concurrency"] == 2
+        assert observed["gpu_id"] == 1
+        assert observed["fail_fast"] is True
+
     def test_process_translate_stage_reaches_processor_as_single_stage(self, monkeypatch):
         config = _minimal_config()
         fake_db = MagicMock()
@@ -542,3 +570,29 @@ class TestTranslateCommandContracts:
 
         assert result.exit_code != 0
         assert "hybrid" in result.output
+
+
+class TestStatusCommandContracts:
+    def test_status_pending_filter_excludes_fully_skipped_video(self, monkeypatch):
+        config = _minimal_config()
+        fake_db = MagicMock()
+        fake_db.list_videos.return_value = [
+            SimpleNamespace(id="v-skip", title="跳过视频", source_type=SimpleNamespace(value="youtube")),
+        ]
+        fake_db.get_tasks.return_value = [
+            SimpleNamespace(id=i + 1, step=step, status=SimpleNamespace(value="skipped"))
+            for i, step in enumerate(TaskStep)
+        ]
+
+        monkeypatch.setattr("vat.cli.commands.get_config", lambda path: config)
+        monkeypatch.setattr("vat.cli.commands.Database", lambda *args, **kwargs: fake_db)
+
+        result = CliRunner().invoke(
+            status_cmd,
+            ["--pending"],
+            obj={"config_path": "unused.yaml"},
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert "跳过视频" not in result.output

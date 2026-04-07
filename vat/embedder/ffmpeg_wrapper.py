@@ -10,6 +10,7 @@ import threading
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Callable, Union
 
+from vat.media import extract_audio_ffmpeg, probe_media_info
 from vat.utils.gpu import resolve_gpu_device, get_available_gpus, is_cuda_available
 from vat.utils.logger import setup_logger
 
@@ -169,40 +170,17 @@ class FFmpegWrapper:
         Returns:
             是否成功
         """
-        if not video_path.exists():
-            print(f"错误: 输入视频文件不存在: {video_path}")
-            return False
-            
-        audio_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # aresample=async=1: 对直播录制视频中的音频时间戳间隙填充静音，
-        # 确保 WAV 时长与 MP4 视频流一致，避免字幕时间轴累进偏移。
-        # 对无间隙视频验证为完全无损（二进制一致），可安全作为默认行为。
-        cmd = [
-            'ffmpeg',
-            '-i', str(video_path),
-            '-vn',  # 不处理视频
-            '-af', 'aresample=async=1',
-            '-acodec', codec,
-            '-ac', str(channels),
-            '-ar', str(sample_rate),
-            '-y',  # 覆盖输出
-            str(audio_path)
-        ]
-        
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=True
+            extract_audio_ffmpeg(
+                video_path,
+                audio_path,
+                sample_rate=sample_rate,
+                channels=channels,
+                codec=codec,
             )
-            if not audio_path.exists():
-                print(f"错误: 音频提取完成但未生成文件: {audio_path}")
-                return False
             return True
-        except subprocess.CalledProcessError as e:
-            print(f"音频提取失败: {e.stderr}")
+        except (FileNotFoundError, RuntimeError) as e:
+            logger.error(str(e))
             return False
     
     def embed_subtitle_soft(
@@ -215,82 +193,124 @@ class FFmpegWrapper:
     ) -> bool:
         """
         软字幕嵌入（作为独立字幕流，不重新编码视频）
-        
+
         优势：
         - 极快（几秒钟完成）
         - 文件大小几乎不变
         - 保持原始视频质量和编码格式
         - 用户可以选择开关字幕
-        
+
         Args:
             video_path: 输入视频路径
             subtitle_path: 字幕文件路径（支持SRT/ASS）
             output_path: 输出视频路径
             subtitle_language: 字幕语言代码（chi/zh/zho）
             subtitle_title: 字幕标题（显示在播放器中）
-            
+
         Returns:
             是否成功
         """
+        if not self._prepare_soft_subtitle_preflight(
+            video_path=video_path,
+            subtitle_path=subtitle_path,
+            output_path=output_path,
+        ):
+            return False
+
+        cmd = self._plan_soft_subtitle_command(
+            video_path=video_path,
+            subtitle_path=subtitle_path,
+            output_path=output_path,
+            subtitle_language=subtitle_language,
+            subtitle_title=subtitle_title,
+        )
+        return self._run_soft_subtitle_runtime_stage(
+            cmd=cmd,
+            subtitle_path=subtitle_path,
+            output_path=output_path,
+        )
+
+    def _prepare_soft_subtitle_preflight(
+        self,
+        *,
+        video_path: Path,
+        subtitle_path: Path,
+        output_path: Path,
+    ) -> bool:
+        """执行软字幕嵌入 preflight 阶段。"""
         if not video_path.exists():
             print(f"错误: 输入视频文件不存在: {video_path}")
             return False
         if not subtitle_path.exists():
             print(f"错误: 字幕文件不存在: {subtitle_path}")
             return False
-        
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # 检查字幕格式
+        return True
+
+    def _plan_soft_subtitle_command(
+        self,
+        *,
+        video_path: Path,
+        subtitle_path: Path,
+        output_path: Path,
+        subtitle_language: str,
+        subtitle_title: str,
+    ) -> List[str]:
+        """规划软字幕嵌入所需 ffmpeg 命令。"""
         subtitle_ext = subtitle_path.suffix.lower()
-        
-        # MKV容器支持更多字幕格式，MP4需要转换
         output_ext = output_path.suffix.lower()
-        
+
         if output_ext == '.mkv':
-            # MKV支持原生ASS字幕
-            cmd = [
+            return [
                 'ffmpeg',
                 '-i', str(video_path),
                 '-i', str(subtitle_path),
-                '-c:v', 'copy',  # 复制视频流（不重新编码）
-                '-c:a', 'copy',  # 复制音频流
-                '-c:s', 'copy' if subtitle_ext == '.ass' else 'srt',  # ASS可直接复制
+                '-c:v', 'copy',
+                '-c:a', 'copy',
+                '-c:s', 'copy' if subtitle_ext == '.ass' else 'srt',
                 '-metadata:s:s:0', f'language={subtitle_language}',
                 '-metadata:s:s:0', f'title={subtitle_title}',
-                '-disposition:s:0', 'default',  # 设为默认字幕
+                '-disposition:s:0', 'default',
                 '-y',
                 str(output_path)
             ]
-        else:
-            # MP4容器，字幕需要转换为mov_text格式
-            # 注意：MP4不支持ASS样式，会丢失样式信息
-            cmd = [
-                'ffmpeg',
-                '-i', str(video_path),
-                '-i', str(subtitle_path),
-                '-c:v', 'copy',  # 复制视频流
-                '-c:a', 'copy',  # 复制音频流
-                '-c:s', 'mov_text',  # MP4字幕格式
-                '-metadata:s:s:0', f'language={subtitle_language}',
-                '-metadata:s:s:0', f'title={subtitle_title}',
-                '-y',
-                str(output_path)
-            ]
-        
+        return [
+            'ffmpeg',
+            '-i', str(video_path),
+            '-i', str(subtitle_path),
+            '-c:v', 'copy',
+            '-c:a', 'copy',
+            '-c:s', 'mov_text',
+            '-metadata:s:s:0', f'language={subtitle_language}',
+            '-metadata:s:s:0', f'title={subtitle_title}',
+            '-y',
+            str(output_path)
+        ]
+
+    def _run_soft_subtitle_runtime_stage(
+        self,
+        *,
+        cmd: List[str],
+        subtitle_path: Path,
+        output_path: Path,
+    ) -> bool:
+        """执行软字幕嵌入运行阶段并校验输出。"""
+        subtitle_ext = subtitle_path.suffix.lower()
+        output_ext = output_path.suffix.lower()
+
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
             if not output_path.exists():
                 print(f"错误: 软字幕嵌入完成但未生成文件: {output_path}")
                 return False
             return True
         except subprocess.CalledProcessError as e:
             print(f"软字幕嵌入失败: {e.stderr}")
-            # 如果是MP4+ASS失败，提示用户
             if output_ext == '.mp4' and subtitle_ext == '.ass':
                 print("提示: MP4容器不完全支持ASS字幕样式，建议使用MKV容器或硬字幕")
             return False
-    
+
     def _get_video_resolution(self, video_path: Path) -> tuple[int, int]:
         """获取视频分辨率"""
         result = subprocess.run(
@@ -298,7 +318,7 @@ class FFmpegWrapper:
             capture_output=True,
             text=True,
         )
-        
+
         # 从 ffmpeg 输出中解析分辨率
         pattern = r"(\d{2,5})x(\d{2,5})"
         match = re.search(pattern, result.stderr)
@@ -401,122 +421,346 @@ class FFmpegWrapper:
         Returns:
             是否成功
         """
+        if not self._prepare_hard_embed_preflight(
+            video_path=video_path,
+            subtitle_path=subtitle_path,
+            output_path=output_path,
+            gpu_device=gpu_device,
+            max_nvenc_sessions=max_nvenc_sessions,
+        ):
+            return False
+
+        temp_files_to_cleanup, vf = self._plan_hard_embed_subtitle_inputs(
+            video_path=video_path,
+            subtitle_path=subtitle_path,
+            subtitle_style=subtitle_style,
+            style_dir=style_dir,
+            fonts_dir=fonts_dir,
+            reference_height=reference_height,
+        )
+
+        # ========== 阶段 2: 获取 NVENC 会话 + 构建 ffmpeg 命令 ==========
+        # 预处理完成后才获取 GPU session，最大化 session 利用率。
+        # ================================================================
+        try:
+            gpu_id, cmd = self._plan_hard_embed_execution(
+                video_path=video_path,
+                output_path=output_path,
+                vf=vf,
+                video_codec=video_codec,
+                audio_codec=audio_codec,
+                crf=crf,
+                preset=preset,
+                gpu_device=gpu_device,
+                max_nvenc_sessions=max_nvenc_sessions,
+            )
+        except Exception:
+            self._cleanup_hard_embed_temp_files(
+                temp_files_to_cleanup=temp_files_to_cleanup,
+            )
+            raise
+
+        return self._run_hard_embed_runtime_stage(
+            gpu_id=gpu_id,
+            cmd=cmd,
+            output_path=output_path,
+            progress_callback=progress_callback,
+            temp_files_to_cleanup=temp_files_to_cleanup,
+        )
+
+    def _prepare_hard_embed_preflight(
+        self,
+        *,
+        video_path: Path,
+        subtitle_path: Path,
+        output_path: Path,
+        gpu_device: str,
+        max_nvenc_sessions: int,
+    ) -> bool:
+        """执行硬字幕合成前的输入校验与基础环境准备。"""
         if not video_path.exists():
             logger.error(f"输入视频文件不存在: {video_path}")
             return False
         if not subtitle_path.exists():
             logger.error(f"字幕文件不存在: {subtitle_path}")
             return False
-        
-        # 初始化 NVENC 会话管理器（幂等）
+
         _nvenc_manager.init(max_per_gpu=max_nvenc_sessions)
-        
-        # GPU 设备校验（仅校验格式，不占用 session）
+
         if gpu_device not in ("auto",) and not gpu_device.startswith("cuda:"):
             error_msg = "Embed 阶段需要 GPU，按 GPU 原则禁止 CPU 回退"
             logger.error(error_msg)
             raise RuntimeError(error_msg)
-        
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        subtitle_ext = subtitle_path.suffix.lower()
-        processed_subtitle = subtitle_path
-        temp_files_to_cleanup = []  # 记录需要清理的临时文件
-        
-        # ========== 阶段 1: ASS 字幕预处理（CPU 密集，不占用 GPU session） ==========
-        # 在获取 NVENC 会话之前完成所有 CPU 预处理工作，
-        # 避免在字体渲染/自动换行期间空耗 GPU 会话槽位。
-        # ============================================================================
-        if subtitle_ext == '.ass' and subtitle_style:
+        return True
+
+    def _finalize_hard_embed_resources(
+        self,
+        *,
+        gpu_id: int,
+        temp_files_to_cleanup: list[str],
+    ) -> None:
+        """释放硬字幕合成阶段占用的资源。"""
+        _nvenc_manager.release(gpu_id)
+        self._cleanup_hard_embed_temp_files(
+            temp_files_to_cleanup=temp_files_to_cleanup,
+        )
+
+    def _cleanup_hard_embed_temp_files(
+        self,
+        *,
+        temp_files_to_cleanup: list[str],
+    ) -> None:
+        """清理硬字幕阶段产生的临时字幕文件。"""
+        for temp_file in temp_files_to_cleanup:
             try:
-                from vat.asr import ASRData
-                from vat.asr.subtitle import get_subtitle_style, auto_wrap_ass_file, compute_subtitle_scale_factor
-                
-                # Step 1: 获取视频分辨率，用于样式缩放
-                width, height = self._get_video_resolution(video_path)
-                
-                # Step 2: 加载并缩放样式
-                style_str = get_subtitle_style(subtitle_style, style_dir=style_dir)
-                if not style_str:
-                    logger.warning(f"无法加载样式 '{subtitle_style}'，使用默认样式")
-                    style_str = get_subtitle_style("default", style_dir=style_dir) or ""
-                
-                scale_factor = compute_subtitle_scale_factor(width, height, reference_height)
-                style_str = self._scale_ass_style(
-                    style_str, scale_factor,
-                    video_width=width, video_height=height,
-                )
-                
-                # Step 3: 加载字幕数据并重新生成 ASS
-                asr_data = ASRData.from_subtitle_file(str(subtitle_path))
-                
-                # 生成临时 ASS 文件（布局固定：原文在上，译文在下）
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".ass", delete=False, encoding="utf-8"
-                ) as temp_file:
-                    ass_content = asr_data.to_ass(
-                        style_str=style_str,
-                        video_width=width,
-                        video_height=height,
-                    )
-                    temp_file.write(ass_content)
-                    temp_ass_path = temp_file.name
-                    temp_files_to_cleanup.append(temp_ass_path)
-                
-                # Step 4: 自动换行处理（CPU 密集：逐行字体渲染测量宽度）
-                processed_subtitle_path = auto_wrap_ass_file(temp_ass_path, fonts_dir=fonts_dir)
-                processed_subtitle = Path(processed_subtitle_path)
-                # 如果换行处理生成了新文件，也需要清理
-                if processed_subtitle_path != temp_ass_path:
-                    temp_files_to_cleanup.append(processed_subtitle_path)
-                
-            except Exception as e:
-                logger.warning(f"ASS 预处理失败，使用原始文件: {e}")
-                processed_subtitle = subtitle_path
-        
-        # 转义字幕路径（Windows路径处理）
-        subtitle_path_escaped = Path(processed_subtitle).as_posix().replace(":", r"\:")
-        
-        # 根据字幕格式选择滤镜
-        if subtitle_ext == '.ass':
-            vf = f"ass='{subtitle_path_escaped}'"
-            # 添加字体目录支持
-            if fonts_dir:
-                fonts_dir_escaped = Path(fonts_dir).as_posix().replace(":", r"\:")
-                vf += f":fontsdir='{fonts_dir_escaped}'"
-        else:
-            vf = f"subtitles='{subtitle_path_escaped}'"
-        
-        # ========== 阶段 2: 获取 NVENC 会话 + 构建 ffmpeg 命令 ==========
-        # 预处理完成后才获取 GPU session，最大化 session 利用率。
-        # ================================================================
-        
-        # GPU 选择：通过 session manager 均衡分配
+                Path(temp_file).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _resolve_hard_embed_gpu_device(self, gpu_device: str) -> int:
+        """解析硬字幕合成使用的 GPU 设备。"""
         if gpu_device == "auto":
             gpu_id = _nvenc_manager.select_gpu()
             logger.info(f"NVENC 会话均衡分配: 选择 GPU {gpu_id}")
-        else:
-            # gpu_device = "cuda:N"
-            try:
-                gpu_id = int(gpu_device.split(":")[1])
-            except (IndexError, ValueError):
-                raise ValueError(f"无效的 GPU 设备格式: {gpu_device}")
-        
-        # 获取 NVENC 会话槽位（阻塞等待，最多 10 分钟）
+            return gpu_id
+
+        try:
+            return int(gpu_device.split(":")[1])
+        except (IndexError, ValueError):
+            raise ValueError(f"无效的 GPU 设备格式: {gpu_device}")
+
+    def _plan_hard_embed_subtitle_inputs(
+        self,
+        *,
+        video_path: Path,
+        subtitle_path: Path,
+        subtitle_style: Optional[str],
+        style_dir: Optional[str],
+        fonts_dir: Optional[str],
+        reference_height: int,
+    ) -> tuple[list[str], str]:
+        """规划硬字幕合成使用的字幕输入与滤镜。"""
+        subtitle_ext = subtitle_path.suffix.lower()
+        processed_subtitle = subtitle_path
+        temp_files_to_cleanup: list[str] = []
+
+        if subtitle_ext == '.ass' and subtitle_style:
+            processed_subtitle, temp_files_to_cleanup = self._prepare_hard_embed_ass_subtitle(
+                video_path=video_path,
+                subtitle_path=subtitle_path,
+                subtitle_style=subtitle_style,
+                style_dir=style_dir,
+                fonts_dir=fonts_dir,
+                reference_height=reference_height,
+            )
+
+        vf = self._build_hard_embed_subtitle_filter(
+            subtitle_ext=subtitle_ext,
+            processed_subtitle=processed_subtitle,
+            fonts_dir=fonts_dir,
+        )
+        return temp_files_to_cleanup, vf
+
+    def _plan_hard_embed_execution(
+        self,
+        *,
+        video_path: Path,
+        output_path: Path,
+        vf: str,
+        video_codec: str,
+        audio_codec: str,
+        crf: int,
+        preset: str,
+        gpu_device: str,
+        max_nvenc_sessions: int,
+    ) -> tuple[int, List[str]]:
+        """规划硬字幕合成执行阶段所需 GPU 与 ffmpeg 命令。"""
+        gpu_id = self._resolve_hard_embed_gpu_device(gpu_device)
+        self._prepare_hard_embed_nvenc_session(
+            gpu_id=gpu_id,
+            max_nvenc_sessions=max_nvenc_sessions,
+        )
+        try:
+            cmd = self._plan_hard_embed_command(
+                video_path=video_path,
+                output_path=output_path,
+                vf=vf,
+                video_codec=video_codec,
+                audio_codec=audio_codec,
+                crf=crf,
+                preset=preset,
+                gpu_id=gpu_id,
+            )
+        except Exception:
+            self._finalize_hard_embed_resources(
+                gpu_id=gpu_id,
+                temp_files_to_cleanup=[],
+            )
+            raise
+        return gpu_id, cmd
+
+    def _plan_hard_embed_command(
+        self,
+        *,
+        video_path: Path,
+        output_path: Path,
+        vf: str,
+        video_codec: str,
+        audio_codec: str,
+        crf: int,
+        preset: str,
+        gpu_id: int,
+    ) -> List[str]:
+        """规划硬字幕合成使用的码率探测与 FFmpeg 命令。"""
+        original_bitrate = self._probe_hard_embed_original_bitrate(video_path)
+        return self._build_hard_embed_ffmpeg_command(
+            video_path=video_path,
+            output_path=output_path,
+            vf=vf,
+            video_codec=video_codec,
+            audio_codec=audio_codec,
+            crf=crf,
+            preset=preset,
+            gpu_id=gpu_id,
+            original_bitrate=original_bitrate,
+        )
+
+    def _run_hard_embed_runtime_stage(
+        self,
+        *,
+        gpu_id: int,
+        cmd: List[str],
+        output_path: Path,
+        progress_callback: Optional[Callable[[str, str], None]],
+        temp_files_to_cleanup: list[str],
+    ) -> bool:
+        """执行硬字幕合成运行阶段并确保资源清理。"""
+        try:
+            return self._run_ffmpeg_embed_process(
+                cmd=cmd,
+                output_path=output_path,
+                progress_callback=progress_callback,
+            )
+        finally:
+            self._finalize_hard_embed_resources(
+                gpu_id=gpu_id,
+                temp_files_to_cleanup=temp_files_to_cleanup,
+            )
+
+    def _prepare_hard_embed_ass_subtitle(
+        self,
+        *,
+        video_path: Path,
+        subtitle_path: Path,
+        subtitle_style: str,
+        style_dir: Optional[str],
+        fonts_dir: Optional[str],
+        reference_height: int,
+    ) -> tuple[Path, list[str]]:
+        """为硬字幕合成预处理 ASS 字幕输入。"""
+        processed_subtitle = subtitle_path
+        temp_files_to_cleanup: list[str] = []
+        temp_ass_path: Optional[str] = None
+
+        try:
+            from vat.asr import ASRData
+            from vat.asr.subtitle import get_subtitle_style, auto_wrap_ass_file, compute_subtitle_scale_factor
+
+            width, height = self._get_video_resolution(video_path)
+
+            style_str = get_subtitle_style(subtitle_style, style_dir=style_dir)
+            if not style_str:
+                logger.warning(f"无法加载样式 '{subtitle_style}'，使用默认样式")
+                style_str = get_subtitle_style("default", style_dir=style_dir) or ""
+
+            scale_factor = compute_subtitle_scale_factor(width, height, reference_height)
+            style_str = self._scale_ass_style(
+                style_str,
+                scale_factor,
+                video_width=width,
+                video_height=height,
+            )
+
+            asr_data = ASRData.from_subtitle_file(str(subtitle_path))
+
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".ass", delete=False, encoding="utf-8"
+            ) as temp_file:
+                temp_ass_path = temp_file.name
+                ass_content = asr_data.to_ass(
+                    style_str=style_str,
+                    video_width=width,
+                    video_height=height,
+                )
+                temp_files_to_cleanup.append(temp_ass_path)
+                temp_file.write(ass_content)
+
+            processed_subtitle_path = auto_wrap_ass_file(temp_ass_path, fonts_dir=fonts_dir)
+            processed_subtitle = Path(processed_subtitle_path)
+            if processed_subtitle_path != temp_ass_path:
+                temp_files_to_cleanup.append(processed_subtitle_path)
+        except Exception as e:
+            if temp_ass_path and temp_ass_path not in temp_files_to_cleanup:
+                temp_files_to_cleanup.append(temp_ass_path)
+            logger.warning(f"ASS 预处理失败，使用原始文件: {e}")
+            processed_subtitle = subtitle_path
+
+        return processed_subtitle, temp_files_to_cleanup
+
+    def _build_hard_embed_subtitle_filter(
+        self,
+        *,
+        subtitle_ext: str,
+        processed_subtitle: Path,
+        fonts_dir: Optional[str],
+    ) -> str:
+        """构建硬字幕合成使用的字幕滤镜。"""
+        subtitle_path_escaped = Path(processed_subtitle).as_posix().replace(":", r"\:")
+
+        if subtitle_ext == '.ass':
+            vf = f"ass='{subtitle_path_escaped}'"
+            if fonts_dir:
+                fonts_dir_escaped = Path(fonts_dir).as_posix().replace(":", r"\:")
+                vf += f":fontsdir='{fonts_dir_escaped}'"
+            return vf
+
+        return f"subtitles='{subtitle_path_escaped}'"
+
+    def _probe_hard_embed_original_bitrate(self, video_path: Path) -> int:
+        """探测硬字幕合成使用的原视频码率。"""
+        video_info = self.get_video_info(video_path)
+        return video_info.get('bit_rate', 0) if video_info else 0
+
+    def _prepare_hard_embed_nvenc_session(self, *, gpu_id: int, max_nvenc_sessions: int) -> None:
+        """为硬字幕合成获取 NVENC 会话并校验支持情况。"""
         if not _nvenc_manager.acquire(gpu_id, timeout=600):
             raise RuntimeError(
                 f"NVENC 会话获取超时: GPU {gpu_id}，"
                 f"所有 {max_nvenc_sessions} 个槽位已满且 10 分钟内未释放"
             )
-        
-        # 检查是否支持 NVENC
+
         if not self._check_nvenc_support():
             _nvenc_manager.release(gpu_id)
             error_msg = "当前环境不支持 NVENC，按 GPU 原则禁止 CPU 回退"
             logger.error(error_msg)
             raise RuntimeError(error_msg)
 
-        # 自动选择硬件编码器
+    def _build_hard_embed_ffmpeg_command(
+        self,
+        *,
+        video_path: Path,
+        output_path: Path,
+        vf: str,
+        video_codec: str,
+        audio_codec: str,
+        crf: int,
+        preset: str,
+        gpu_id: int,
+        original_bitrate: int,
+    ) -> List[str]:
+        """构建硬字幕合成使用的 FFmpeg 命令。"""
         if video_codec in ['libx265', 'hevc']:
             actual_codec = 'hevc_nvenc'
         elif video_codec == 'av1':
@@ -530,24 +774,18 @@ class FFmpegWrapper:
                 logger.info(f"未知编码器 {video_codec}，使用 h264_nvenc")
             actual_codec = 'h264_nvenc'
 
-        # 优化：获取原视频码率以控制输出体积
-        video_info = self.get_video_info(video_path)
-        original_bitrate = video_info.get('bit_rate', 0) if video_info else 0
-
         if original_bitrate > 0:
-            # 使用受限码率模式 (VBR)，目标码率设为原视频的 1.1 倍，最大 1.5 倍
             target_bitrate = int(original_bitrate * 1.1)
             max_bitrate = int(original_bitrate * 1.5)
             codec_params = [
-                '-rc', 'vbr',              # 变码率模式
-                '-cq', str(crf),           # 目标质量
+                '-rc', 'vbr',
+                '-cq', str(crf),
                 '-b:v', str(target_bitrate),
                 '-maxrate', str(max_bitrate),
                 '-bufsize', str(max_bitrate * 2),
                 '-preset', preset if preset.startswith('p') else 'p4',
             ]
         else:
-            # 如果获取不到码率，回退到质量优先模式
             codec_params = [
                 '-rc', 'constqp',
                 '-qp', str(crf),
@@ -557,14 +795,10 @@ class FFmpegWrapper:
         codec_params.extend([
             '-gpu', str(gpu_id),
             '-spatial_aq', '1',
-            '-temporal_aq', '1'
+            '-temporal_aq', '1',
         ])
-        
-        # 构建 ffmpeg 命令
-        # 注意：-vf ass/subtitles 是 CPU 滤镜，帧流为:
-        #   hwaccel 解码(GPU N) → 下载到 CPU → 字幕渲染 → 上传到 GPU N → NVENC 编码
-        # 使用 -hwaccel_device 确保解码与编码在同一张 GPU，避免所有进程挤占 GPU 0。
-        cmd = [
+
+        return [
             'ffmpeg',
             '-hwaccel', 'cuda',
             '-hwaccel_device', str(gpu_id),
@@ -575,39 +809,42 @@ class FFmpegWrapper:
             '-c:a', audio_codec,
             '-movflags', '+faststart',
             '-y',
-            str(output_path)
+            str(output_path),
         ]
-        
+
+    def _run_ffmpeg_embed_process(
+        self,
+        *,
+        cmd: List[str],
+        output_path: Path,
+        progress_callback: Optional[Callable[[str, str], None]] = None,
+    ) -> bool:
+        """执行 FFmpeg 硬字幕合成并处理进度与日志。"""
         try:
-            # 保存 FFmpeg 输出日志到视频文件夹
             log_path = output_path.parent / "ffmpeg_embed.log"
             ffmpeg_log_lines = []
-            
-            # 使用 Popen 实时读取进度
+
             process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                
-            # 实时读取输出并调用回调
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+
             total_duration = None
             current_time = 0
             last_progress = -1
             start_time = time.time()
-            
+
             while True:
                 output_line = process.stderr.readline()
                 if not output_line or (process.poll() is not None):
                     break
-                
-                # 保存所有输出行到日志
+
                 ffmpeg_log_lines.append(output_line)
-                
-                # 解析总时长
+
                 if total_duration is None:
                     duration_match = re.search(
                         r"Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})", output_line
@@ -615,41 +852,38 @@ class FFmpegWrapper:
                     if duration_match:
                         h, m, s = map(float, duration_match.groups())
                         total_duration = h * 3600 + m * 60 + s
-                
-                # 解析当前处理时间
+
                 time_match = re.search(
                     r"time=(\d{2}):(\d{2}):(\d{2}\.\d{2})", output_line
                 )
                 if time_match:
                     h, m, s = map(float, time_match.groups())
                     current_time = h * 3600 + m * 60 + s
-                
-                # 计算进度百分比
+
                 if total_duration:
                     progress = (current_time / total_duration) * 100
                     current_progress_int = int(progress)
-                    
-                    # 只有当进度增加至少 5% 时才打印，或者刚开始/结束时
-                    if current_progress_int >= last_progress + 5 or (last_progress == -1 and current_progress_int == 0) or current_progress_int == 100:
+
+                    if (
+                        current_progress_int >= last_progress + 5
+                        or (last_progress == -1 and current_progress_int == 0)
+                        or (current_progress_int == 100 and last_progress < 100)
+                    ):
                         elapsed = time.time() - start_time
                         info_str = f"{current_progress_int}%"
-                        
+
                         if current_progress_int > 0:
                             total_estimated = elapsed / (progress / 100)
                             remaining = total_estimated - elapsed
                             info_str += f" | 耗时: {_format_time(elapsed)} | 预计剩余: {_format_time(remaining)}"
-                        
-                        progress_callback(info_str, "正在合成")
+
+                        if progress_callback:
+                            progress_callback(info_str, "正在合成")
                         last_progress = current_progress_int
                 time.sleep(0.1)
-            
-            if progress_callback:
-                progress_callback("100", "合成完成")
-            
-            # 检查返回码
+
             return_code = process.wait()
-            
-            # 写入完整日志
+
             try:
                 with open(log_path, "w", encoding="utf-8") as f:
                     f.write("=== FFmpeg 命令 ===\n")
@@ -662,32 +896,24 @@ class FFmpegWrapper:
                             f.write(remaining_output)
             except Exception as e:
                 logger.warning(f"无法保存 FFmpeg 日志: {e}")
-            
+
             if return_code != 0:
-                # 从已收集的日志行中提取错误信息（stderr 已被 readline 循环消费）
                 error_lines = [l.strip() for l in ffmpeg_log_lines if 'error' in l.lower() or 'failed' in l.lower()]
                 error_summary = '; '.join(error_lines[-3:]) if error_lines else '(无详细错误，见日志)'
                 logger.error(f"硬字幕嵌入失败: {error_summary}")
                 logger.info(f"完整日志已保存至: {log_path}")
                 return False
-            
+
             if not output_path.exists():
                 logger.error(f"硬字幕嵌入完成但未生成文件: {output_path}")
                 return False
+            if progress_callback:
+                progress_callback("100", "合成完成")
             return True
         except subprocess.CalledProcessError as e:
             logger.error(f"硬字幕嵌入失败: {e.stderr}")
             return False
-        finally:
-            # 释放 NVENC 会话槽位
-            _nvenc_manager.release(gpu_id)
-            # 清理临时文件
-            for temp_file in temp_files_to_cleanup:
-                try:
-                    Path(temp_file).unlink(missing_ok=True)
-                except Exception:
-                    pass
-    
+
     def _check_encoder_support(self, encoder_name: str) -> bool:
         """检查是否支持特定编码器"""
         try:
@@ -715,57 +941,7 @@ class FFmpegWrapper:
         Returns:
             视频信息字典
         """
-        cmd = [
-            'ffprobe',
-            '-v', 'quiet',
-            '-print_format', 'json',
-            '-show_format',
-            '-show_streams',
-            str(video_path)
-        ]
-        
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            
-            import json
-            info = json.loads(result.stdout)
-            
-            # 提取关键信息
-            video_stream = None
-            audio_stream = None
-            
-            for stream in info.get('streams', []):
-                if stream['codec_type'] == 'video' and video_stream is None:
-                    video_stream = stream
-                elif stream['codec_type'] == 'audio' and audio_stream is None:
-                    audio_stream = stream
-            
-            format_info = info.get('format', {})
-            
-            return {
-                'duration': float(format_info.get('duration', 0)),
-                'size': int(format_info.get('size', 0)),
-                'bit_rate': int(format_info.get('bit_rate', 0)),
-                'video': {
-                    'codec': video_stream.get('codec_name', '') if video_stream else '',
-                    'width': video_stream.get('width', 0) if video_stream else 0,
-                    'height': video_stream.get('height', 0) if video_stream else 0,
-                    'fps': eval(video_stream.get('r_frame_rate', '0/1')) if video_stream else 0,
-                } if video_stream else None,
-                'audio': {
-                    'codec': audio_stream.get('codec_name', '') if audio_stream else '',
-                    'sample_rate': audio_stream.get('sample_rate', 0) if audio_stream else 0,
-                    'channels': audio_stream.get('channels', 0) if audio_stream else 0,
-                } if audio_stream else None,
-            }
-        except Exception as e:
-            print(f"获取视频信息失败: {e}")
-            return None
+        return probe_media_info(video_path)
     
     def convert_video(
         self,
@@ -778,7 +954,7 @@ class FFmpegWrapper:
     ) -> bool:
         """
         转换视频格式
-        
+
         Args:
             input_path: 输入视频路径
             output_path: 输出视频路径
@@ -786,13 +962,41 @@ class FFmpegWrapper:
             audio_codec: 音频编码器
             crf: 视频质量
             preset: 编码预设
-            
+
         Returns:
             是否成功
         """
+        self._prepare_convert_video_preflight(output_path=output_path)
+        cmd = self._plan_convert_video_command(
+            input_path=input_path,
+            output_path=output_path,
+            video_codec=video_codec,
+            audio_codec=audio_codec,
+            crf=crf,
+            preset=preset,
+        )
+        return self._run_convert_video_runtime_stage(cmd=cmd)
+
+    def _prepare_convert_video_preflight(
+        self,
+        *,
+        output_path: Path,
+    ) -> None:
+        """执行视频转换 preflight 阶段。"""
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        cmd = [
+
+    def _plan_convert_video_command(
+        self,
+        *,
+        input_path: Path,
+        output_path: Path,
+        video_codec: str,
+        audio_codec: str,
+        crf: int,
+        preset: str,
+    ) -> List[str]:
+        """规划视频转换所需 ffmpeg 命令。"""
+        return [
             'ffmpeg',
             '-i', str(input_path),
             '-c:v', video_codec,
@@ -802,14 +1006,20 @@ class FFmpegWrapper:
             '-y',
             str(output_path)
         ]
-        
+
+    def _run_convert_video_runtime_stage(
+        self,
+        *,
+        cmd: List[str],
+    ) -> bool:
+        """执行视频转换 runtime 阶段。"""
         try:
             subprocess.run(cmd, capture_output=True, text=True, check=True)
             return True
         except subprocess.CalledProcessError as e:
             print(f"视频转换失败: {e.stderr}")
             return False
-    
+
     def extract_thumbnail(
         self,
         video_path: Path,
@@ -818,18 +1028,40 @@ class FFmpegWrapper:
     ) -> bool:
         """
         提取视频缩略图
-        
+
         Args:
             video_path: 视频文件路径
             output_path: 输出图片路径
             time_position: 时间位置 (HH:MM:SS)
-            
+
         Returns:
             是否成功
         """
+        self._prepare_extract_thumbnail_preflight(output_path=output_path)
+        cmd = self._plan_extract_thumbnail_command(
+            video_path=video_path,
+            output_path=output_path,
+            time_position=time_position,
+        )
+        return self._run_extract_thumbnail_runtime_stage(cmd=cmd)
+
+    def _prepare_extract_thumbnail_preflight(
+        self,
+        *,
+        output_path: Path,
+    ) -> None:
+        """执行提取缩略图 preflight 阶段。"""
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        cmd = [
+
+    def _plan_extract_thumbnail_command(
+        self,
+        *,
+        video_path: Path,
+        output_path: Path,
+        time_position: str,
+    ) -> List[str]:
+        """规划提取缩略图所需 ffmpeg 命令。"""
+        return [
             'ffmpeg',
             '-ss', time_position,
             '-i', str(video_path),
@@ -838,7 +1070,13 @@ class FFmpegWrapper:
             '-y',
             str(output_path)
         ]
-        
+
+    def _run_extract_thumbnail_runtime_stage(
+        self,
+        *,
+        cmd: List[str],
+    ) -> bool:
+        """执行提取缩略图 runtime 阶段。"""
         try:
             subprocess.run(cmd, capture_output=True, text=True, check=True)
             return True
@@ -887,6 +1125,177 @@ class FFmpegWrapper:
         
         return None
 
+    def _prepare_mask_violation_context(
+        self,
+        *,
+        video_path: Path,
+        output_path: Path,
+        violation_ranges: List[tuple],
+        margin_sec: float,
+    ) -> Optional[tuple[Dict[str, Any], int, int, List[tuple]]]:
+        """准备违规遮罩前置上下文。"""
+        if not video_path.exists():
+            logger.error(f"输入视频不存在: {video_path}")
+            return None
+
+        if not violation_ranges:
+            logger.warning("无违规时间段，无需处理")
+            return None
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        video_info = self.get_video_info(video_path)
+        if not video_info:
+            logger.error("无法获取视频信息")
+            return None
+
+        duration = video_info.get('duration', 0)
+        width = video_info.get('video', {}).get('width', 1920) if video_info.get('video') else 1920
+        height = video_info.get('video', {}).get('height', 1080) if video_info.get('video') else 1080
+        merged = self._merge_ranges(violation_ranges, margin_sec, duration)
+        return video_info, width, height, merged
+
+    def _plan_mask_violation_filters(
+        self,
+        *,
+        width: int,
+        height: int,
+        merged: List[tuple],
+        mask_text: str,
+    ) -> tuple[str, str]:
+        """规划违规遮罩所需的音视频滤镜。"""
+        vf_parts = []
+        af_parts = []
+
+        escaped_text = mask_text.replace("'", "\\'").replace(":", "\\:")
+        fontsize = max(24, height // 30)
+        cjk_font = self._find_cjk_font()
+        if cjk_font:
+            escaped_font = cjk_font.replace(":", "\\:").replace("'", "\\'")
+            font_param = f":fontfile='{escaped_font}'"
+            logger.info(f"使用 CJK 字体: {cjk_font}")
+        else:
+            logger.warning("未找到 CJK 字体，中文文字可能无法正常显示")
+            font_param = ""
+
+        for start, end in merged:
+            vf_parts.append(
+                f"drawbox=x=0:y=0:w={width}:h={height}:color=black:t=fill"
+                f":enable='between(t,{start},{end})'"
+            )
+            vf_parts.append(
+                f"drawtext=text='{escaped_text}'"
+                f"{font_param}"
+                f":fontsize={fontsize}:fontcolor=white"
+                f":x=(w-text_w)/2:y=(h-text_h)/2"
+                f":enable='between(t,{start},{end})'"
+            )
+            af_parts.append(
+                f"volume=enable='between(t,{start},{end})':volume=0"
+            )
+
+        vf = ",".join(vf_parts)
+        af = ",".join(af_parts) if af_parts else "anull"
+        return vf, af
+
+    def _plan_mask_violation_execution(
+        self,
+        *,
+        video_path: Path,
+        output_path: Path,
+        vf: str,
+        af: str,
+        video_info: Dict[str, Any],
+        gpu_device: str,
+    ) -> Optional[tuple[int, List[str]]]:
+        """规划违规遮罩执行阶段所需 GPU 与 ffmpeg 命令。"""
+        _nvenc_manager.init()
+
+        if gpu_device == "auto":
+            gpu_id = _nvenc_manager.select_gpu()
+        else:
+            try:
+                gpu_id = int(gpu_device.split(":")[1])
+            except (IndexError, ValueError):
+                gpu_id = 0
+
+        if not _nvenc_manager.acquire(gpu_id, timeout=300):
+            logger.error(f"NVENC 会话获取超时: GPU {gpu_id}")
+            return None
+
+        original_bitrate = video_info.get('bit_rate', 0)
+        if original_bitrate > 0:
+            codec_params = [
+                '-rc', 'vbr',
+                '-cq', '23',
+                '-b:v', str(int(original_bitrate * 1.1)),
+                '-maxrate', str(int(original_bitrate * 1.5)),
+            ]
+        else:
+            codec_params = ['-rc', 'constqp', '-qp', '23']
+
+        cmd = [
+            'ffmpeg',
+            '-hwaccel', 'cuda',
+            '-hwaccel_device', str(gpu_id),
+            '-i', str(video_path),
+            '-vf', vf,
+            '-af', af,
+            '-c:v', 'hevc_nvenc',
+            '-gpu', str(gpu_id),
+            *codec_params,
+            '-preset', 'p4',
+            '-c:a', 'aac',
+            '-movflags', '+faststart',
+            '-y',
+            str(output_path)
+        ]
+        return gpu_id, cmd
+
+    def _run_mask_violation_runtime_stage(
+        self,
+        *,
+        video_path: Path,
+        output_path: Path,
+        gpu_id: int,
+        cmd: List[str],
+    ) -> bool:
+        """执行违规遮罩运行阶段并确保释放 NVENC 会话。"""
+        try:
+            logger.info(f"开始遮罩处理 (GPU {gpu_id})...")
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=3600,  # 1小时超时
+            )
+
+            if result.returncode != 0:
+                logger.error(f"ffmpeg 遮罩处理失败: {result.stderr[-500:]}")
+                return False
+
+            if not output_path.exists():
+                logger.error("遮罩处理完成但未生成文件")
+                return False
+
+            in_size = video_path.stat().st_size
+            out_size = output_path.stat().st_size
+            ratio = out_size / in_size if in_size > 0 else 0
+            logger.info(
+                f"遮罩处理完成: {output_path.name} "
+                f"({out_size / 1024 / 1024:.1f}MB, 相对原文件 {ratio:.1%})"
+            )
+            return True
+
+        except subprocess.TimeoutExpired:
+            logger.error("ffmpeg 遮罩处理超时 (>1小时)")
+            return False
+        except Exception as e:
+            logger.error(f"遮罩处理异常: {e}")
+            return False
+        finally:
+            _nvenc_manager.release(gpu_id)
+
     def mask_violation_segments(
         self,
         video_path: Path,
@@ -913,154 +1322,47 @@ class FFmpegWrapper:
         Returns:
             是否成功
         """
-        if not video_path.exists():
-            logger.error(f"输入视频不存在: {video_path}")
+        context = self._prepare_mask_violation_context(
+            video_path=video_path,
+            output_path=output_path,
+            violation_ranges=violation_ranges,
+            margin_sec=margin_sec,
+        )
+        if context is None:
             return False
-        
-        if not violation_ranges:
-            logger.warning("无违规时间段，无需处理")
-            return False
-        
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # 获取视频信息
-        video_info = self.get_video_info(video_path)
-        if not video_info:
-            logger.error("无法获取视频信息")
-            return False
-        
-        duration = video_info.get('duration', 0)
-        width = video_info.get('video', {}).get('width', 1920) if video_info.get('video') else 1920
-        height = video_info.get('video', {}).get('height', 1080) if video_info.get('video') else 1080
-        
-        # 合并重叠的违规区间并添加安全边距
-        merged = self._merge_ranges(violation_ranges, margin_sec, duration)
-        
+
+        video_info, width, height, merged = context
+
         logger.info(f"遮罩 {len(merged)} 个违规片段（含 {margin_sec}s 安全边距）:")
         for start, end in merged:
             logger.info(f"  {_format_time(start)} - {_format_time(end)} ({end - start:.1f}s)")
-        
-        # 构建 ffmpeg 复合滤镜
-        # 策略：对每个违规区间，用 drawbox 覆盖整个画面（黑色），再叠加说明文字
-        # 同时用 volume 滤镜将对应区间的音频静音
-        
-        # 视频滤镜：黑屏 + 文字
-        vf_parts = []
-        af_parts = []
-        
-        # 查找 CJK 字体（只查一次）
-        escaped_text = mask_text.replace("'", "\\'").replace(":", "\\:")
-        fontsize = max(24, height // 30)
-        cjk_font = self._find_cjk_font()
-        if cjk_font:
-            escaped_font = cjk_font.replace(":", "\\:").replace("'", "\\'")
-            font_param = f":fontfile='{escaped_font}'"
-            logger.info(f"使用 CJK 字体: {cjk_font}")
-        else:
-            logger.warning("未找到 CJK 字体，中文文字可能无法正常显示")
-            font_param = ""
-        
-        for start, end in merged:
-            # drawbox 覆盖整个画面为黑色
-            vf_parts.append(
-                f"drawbox=x=0:y=0:w={width}:h={height}:color=black:t=fill"
-                f":enable='between(t,{start},{end})'"
-            )
-            vf_parts.append(
-                f"drawtext=text='{escaped_text}'"
-                f"{font_param}"
-                f":fontsize={fontsize}:fontcolor=white"
-                f":x=(w-text_w)/2:y=(h-text_h)/2"
-                f":enable='between(t,{start},{end})'"
-            )
-            # 音频静音
-            af_parts.append(
-                f"volume=enable='between(t,{start},{end})':volume=0"
-            )
-        
-        vf = ",".join(vf_parts)
-        af = ",".join(af_parts) if af_parts else "anull"
-        
-        # GPU 编码选择
-        _nvenc_manager.init()
-        
-        if gpu_device == "auto":
-            gpu_id = _nvenc_manager.select_gpu()
-        else:
-            try:
-                gpu_id = int(gpu_device.split(":")[1])
-            except (IndexError, ValueError):
-                gpu_id = 0
-        
-        if not _nvenc_manager.acquire(gpu_id, timeout=300):
-            logger.error(f"NVENC 会话获取超时: GPU {gpu_id}")
+
+        vf, af = self._plan_mask_violation_filters(
+            width=width,
+            height=height,
+            merged=merged,
+            mask_text=mask_text,
+        )
+
+        planned_execution = self._plan_mask_violation_execution(
+            video_path=video_path,
+            output_path=output_path,
+            vf=vf,
+            af=af,
+            video_info=video_info,
+            gpu_device=gpu_device,
+        )
+        if planned_execution is None:
             return False
-        
-        # 获取原视频码率，控制输出质量
-        original_bitrate = video_info.get('bit_rate', 0)
-        if original_bitrate > 0:
-            codec_params = [
-                '-rc', 'vbr',
-                '-cq', '23',
-                '-b:v', str(int(original_bitrate * 1.1)),
-                '-maxrate', str(int(original_bitrate * 1.5)),
-            ]
-        else:
-            codec_params = ['-rc', 'constqp', '-qp', '23']
-        
-        cmd = [
-            'ffmpeg',
-            '-hwaccel', 'cuda',
-            '-hwaccel_device', str(gpu_id),
-            '-i', str(video_path),
-            '-vf', vf,
-            '-af', af,
-            '-c:v', 'hevc_nvenc',
-            '-gpu', str(gpu_id),
-            *codec_params,
-            '-preset', 'p4',
-            '-c:a', 'aac',
-            '-movflags', '+faststart',
-            '-y',
-            str(output_path)
-        ]
-        
-        try:
-            logger.info(f"开始遮罩处理 (GPU {gpu_id})...")
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=3600,  # 1小时超时
-            )
-            
-            if result.returncode != 0:
-                logger.error(f"ffmpeg 遮罩处理失败: {result.stderr[-500:]}")
-                return False
-            
-            if not output_path.exists():
-                logger.error("遮罩处理完成但未生成文件")
-                return False
-            
-            # 检查输出文件大小合理性
-            in_size = video_path.stat().st_size
-            out_size = output_path.stat().st_size
-            ratio = out_size / in_size if in_size > 0 else 0
-            logger.info(
-                f"遮罩处理完成: {output_path.name} "
-                f"({out_size / 1024 / 1024:.1f}MB, 相对原文件 {ratio:.1%})"
-            )
-            return True
-            
-        except subprocess.TimeoutExpired:
-            logger.error("ffmpeg 遮罩处理超时 (>1小时)")
-            return False
-        except Exception as e:
-            logger.error(f"遮罩处理异常: {e}")
-            return False
-        finally:
-            _nvenc_manager.release(gpu_id)
-    
+
+        gpu_id, cmd = planned_execution
+        return self._run_mask_violation_runtime_stage(
+            video_path=video_path,
+            output_path=output_path,
+            gpu_id=gpu_id,
+            cmd=cmd,
+        )
+
     @staticmethod
     def _merge_ranges(
         ranges: List[tuple], margin: float, max_duration: float

@@ -7,6 +7,8 @@ downloaders 模块单元测试
 import pytest
 from pathlib import Path
 from vat.downloaders import YouTubeDownloader
+from vat.models import SourceType
+from vat.pipeline import resolve_video_identity_from_source
 
 
 @pytest.fixture
@@ -134,6 +136,16 @@ class TestGenerateVideoId:
         url = "https://youtube.com/watch?v=test123"
         expected = hashlib.md5(url.encode()).hexdigest()[:16]
         assert YouTubeDownloader.generate_video_id_from_url(url) == expected
+
+
+class TestResolveVideoIdentity:
+    def test_youtube_prefers_platform_video_id(self):
+        normalized, video_id = resolve_video_identity_from_source(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            SourceType.YOUTUBE,
+        )
+        assert normalized == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        assert video_id == "dQw4w9WgXcQ"
 
 
 class TestChannelPattern:

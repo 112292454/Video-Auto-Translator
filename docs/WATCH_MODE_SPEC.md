@@ -151,8 +151,8 @@ CREATE TABLE resource_locks (
 
 | 资源类型 | 最大并发 | 最小间隔 | 锁超时 |
 |----------|----------|----------|--------|
-| `youtube_download` | 1 | 配置项 `downloader.youtube.download_delay`（当前默认 10s） | 30 分钟 |
-| `bilibili_upload` | 1 | 配置项 `uploader.bilibili.upload_interval`（当前默认值） | 60 分钟 |
+| `youtube_download` | 配置项 `concurrency.max_concurrent_downloads`（默认 1） | 配置项 `downloader.youtube.download_delay` | 30 分钟 |
+| `bilibili_upload` | 配置项 `concurrency.max_concurrent_uploads`（默认 1） | 配置项 `uploader.bilibili.upload_interval` | 60 分钟 |
 
 **获取锁流程**:
 
@@ -184,7 +184,7 @@ def release_lock(resource_type):
 
 ```python
 # 推荐使用方式：确保异常/kill 场景下锁的安全释放
-with resource_lock('youtube_download', timeout=300) as lock:
+with resource_lock(db_path, 'youtube_download', timeout_seconds=300, max_concurrent=1):
     do_download()
 # __exit__ 中自动 release_lock
 # 进程被 kill 时，心跳停止 → 其他进程通过心跳超时检测到死锁 → 自动清理
@@ -215,22 +215,26 @@ CREATE TABLE resource_cooldowns (
 #### 3.4.3 配置
 
 ```yaml
-# 现有配置的复用（无需新增配置项）
+# 新增全局资源并发上限；冷却间隔继续复用现有 download_delay / upload_interval
+concurrency:
+  max_concurrent_downloads: 1  # 全局下载总并发上限（所有 VAT 实例合计）
+  max_concurrent_uploads: 1    # 全局上传总并发上限（所有 VAT 实例合计）
+
 downloader:
   youtube:
-    download_delay: 10  # 已有，作为下载间隔的最小值
+    download_delay: 10  # 已有，作为下载冷却间隔的最小值
 
 uploader:
   bilibili:
-    upload_interval: 60  # 已有，作为上传间隔的最小值
+    upload_interval: 60  # 已有，作为上传冷却间隔的最小值
 ```
 
 #### 3.4.4 集成点
 
 资源锁需要集成到现有的下载和上传执行路径中：
 
-- **下载**: `VideoProcessor` 的 download 阶段执行前获取 `youtube_download` 锁
-- **上传**: `VideoProcessor` 的 upload 阶段执行前获取 `bilibili_upload` 锁
+- **下载**: `YouTubeDownloader.download()` 内部获取 `youtube_download` 锁
+- **上传**: `BilibiliUploader.upload()` / 替换视频上传内部获取 `bilibili_upload` 锁
 - **所有调用者**自动受益（watch 模式、手动 process、cron upload 等）
 
 ### 3.5 错误处理与自动重试
@@ -448,7 +452,7 @@ Watch 发现新视频后的任务提交方式：
 
 1. 在 `vat/utils/` 下新增 `resource_lock.py`
 2. 新增 `resource_locks` + `resource_cooldowns` 数据库表
-3. 在 `VideoProcessor` 的 download/upload 阶段集成锁
+3. 在真实下载/上传 adapter 内部集成锁，避免调用方绕过
 4. 测试：两个 `vat process` 进程并发执行时锁的行为
 
 ### Phase 2: Watch 核心逻辑
@@ -514,8 +518,9 @@ Watch 发现新视频后的任务提交方式：
 1. **资源锁使用独立 SQLite 文件**：`resource_lock.py` 使用独立的 `resource_locks.db`（与主数据库同目录），而非共用主 DB。这样即使不通过 `Database` 类的场景也能使用锁。
 2. **Watch CLI 注册为顶级命令**：`vat watch` 作为顶级命令，同时也注册为 `vat tools watch` 子命令（供 WebUI JobManager 调用）。
 3. **watch_rounds 表增加 `retry_video_ids` 列**：记录每轮中哪些视频是重试候选，方便 WebUI 展示和调试。
-4. **Watch 通过 JobManager 提交 process job**：`WatchService` 通过 `JobManager.submit_job(task_type='process')` 提交处理任务，而非直接 `subprocess.Popen`。这样 watch 提交的处理任务在 `web_jobs` 表有正式记录，WebUI 可见、可追踪、可取消。Watch 只做轻量编排（sync → filter → submit），不干涉处理流程内部。WebUI 通过 `JobManager` 提交 `watch` tools 任务来启动 watch 进程本身。
-5. **视频候选范围修复**：`_get_processable_videos` 只接收 sync 报告的新增视频 ID，不再扫描全量 playlist（旧实现导致首次 watch 提交数千视频）。retry 范围限定为本 session 提交过的视频，防止历史失败被大规模重试。额外增加安全上限（代码硬上限 50 + 配置默认 20）。
+4. **锁下沉到下载器/上传器内部**：最终实现没有把锁留在 `VideoProcessor` 外层，而是放进 `YouTubeDownloader` / `BilibiliUploader` 的真实传输方法中。这样 `vat process`、`vat upload video`、违规修复替换视频等路径共享同一把锁，避免入口级遗漏。
+5. **Watch 通过 JobManager 提交 process job**：`WatchService` 通过 `JobManager.submit_job(task_type='process')` 提交处理任务，而非直接 `subprocess.Popen`。这样 watch 提交的处理任务在 `web_jobs` 表有正式记录，WebUI 可见、可追踪、可取消。Watch 只做轻量编排（sync → filter → submit），不干涉处理流程内部。WebUI 通过 `JobManager` 提交 `watch` tools 任务来启动 watch 进程本身。
+6. **视频候选范围修复**：`_get_processable_videos` 只接收 sync 报告的新增视频 ID，不再扫描全量 playlist（旧实现导致首次 watch 提交数千视频）。retry 范围限定为本 session 提交过的视频，防止历史失败被大规模重试。额外增加安全上限（代码硬上限 50 + 配置默认 20）。
 
 ### 已知限制与未来规划
 

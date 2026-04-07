@@ -1,0 +1,1339 @@
+{% extends "base.html" %}
+
+{% block title %}测试中心 - VAT{% endblock %}
+
+{% block content %}
+<div class="space-y-6" x-data="testCenterPage()" x-init="init()">
+    <div class="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+        <div>
+            <h1 class="text-2xl font-bold text-gray-800">测试中心</h1>
+            <p class="text-sm text-gray-500 mt-1">在这里检查接口、提示词、配置和运行环境。</p>
+        </div>
+        <div class="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900 max-w-2xl">
+            适合排查首次部署、配置变更和接口异常。
+        </div>
+    </div>
+
+    <div class="flex flex-wrap gap-2">
+        <button type="button" class="filter-tag rounded-full px-4 py-2 bg-gray-200 text-gray-700"
+                :class="activeTab === 'llm' ? 'bg-gray-800 text-white active' : ''"
+                @click="activeTab = 'llm'">LLM 接口测试</button>
+        <button type="button" class="filter-tag rounded-full px-4 py-2 bg-gray-200 text-gray-700"
+                :class="activeTab === 'prompt' ? 'bg-gray-800 text-white active' : ''"
+                @click="activeTab = 'prompt'">Prompt 预览</button>
+        <button type="button" class="filter-tag rounded-full px-4 py-2 bg-gray-200 text-gray-700"
+                :class="activeTab === 'config' ? 'bg-gray-800 text-white active' : ''"
+                @click="activeTab = 'config'">配置编辑</button>
+        <button type="button" class="filter-tag rounded-full px-4 py-2 bg-gray-200 text-gray-700"
+                :class="activeTab === 'env' ? 'bg-gray-800 text-white active' : ''"
+                @click="activeTab = 'env'">环境检测</button>
+    </div>
+
+    <section x-show="activeTab === 'llm'" x-cloak class="space-y-4">
+        <div class="bg-white rounded-2xl shadow p-6 space-y-4">
+            <div class="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                <div>
+                    <h2 class="text-lg font-semibold text-gray-900">接口测试</h2>
+                    <p class="text-sm text-gray-500 mt-1">检查各阶段的 LLM 是否能正常响应。</p>
+                </div>
+                <div class="flex flex-wrap gap-2">
+                    <button class="px-4 py-2 bg-gray-200 text-gray-800 rounded-lg hover:bg-gray-300 disabled:opacity-50"
+                            :disabled="llmLoadingAll"
+                            @click="loadLlmTargets()">刷新列表</button>
+                    <button class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                            :disabled="llmLoadingAll || !llmTargets.length"
+                            @click="runAllLlmTargets()">
+                        <span x-show="!llmLoadingAll">全部测试</span>
+                        <span x-show="llmLoadingAll">测试中...</span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div class="rounded-xl border border-gray-200 bg-gray-50 p-4">
+                    <div class="text-xs uppercase text-gray-500">可测试接口</div>
+                    <div class="mt-2 text-2xl font-bold text-gray-900" x-text="llmStats().total"></div>
+                </div>
+                <div class="rounded-xl border border-emerald-200 bg-emerald-50 p-4">
+                    <div class="text-xs uppercase text-emerald-700">成功</div>
+                    <div class="mt-2 text-2xl font-bold text-emerald-900" x-text="llmStats().success"></div>
+                </div>
+                <div class="rounded-xl border border-rose-200 bg-rose-50 p-4">
+                    <div class="text-xs uppercase text-rose-700">失败</div>
+                    <div class="mt-2 text-2xl font-bold text-rose-900" x-text="llmStats().failed"></div>
+                </div>
+            </div>
+
+            <div class="overflow-x-auto border rounded-2xl">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">阶段</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Provider</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Model</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">配置</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">结果</th>
+                            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-gray-100 bg-white">
+                        <template x-for="target in llmTargets" :key="target.id">
+                            <tr :class="selectedLlmTargetId === target.id ? 'bg-sky-50' : ''">
+                                <td class="px-4 py-3 align-top">
+                                    <div class="font-medium text-gray-900" x-text="target.label"></div>
+                                    <div class="text-xs text-gray-500 mt-1" x-text="target.id"></div>
+                                </td>
+                                <td class="px-4 py-3 align-top text-sm text-gray-700" x-text="target.provider"></td>
+                                <td class="px-4 py-3 align-top text-sm font-mono text-gray-700 break-all" x-text="target.model"></td>
+                                <td class="px-4 py-3 align-top text-xs text-gray-600 space-y-1">
+                                    <div class="font-mono break-all" x-text="target.base_url || '(继承 / 为空)'"></div>
+                                    <div class="font-mono break-all" x-text="'proxy: ' + (target.proxy || '(无)')"></div>
+                                    <div class="font-mono" x-text="'key: ' + (target.api_key_masked || '(空)')"></div>
+                                </td>
+                                <td class="px-4 py-3 align-top">
+                                    <template x-if="llmResults[target.id]">
+                                        <div class="space-y-2">
+                                            <span class="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium"
+                                                  :class="statusBadgeClass(llmResults[target.id])"
+                                                  x-text="llmResults[target.id].ok ? '成功' : '失败'"></span>
+                                            <div class="text-sm text-gray-800" x-text="llmResults[target.id].summary || '-'"></div>
+                                            <div class="text-xs text-gray-500" x-text="formatDurationMs(llmResults[target.id].duration_ms)"></div>
+                                        </div>
+                                    </template>
+                                    <template x-if="!llmResults[target.id]">
+                                        <span class="text-sm text-gray-400">未测试</span>
+                                    </template>
+                                </td>
+                                <td class="px-4 py-3 align-top">
+                                    <div class="flex flex-wrap gap-2">
+                                        <button class="px-3 py-1.5 bg-emerald-600 text-white rounded hover:bg-emerald-700 disabled:opacity-50"
+                                                :disabled="llmRunning[target.id] || llmLoadingAll"
+                                                @click="runLlmTarget(target.id)">
+                                            <span x-show="!llmRunning[target.id]">测试</span>
+                                            <span x-show="llmRunning[target.id]">测试中...</span>
+                                        </button>
+                                        <button class="px-3 py-1.5 bg-gray-100 text-gray-700 rounded hover:bg-gray-200 disabled:opacity-50"
+                                                :disabled="!llmResults[target.id]"
+                                                @click="selectLlmResult(target.id)">查看详情</button>
+                                    </div>
+                                </td>
+                            </tr>
+                        </template>
+                        <tr x-show="!llmTargets.length">
+                            <td colspan="6" class="px-4 py-8 text-center text-gray-500">暂无数据</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="bg-white rounded-2xl shadow p-6" x-show="selectedLlmResult()">
+            <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                <div>
+                    <h3 class="font-semibold text-gray-900">测试结果详情</h3>
+                    <p class="text-sm text-gray-500 mt-1" x-text="selectedLlmResult()?.target?.label || ''"></p>
+                </div>
+                <span class="inline-flex items-center rounded-full px-3 py-1 text-sm font-medium"
+                      :class="statusBadgeClass(selectedLlmResult())"
+                      x-text="selectedLlmResult()?.ok ? '成功' : '失败'"></span>
+            </div>
+
+            <div class="mt-4 grid grid-cols-1 md:grid-cols-4 gap-3">
+                <div class="rounded-xl border p-4">
+                    <div class="text-xs uppercase text-gray-500">阶段</div>
+                    <div class="mt-2 font-semibold text-gray-900" x-text="selectedLlmResult()?.target_id || '-'"></div>
+                </div>
+                <div class="rounded-xl border p-4">
+                    <div class="text-xs uppercase text-gray-500">摘要</div>
+                    <div class="mt-2 text-sm text-gray-900" x-text="selectedLlmResult()?.summary || '-'"></div>
+                </div>
+                <div class="rounded-xl border p-4">
+                    <div class="text-xs uppercase text-gray-500">耗时</div>
+                    <div class="mt-2 font-semibold text-gray-900" x-text="formatDurationMs(selectedLlmResult()?.duration_ms)"></div>
+                </div>
+                <div class="rounded-xl border p-4">
+                    <div class="text-xs uppercase text-gray-500">返回</div>
+                    <div class="mt-2 font-semibold text-gray-900" x-text="selectedLlmResult()?.ok ? '有响应' : '失败'"></div>
+                </div>
+            </div>
+
+            <div class="mt-6 grid grid-cols-1 xl:grid-cols-2 gap-4">
+                <div class="rounded-2xl border p-4 space-y-3">
+                    <h4 class="font-medium text-gray-900">测试操作</h4>
+                    <div class="text-sm text-gray-700">这里会显示本次测试实际使用的接口配置和发送内容。</div>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                        <div class="rounded-xl bg-gray-50 p-3">
+                            <div class="text-xs uppercase text-gray-500">Model</div>
+                            <div class="mt-1 font-mono break-all" x-text="selectedLlmResult()?.request?.model || '-'"></div>
+                        </div>
+                        <div class="rounded-xl bg-gray-50 p-3">
+                            <div class="text-xs uppercase text-gray-500">Proxy</div>
+                            <div class="mt-1 font-mono break-all" x-text="selectedLlmResult()?.request?.proxy || '(无)'"></div>
+                        </div>
+                        <div class="rounded-xl bg-gray-50 p-3 md:col-span-2">
+                            <div class="text-xs uppercase text-gray-500">Base URL</div>
+                            <div class="mt-1 font-mono break-all" x-text="selectedLlmResult()?.request?.base_url || '(继承 / 为空)'"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="rounded-2xl border p-4 space-y-3">
+                    <h4 class="font-medium text-gray-900">返回结果</h4>
+                    <template x-if="selectedLlmResult()?.ok">
+                        <div class="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-emerald-900">
+                            接口返回成功，下面保留原始返回文本方便核对。
+                        </div>
+                    </template>
+                    <template x-if="selectedLlmResult() && !selectedLlmResult()?.ok">
+                        <div class="rounded-xl border border-rose-200 bg-rose-50 p-3 text-rose-900">
+                            <div class="font-medium" x-text="selectedLlmResult()?.error?.message || selectedLlmResult()?.summary || '失败'"></div>
+                            <div class="text-xs mt-1" x-text="selectedLlmResult()?.error?.type || ''"></div>
+                        </div>
+                    </template>
+                    <pre class="bg-gray-900 text-gray-100 rounded-xl p-4 overflow-x-auto text-sm whitespace-pre-wrap min-h-[120px]" x-text="selectedLlmResult()?.response?.raw_output || '(无返回文本)'"></pre>
+                </div>
+            </div>
+
+            <div class="mt-6 space-y-4">
+                <div>
+                    <h4 class="font-medium text-gray-900 mb-2">发送内容</h4>
+                    <div class="space-y-3">
+                        <template x-for="(message, index) in (selectedLlmResult()?.request?.messages || [])" :key="index">
+                            <div class="rounded-2xl border overflow-hidden">
+                                <div class="px-4 py-2 border-b text-xs font-medium uppercase tracking-wide"
+                                     :class="message.role === 'system' ? 'bg-slate-100 text-slate-700' : 'bg-blue-50 text-blue-700'">
+                                    <span x-text="message.role"></span>
+                                </div>
+                                <pre class="p-4 text-sm whitespace-pre-wrap overflow-x-auto bg-white" x-text="message.content"></pre>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+
+                <div class="rounded-2xl border p-4" x-show="selectedLlmResult()?.reproduction">
+                    <h4 class="font-medium text-gray-900 mb-2">如何复刻这个请求</h4>
+                    <div class="text-sm text-gray-600 mb-3">如果要在终端里直接复现这次调用，可以复制下面的命令。</div>
+                    <div class="space-y-3">
+                        <div class="rounded-xl bg-gray-50 p-3">
+                            <div class="text-xs uppercase text-gray-500">Endpoint</div>
+                            <div class="mt-1 font-mono text-sm break-all" x-text="selectedLlmResult()?.reproduction?.endpoint || '-'"></div>
+                        </div>
+                        <pre class="bg-gray-900 text-gray-100 rounded-xl p-4 overflow-x-auto text-sm whitespace-pre-wrap" x-text="selectedLlmResult()?.reproduction?.curl_command || ''"></pre>
+                    </div>
+                </div>
+
+                <details class="rounded-2xl border p-4">
+                    <summary class="cursor-pointer font-medium text-gray-900">查看原始详情</summary>
+                    <div class="mt-4 space-y-4">
+                        <div>
+                            <div class="text-sm font-medium text-gray-800 mb-2">原始请求 JSON</div>
+                            <pre class="bg-gray-900 text-gray-100 rounded-xl p-4 overflow-x-auto text-sm whitespace-pre-wrap" x-text="formatJson(selectedLlmResult()?.request)"></pre>
+                        </div>
+                        <div x-show="selectedLlmResult()?.reproduction">
+                            <div class="text-sm font-medium text-gray-800 mb-2">curl 复刻参数</div>
+                            <pre class="bg-gray-900 text-gray-100 rounded-xl p-4 overflow-x-auto text-sm whitespace-pre-wrap" x-text="formatJson(selectedLlmResult()?.reproduction)"></pre>
+                        </div>
+                        <div x-show="selectedLlmResult()?.traceback">
+                            <div class="text-sm font-medium text-gray-800 mb-2">Traceback</div>
+                            <pre class="bg-gray-900 text-gray-100 rounded-xl p-4 overflow-x-auto text-sm whitespace-pre-wrap" x-text="selectedLlmResult()?.traceback || ''"></pre>
+                        </div>
+                    </div>
+                </details>
+            </div>
+        </div>
+    </section>
+
+    <section x-show="activeTab === 'prompt'" x-cloak class="space-y-4">
+        <div class="bg-white rounded-2xl shadow p-6 space-y-4">
+            <div class="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+                <div>
+                    <h2 class="text-lg font-semibold text-gray-900">Prompt 预览</h2>
+                    <p class="text-sm text-gray-500 mt-1">修改测试输入后生成预览，下面会展示该阶段最终发送的参数和提示词。</p>
+                </div>
+                <div class="w-full xl:w-72">
+                    <label class="block text-sm font-medium text-gray-700 mb-1">阶段</label>
+                    <select class="w-full border rounded-lg px-3 py-2" x-model="promptStage" @change="loadPromptStageDefaults()">
+                        <option value="split">split</option>
+                        <option value="translate">translate</option>
+                        <option value="optimize">optimize</option>
+                        <option value="scene_identify">scene_identify</option>
+                        <option value="video_info_translate">video_info_translate</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="rounded-2xl border border-sky-200 bg-sky-50 p-4">
+                <div class="font-medium text-sky-900 mb-2">测试输入</div>
+
+                <div class="space-y-4" x-show="promptStage === 'split'">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">原文本</label>
+                        <textarea rows="4" class="w-full border rounded-lg px-3 py-2 text-sm" x-model="promptInput.text"></textarea>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">场景提示词</label>
+                        <textarea rows="3" class="w-full border rounded-lg px-3 py-2 text-sm" x-model="promptInput.scene_prompt"></textarea>
+                    </div>
+                </div>
+
+                <div class="space-y-4" x-show="promptStage === 'translate'">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">待翻译片段（每行一条）</label>
+                        <textarea rows="5" class="w-full border rounded-lg px-3 py-2 text-sm" x-model="promptInput.segments_text"></textarea>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">前文上下文（每行 `key|text`）</label>
+                        <textarea rows="4" class="w-full border rounded-lg px-3 py-2 text-sm" x-model="promptInput.previous_context_text"></textarea>
+                    </div>
+                </div>
+
+                <div class="space-y-4" x-show="promptStage === 'optimize'">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">字幕块（每行 `key|text`）</label>
+                        <textarea rows="5" class="w-full border rounded-lg px-3 py-2 text-sm" x-model="promptInput.subtitle_chunk_text"></textarea>
+                    </div>
+                </div>
+
+                <div class="space-y-4" x-show="promptStage === 'scene_identify'">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">标题</label>
+                        <input type="text" class="w-full border rounded-lg px-3 py-2 text-sm" x-model="promptInput.title">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">简介</label>
+                        <textarea rows="4" class="w-full border rounded-lg px-3 py-2 text-sm" x-model="promptInput.description"></textarea>
+                    </div>
+                </div>
+
+                <div class="space-y-4" x-show="promptStage === 'video_info_translate'">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">标题</label>
+                        <input type="text" class="w-full border rounded-lg px-3 py-2 text-sm" x-model="promptInput.title">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">简介</label>
+                        <textarea rows="4" class="w-full border rounded-lg px-3 py-2 text-sm" x-model="promptInput.description"></textarea>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">上传者</label>
+                            <input type="text" class="w-full border rounded-lg px-3 py-2 text-sm" x-model="promptInput.uploader">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">默认分区</label>
+                            <input type="number" class="w-full border rounded-lg px-3 py-2 text-sm" x-model="promptInput.default_tid">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">标签（逗号分隔）</label>
+                            <input type="text" class="w-full border rounded-lg px-3 py-2 text-sm" x-model="promptInput.tags_text">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="flex flex-wrap gap-3 mt-4">
+                    <button class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                            :disabled="promptLoading"
+                            @click="previewPrompt()">
+                        <span x-show="!promptLoading">生成预览</span>
+                        <span x-show="promptLoading">生成中...</span>
+                    </button>
+                    <button class="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300"
+                            @click="loadPromptStageDefaults()">恢复默认输入</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="bg-white rounded-2xl shadow p-6" x-show="promptPreview">
+            <div class="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+                <div>
+                    <h3 class="font-semibold text-gray-900">预览结果</h3>
+                    <p class="text-sm text-gray-500 mt-1" x-text="'阶段：' + (promptPreview?.stage || '')"></p>
+                </div>
+                <div class="grid grid-cols-2 gap-3 xl:w-[420px]">
+                    <div class="rounded-xl border p-3">
+                        <div class="text-xs uppercase text-gray-500">Model</div>
+                        <div class="mt-1 font-mono text-sm break-all" x-text="promptPreview?.runtime?.model || '-'"></div>
+                    </div>
+                    <div class="rounded-xl border p-3">
+                        <div class="text-xs uppercase text-gray-500">温度</div>
+                        <div class="mt-1 font-semibold text-sm" x-text="promptPreview?.runtime?.temperature ?? '-'"></div>
+                    </div>
+                    <div class="rounded-xl border p-3 col-span-2">
+                        <div class="text-xs uppercase text-gray-500">Base URL / Proxy</div>
+                        <div class="mt-1 text-sm font-mono break-all" x-text="(promptPreview?.runtime?.base_url || '(继承 / 为空)') + ' | proxy: ' + (promptPreview?.runtime?.proxy || '(无)')"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="mt-6 grid grid-cols-1 xl:grid-cols-2 gap-4">
+                <div class="rounded-2xl border p-4">
+                    <h4 class="font-medium text-gray-900 mb-3">当前输入</h4>
+                    <template x-for="entry in objectEntries(promptPreview?.effective_input || {})" :key="entry.key">
+                        <div class="mb-3 rounded-xl bg-gray-50 p-3">
+                            <div class="text-xs uppercase text-gray-500" x-text="entry.key"></div>
+                            <pre class="mt-2 text-sm whitespace-pre-wrap overflow-x-auto" x-text="formatInline(entry.value)"></pre>
+                        </div>
+                    </template>
+                </div>
+                <div class="rounded-2xl border p-4">
+                    <h4 class="font-medium text-gray-900 mb-3">请求消息</h4>
+                    <div class="space-y-3">
+                        <template x-for="(message, index) in (promptPreview?.request?.messages || [])" :key="index">
+                            <div class="rounded-2xl border overflow-hidden">
+                                <div class="px-4 py-2 border-b text-xs font-medium uppercase tracking-wide"
+                                     :class="message.role === 'system' ? 'bg-slate-100 text-slate-700' : 'bg-blue-50 text-blue-700'">
+                                    <span x-text="message.role"></span>
+                                </div>
+                                <pre class="p-4 text-sm whitespace-pre-wrap overflow-x-auto bg-white" x-text="message.content"></pre>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            </div>
+
+            <details class="rounded-2xl border p-4 mt-6">
+                <summary class="cursor-pointer font-medium text-gray-900">查看原始请求 JSON</summary>
+                <pre class="mt-4 bg-gray-900 text-gray-100 rounded-xl p-4 overflow-x-auto text-sm whitespace-pre-wrap" x-text="formatJson(promptPreview?.request)"></pre>
+            </details>
+        </div>
+    </section>
+
+    <section x-show="activeTab === 'config'" x-cloak class="space-y-4">
+        <div class="rounded-2xl border border-sky-200 bg-sky-50 p-4 text-sm text-sky-900">
+            <div class="font-medium">结构化编辑</div>
+            <div class="mt-1">优先使用结构化表单修改配置；原始 YAML 放在高级模式里备用。</div>
+        </div>
+
+        <div class="flex flex-wrap gap-2">
+            <button type="button" class="filter-tag rounded-full px-4 py-2 bg-gray-200 text-gray-700"
+                    :class="configTab === 'main' ? 'bg-gray-800 text-white active' : ''"
+                    @click="configTab = 'main'">主配置文件</button>
+            <button type="button" class="filter-tag rounded-full px-4 py-2 bg-gray-200 text-gray-700"
+                    :class="configTab === 'upload' ? 'bg-gray-800 text-white active' : ''"
+                    @click="configTab = 'upload'">Upload 配置</button>
+        </div>
+
+        <div class="bg-white rounded-2xl shadow p-6 space-y-4" x-show="configTab === 'main'" x-cloak>
+            <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                <div>
+                    <h2 class="text-lg font-semibold text-gray-900">主配置文件</h2>
+                    <p class="text-sm text-gray-500 mt-1" x-text="configState.path || ''"></p>
+                </div>
+                <div class="flex flex-wrap gap-2">
+                    <button class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50"
+                            :disabled="configSaving"
+                            @click="saveConfigForm()">
+                        <span x-show="!configSaving">保存结构化编辑</span>
+                        <span x-show="configSaving">保存中...</span>
+                    </button>
+                    <button class="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300"
+                            @click="loadConfigState()">重新加载</button>
+                </div>
+            </div>
+
+            <div class="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+                <template x-for="note in configState.notes || []" :key="note">
+                    <div x-text="note"></div>
+                </template>
+            </div>
+
+            <div class="space-y-2">
+                <template x-for="row in configRows" :key="row.key">
+                    <div x-show="rowVisible(row, configGroupExpanded)">
+                        <template x-if="row.kind === 'group'">
+                            <div class="rounded-xl border bg-white" :style="nodeOffsetStyle(row.depth)">
+                                <button type="button"
+                                        class="w-full flex items-center justify-between px-4 py-3 text-left"
+                                        @click="toggleGroup(configGroupExpanded, row.path)">
+                                    <span class="flex items-center gap-2">
+                                        <span class="text-gray-500" x-text="configGroupExpanded[row.path] ? '▾' : '▸'"></span>
+                                        <span class="font-medium text-gray-900" x-text="row.label"></span>
+                                    </span>
+                                    <span class="text-xs text-gray-500" x-text="row.childFieldCount + ' 个字段'"></span>
+                                </button>
+                            </div>
+                        </template>
+                        <template x-if="row.kind === 'field'">
+                            <div class="rounded-xl bg-gray-50 p-3" :style="nodeOffsetStyle(row.depth)">
+                                <div class="flex flex-col gap-1 lg:flex-row lg:items-center lg:justify-between">
+                                    <div>
+                                        <div class="font-mono text-sm text-gray-900 break-all" x-text="row.label"></div>
+                                        <div class="text-xs text-gray-500 mt-1" x-show="row.description" x-text="row.description"></div>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-xs text-gray-500 uppercase" x-text="row.type"></span>
+                                        <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs"
+                                              :class="row.source === '显式配置' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'"
+                                              x-text="row.source"></span>
+                                    </div>
+                                </div>
+                                <div class="mt-3">
+                                    <template x-if="row.type === 'bool'">
+                                        <label class="inline-flex items-center gap-2 text-sm text-gray-700">
+                                            <input type="checkbox" class="h-4 w-4" x-model="configFieldValues[row.path]">
+                                            <span>启用</span>
+                                        </label>
+                                    </template>
+                                    <template x-if="row.type === 'int' || row.type === 'float'">
+                                        <input :type="row.type === 'int' ? 'number' : 'text'"
+                                               class="w-full border rounded-lg px-3 py-2 text-sm"
+                                               x-model="configFieldValues[row.path]">
+                                    </template>
+                                    <template x-if="row.type === 'list'">
+                                        <textarea rows="4" class="w-full border rounded-lg px-3 py-2 text-sm font-mono"
+                                                  x-model="configFieldValues[row.path]"></textarea>
+                                    </template>
+                                    <template x-if="row.type === 'str' || row.type === 'null'">
+                                        <template x-if="row.multiline">
+                                            <textarea rows="4" class="w-full border rounded-lg px-3 py-2 text-sm"
+                                                      x-model="configFieldValues[row.path]"></textarea>
+                                        </template>
+                                    </template>
+                                    <template x-if="(row.type === 'str' || row.type === 'null') && !row.multiline">
+                                        <input type="text" class="w-full border rounded-lg px-3 py-2 text-sm"
+                                               x-model="configFieldValues[row.path]">
+                                    </template>
+                                </div>
+                                <div class="mt-2 text-xs text-gray-500">
+                                    示例：<span class="font-mono break-all" x-text="formatInline(row.example)"></span>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </template>
+            </div>
+
+            <details class="rounded-2xl border p-4">
+                <summary class="cursor-pointer font-medium text-gray-900">高级模式：原始 YAML</summary>
+                <textarea rows="18" class="mt-4 w-full border rounded-lg px-3 py-3 font-mono text-sm"
+                          x-model="configYaml"></textarea>
+                <div class="mt-3 flex gap-2">
+                    <button class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700"
+                            @click="saveConfigRaw()">按原始 YAML 保存</button>
+                </div>
+            </details>
+
+            <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                <div class="rounded-2xl border p-4">
+                    <h3 class="font-medium text-gray-900 mb-3">备份列表</h3>
+                    <div class="space-y-2 max-h-[280px] overflow-y-auto">
+                        <template x-for="backup in configState.backups || []" :key="backup.name">
+                            <div class="rounded-xl border p-3">
+                                <div class="font-mono text-sm break-all" x-text="backup.name"></div>
+                                <div class="text-xs text-gray-500 mt-1" x-text="backup.path || ''"></div>
+                                <button class="mt-3 px-3 py-1.5 bg-orange-600 text-white rounded hover:bg-orange-700 text-sm"
+                                        @click="restoreConfig(backup.name)">恢复</button>
+                            </div>
+                        </template>
+                        <div x-show="!(configState.backups || []).length" class="text-sm text-gray-400">暂无备份</div>
+                    </div>
+                </div>
+                <div class="rounded-2xl border p-4" x-show="configSaveResult">
+                    <h3 class="font-medium text-gray-900 mb-2">最近保存结果</h3>
+                    <pre class="bg-gray-900 text-gray-100 rounded-xl p-4 overflow-x-auto text-sm whitespace-pre-wrap" x-text="formatJson(configSaveResult)"></pre>
+                </div>
+            </div>
+        </div>
+
+        <div class="bg-white rounded-2xl shadow p-6 space-y-4" x-show="configTab === 'upload'" x-cloak>
+            <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                <div>
+                    <h2 class="text-lg font-semibold text-gray-900">Upload 配置</h2>
+                    <p class="text-sm text-gray-500 mt-1" x-text="uploadConfigState.path || ''"></p>
+                </div>
+                <div class="flex flex-wrap gap-2">
+                    <button class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50"
+                            :disabled="uploadConfigSaving"
+                            @click="saveUploadConfigForm()">
+                        <span x-show="!uploadConfigSaving">保存结构化编辑</span>
+                        <span x-show="uploadConfigSaving">保存中...</span>
+                    </button>
+                    <button class="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300"
+                            @click="loadUploadConfigState()">重新加载</button>
+                </div>
+            </div>
+
+            <div class="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900">
+                <template x-for="note in uploadConfigState.notes || []" :key="note">
+                    <div x-text="note"></div>
+                </template>
+            </div>
+
+            <div class="space-y-2">
+                <template x-for="row in uploadConfigRows" :key="row.key">
+                    <div x-show="rowVisible(row, uploadConfigGroupExpanded)">
+                        <template x-if="row.kind === 'group'">
+                            <div class="rounded-xl border bg-white" :style="nodeOffsetStyle(row.depth)">
+                                <button type="button"
+                                        class="w-full flex items-center justify-between px-4 py-3 text-left"
+                                        @click="toggleGroup(uploadConfigGroupExpanded, row.path)">
+                                    <span class="flex items-center gap-2">
+                                        <span class="text-gray-500" x-text="uploadConfigGroupExpanded[row.path] ? '▾' : '▸'"></span>
+                                        <span class="font-medium text-gray-900" x-text="row.label"></span>
+                                    </span>
+                                    <span class="text-xs text-gray-500" x-text="row.childFieldCount + ' 个字段'"></span>
+                                </button>
+                            </div>
+                        </template>
+                        <template x-if="row.kind === 'field'">
+                            <div class="rounded-xl bg-gray-50 p-3" :style="nodeOffsetStyle(row.depth)">
+                                <div class="flex flex-col gap-1 lg:flex-row lg:items-center lg:justify-between">
+                                    <div>
+                                        <div class="font-mono text-sm text-gray-900 break-all" x-text="row.label"></div>
+                                        <div class="text-xs text-gray-500 mt-1" x-show="row.description" x-text="row.description"></div>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-xs text-gray-500 uppercase" x-text="row.type"></span>
+                                        <span class="inline-flex items-center rounded-full px-2 py-0.5 text-xs"
+                                              :class="row.source === '显式配置' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'"
+                                              x-text="row.source"></span>
+                                    </div>
+                                </div>
+                                <div class="mt-3">
+                                    <template x-if="row.type === 'bool'">
+                                        <label class="inline-flex items-center gap-2 text-sm text-gray-700">
+                                            <input type="checkbox" class="h-4 w-4" x-model="uploadConfigFieldValues[row.path]">
+                                            <span>启用</span>
+                                        </label>
+                                    </template>
+                                    <template x-if="row.type === 'int' || row.type === 'float'">
+                                        <input :type="row.type === 'int' ? 'number' : 'text'"
+                                               class="w-full border rounded-lg px-3 py-2 text-sm"
+                                               x-model="uploadConfigFieldValues[row.path]">
+                                    </template>
+                                    <template x-if="row.type === 'list'">
+                                        <textarea rows="4" class="w-full border rounded-lg px-3 py-2 text-sm font-mono"
+                                                  x-model="uploadConfigFieldValues[row.path]"></textarea>
+                                    </template>
+                                    <template x-if="row.type === 'str' || row.type === 'null'">
+                                        <template x-if="row.multiline">
+                                            <textarea rows="4" class="w-full border rounded-lg px-3 py-2 text-sm"
+                                                      x-model="uploadConfigFieldValues[row.path]"></textarea>
+                                        </template>
+                                    </template>
+                                    <template x-if="(row.type === 'str' || row.type === 'null') && !row.multiline">
+                                        <input type="text" class="w-full border rounded-lg px-3 py-2 text-sm"
+                                               x-model="uploadConfigFieldValues[row.path]">
+                                    </template>
+                                </div>
+                                <div class="mt-2 text-xs text-gray-500">
+                                    示例：<span class="font-mono break-all" x-text="formatInline(row.example)"></span>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </template>
+            </div>
+
+            <details class="rounded-2xl border p-4">
+                <summary class="cursor-pointer font-medium text-gray-900">高级模式：原始 YAML</summary>
+                <textarea rows="18" class="mt-4 w-full border rounded-lg px-3 py-3 font-mono text-sm"
+                          x-model="uploadConfigYaml"></textarea>
+                <div class="mt-3 flex gap-2">
+                    <button class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700"
+                            @click="saveUploadConfigRaw()">按原始 YAML 保存</button>
+                </div>
+            </details>
+
+            <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                <div class="rounded-2xl border p-4">
+                    <h3 class="font-medium text-gray-900 mb-3">备份列表</h3>
+                    <div class="space-y-2 max-h-[280px] overflow-y-auto">
+                        <template x-for="backup in uploadConfigState.backups || []" :key="backup.name">
+                            <div class="rounded-xl border p-3">
+                                <div class="font-mono text-sm break-all" x-text="backup.name"></div>
+                                <div class="text-xs text-gray-500 mt-1" x-text="backup.path || ''"></div>
+                                <button class="mt-3 px-3 py-1.5 bg-orange-600 text-white rounded hover:bg-orange-700 text-sm"
+                                        @click="restoreUploadConfig(backup.name)">恢复</button>
+                            </div>
+                        </template>
+                        <div x-show="!(uploadConfigState.backups || []).length" class="text-sm text-gray-400">暂无备份</div>
+                    </div>
+                </div>
+                <div class="rounded-2xl border p-4" x-show="uploadConfigSaveResult">
+                    <h3 class="font-medium text-gray-900 mb-2">最近保存结果</h3>
+                    <pre class="bg-gray-900 text-gray-100 rounded-xl p-4 overflow-x-auto text-sm whitespace-pre-wrap" x-text="formatJson(uploadConfigSaveResult)"></pre>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section x-show="activeTab === 'env'" x-cloak class="space-y-4">
+        <div class="bg-white rounded-2xl shadow p-6 space-y-4">
+            <div class="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+                <div>
+                    <h2 class="text-lg font-semibold text-gray-900">环境检测</h2>
+                    <p class="text-sm text-gray-500 mt-1">先看结论，再按需展开原始结果。</p>
+                </div>
+                <div class="flex flex-wrap gap-3">
+                    <button class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                            :disabled="environmentLoading === 'ffmpeg'"
+                            @click="runEnvironmentCheck('ffmpeg')">
+                        <span x-show="environmentLoading !== 'ffmpeg'">检测 ffmpeg</span>
+                        <span x-show="environmentLoading === 'ffmpeg'">检测中...</span>
+                    </button>
+                    <button class="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50"
+                            :disabled="environmentLoading === 'whisper'"
+                            @click="runEnvironmentCheck('whisper')">
+                        <span x-show="environmentLoading !== 'whisper'">检测 Whisper</span>
+                        <span x-show="environmentLoading === 'whisper'">检测中...</span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-[1.2fr,0.8fr] gap-4">
+                <div class="rounded-2xl border p-4 space-y-3">
+                    <h3 class="font-medium text-gray-900">视频文件检测</h3>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">文件路径</label>
+                        <input type="text" class="w-full border rounded-lg px-3 py-2 text-sm"
+                               x-model="videoProbePath"
+                               placeholder="输入文件路径，或留空后在下方填写 video_id">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">video_id</label>
+                        <input type="text" class="w-full border rounded-lg px-3 py-2 text-sm"
+                               x-model="videoProbeId"
+                               placeholder="例如: youtube_xxxxx">
+                    </div>
+                    <button class="px-4 py-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-50"
+                            :disabled="environmentLoading === 'video'"
+                            @click="runVideoProbe()">
+                        <span x-show="environmentLoading !== 'video'">检测视频文件</span>
+                        <span x-show="environmentLoading === 'video'">检测中...</span>
+                    </button>
+                </div>
+
+                <div class="rounded-2xl border p-4">
+                    <h3 class="font-medium text-gray-900">结论</h3>
+                    <div class="mt-4 space-y-3" x-show="environmentResult">
+                        <template x-if="environmentResult?.ffmpeg">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div class="rounded-xl border p-3">
+                                    <div class="text-xs uppercase text-gray-500">ffmpeg / ffprobe</div>
+                                    <div class="mt-2 font-semibold text-gray-900" x-text="environmentResult.ok ? '可用' : '异常'"></div>
+                                </div>
+                                <div class="rounded-xl border p-3">
+                                    <div class="text-xs uppercase text-gray-500">样例抽音频</div>
+                                    <div class="mt-2 font-semibold text-gray-900" x-text="environmentResult.audio_extract?.ok ? '成功' : '失败'"></div>
+                                </div>
+                            </div>
+                        </template>
+
+                        <template x-if="environmentResult?.model_source">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div class="rounded-xl border p-3">
+                                    <div class="text-xs uppercase text-gray-500">Whisper 加载</div>
+                                    <div class="mt-2 font-semibold text-gray-900" x-text="environmentResult.load?.ok ? '成功' : (environmentResult.load?.oom ? '失败（OOM）' : '失败')"></div>
+                                </div>
+                                <div class="rounded-xl border p-3">
+                                    <div class="text-xs uppercase text-gray-500">最小转录</div>
+                                    <div class="mt-2 font-semibold text-gray-900" x-text="environmentResult.transcription?.ok ? ('成功，片段 ' + environmentResult.transcription?.segments) : (environmentResult.transcription?.oom ? '失败（OOM）' : '未执行 / 失败')"></div>
+                                </div>
+                                <div class="rounded-xl border p-3">
+                                    <div class="text-xs uppercase text-gray-500">模型来源</div>
+                                    <div class="mt-2 text-sm font-mono break-all" x-text="environmentResult.model_source?.repo_id || '-'"></div>
+                                </div>
+                                <div class="rounded-xl border p-3">
+                                    <div class="text-xs uppercase text-gray-500">GPU</div>
+                                    <div class="mt-2 text-sm font-mono break-all" x-text="(environmentResult.gpu?.selected_device || '-') + ' / ' + (environmentResult.gpu?.selected_gpu_id ?? '-')"></div>
+                                </div>
+                                <div class="rounded-xl border p-3">
+                                    <div class="text-xs uppercase text-gray-500">加载峰值显存</div>
+                                    <div class="mt-2 font-semibold text-gray-900" x-text="formatMemory(environmentResult.load?.memory?.peak_used_mb, environmentResult.load?.memory?.delta_peak_mb)"></div>
+                                </div>
+                                <div class="rounded-xl border p-3">
+                                    <div class="text-xs uppercase text-gray-500">转录峰值显存</div>
+                                    <div class="mt-2 font-semibold text-gray-900" x-text="formatMemory(environmentResult.transcription?.memory?.peak_used_mb, environmentResult.transcription?.memory?.delta_peak_mb)"></div>
+                                </div>
+                            </div>
+                        </template>
+
+                        <template x-if="environmentResult?.media_info">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div class="rounded-xl border p-3">
+                                    <div class="text-xs uppercase text-gray-500">时长</div>
+                                    <div class="mt-2 font-semibold text-gray-900" x-text="environmentResult.media_info?.duration || 0"></div>
+                                </div>
+                                <div class="rounded-xl border p-3">
+                                    <div class="text-xs uppercase text-gray-500">分辨率</div>
+                                    <div class="mt-2 font-semibold text-gray-900" x-text="(environmentResult.media_info?.video?.width || 0) + 'x' + (environmentResult.media_info?.video?.height || 0)"></div>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                    <div class="mt-4 text-sm text-gray-400" x-show="!environmentResult">先运行一次检测，这里会提取结论。</div>
+                </div>
+            </div>
+
+            <details class="rounded-2xl border p-4" x-show="environmentResult">
+                <summary class="cursor-pointer font-medium text-gray-900">查看原始检测结果</summary>
+                <pre class="mt-4 bg-gray-900 text-gray-100 rounded-xl p-4 overflow-x-auto text-sm whitespace-pre-wrap" x-text="formatJson(environmentResult)"></pre>
+            </details>
+        </div>
+    </section>
+</div>
+
+<script>
+function testCenterPage() {
+    return {
+        activeTab: 'llm',
+        llmTargets: [],
+        llmResults: {},
+        llmRunning: {},
+        llmLoadingAll: false,
+        selectedLlmTargetId: '',
+
+        promptStage: 'split',
+        promptInput: {},
+        promptPreview: null,
+        promptLoading: false,
+
+        configTab: 'main',
+        configState: {},
+        configYaml: '',
+        configSaveResult: null,
+        configRows: [],
+        configFieldValues: {},
+        initialConfigFieldValues: {},
+        configGroupExpanded: {},
+        configSaving: false,
+
+        uploadConfigState: {},
+        uploadConfigYaml: '',
+        uploadConfigSaveResult: null,
+        uploadConfigRows: [],
+        uploadConfigFieldValues: {},
+        initialUploadConfigFieldValues: {},
+        uploadConfigGroupExpanded: {},
+        uploadConfigSaving: false,
+
+        environmentResult: null,
+        environmentLoading: '',
+        videoProbePath: '',
+        videoProbeId: '',
+
+        async init() {
+            await Promise.all([
+                this.loadLlmTargets(),
+                this.loadConfigState(),
+                this.loadUploadConfigState(),
+            ]);
+            this.loadPromptStageDefaults();
+        },
+
+        async fetchJson(url, options = {}) {
+            const response = await fetch(url, options);
+            const data = await response.json();
+            if (!response.ok) {
+                const message = data.detail || data.error || `请求失败: ${response.status}`;
+                throw new Error(message);
+            }
+            return data;
+        },
+
+        sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        },
+
+        normalizeJobResult(jobState, fallbackMessage) {
+            if (jobState.result) return jobState.result;
+            return {
+                ok: false,
+                error: jobState.message || fallbackMessage || '任务执行失败',
+            };
+        },
+
+        async waitForTestJob(jobId) {
+            while (true) {
+                const jobState = await this.fetchJson(`/api/test-center/jobs/${jobId}`);
+                if (['completed', 'failed', 'cancelled'].includes(jobState.status)) {
+                    return jobState;
+                }
+                await this.sleep(1000);
+            }
+        },
+
+        formatJson(value) {
+            if (!value) return '';
+            try {
+                return JSON.stringify(value, null, 2);
+            } catch (error) {
+                return String(value);
+            }
+        },
+
+        formatInline(value) {
+            if (value === undefined) return '(未设置)';
+            if (value === null) return 'null';
+            if (typeof value === 'string') return value || '(空字符串)';
+            return JSON.stringify(value, null, 2);
+        },
+
+        objectEntries(obj) {
+            return Object.entries(obj || {}).map(([key, value]) => ({key, value}));
+        },
+
+        formatDurationMs(value) {
+            if (value === undefined || value === null) return '-';
+            return `${value} ms`;
+        },
+
+        formatMemory(peak, delta) {
+            if (peak === undefined || peak === null) return '-';
+            if (delta === undefined || delta === null) return `${peak} MB`;
+            return `${peak} MB (增量 ${delta} MB)`;
+        },
+
+        statusBadgeClass(result) {
+            if (!result) return 'bg-gray-100 text-gray-600';
+            return result.ok ? 'bg-emerald-100 text-emerald-800' : 'bg-rose-100 text-rose-800';
+        },
+
+        llmStats() {
+            const results = Object.values(this.llmResults || {});
+            return {
+                total: this.llmTargets.length,
+                success: results.filter(item => item.ok).length,
+                failed: results.filter(item => item.ok === false).length,
+            };
+        },
+
+        async loadLlmTargets() {
+            const data = await this.fetchJson('/api/test-center/llm/targets');
+            this.llmTargets = data.targets || [];
+        },
+
+        async runLlmTarget(targetId) {
+            this.llmRunning[targetId] = true;
+            try {
+                const submission = await this.fetchJson('/api/test-center/llm/run', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({target_id: targetId}),
+                });
+                const jobState = await this.waitForTestJob(submission.job_id);
+                const result = this.normalizeJobResult(jobState, `测试任务失败：${targetId}`);
+                this.llmResults[targetId] = result;
+                this.selectedLlmTargetId = targetId;
+                showToast(result.ok ? `测试成功：${targetId}` : `测试失败：${targetId}`, result.ok ? 'success' : 'warning');
+            } catch (error) {
+                showToast(error.message, 'error');
+            } finally {
+                this.llmRunning[targetId] = false;
+            }
+        },
+
+        async runAllLlmTargets() {
+            this.llmLoadingAll = true;
+            try {
+                const submission = await this.fetchJson('/api/test-center/llm/run-all', {method: 'POST'});
+                const jobState = await this.waitForTestJob(submission.job_id);
+                const result = this.normalizeJobResult(jobState, '全部 LLM 测试任务失败');
+                for (const item of result.results || []) {
+                    this.llmResults[item.target_id] = item;
+                }
+                if ((result.results || []).length) {
+                    this.selectedLlmTargetId = result.results[0].target_id;
+                }
+                showToast(`全部测试完成：成功 ${result.summary?.success || 0}，失败 ${result.summary?.failed || 0}`, (result.summary?.failed || 0) > 0 ? 'warning' : 'success');
+            } catch (error) {
+                showToast(error.message, 'error');
+            } finally {
+                this.llmLoadingAll = false;
+            }
+        },
+
+        selectLlmResult(targetId) {
+            this.selectedLlmTargetId = targetId;
+        },
+
+        selectedLlmResult() {
+            return this.llmResults[this.selectedLlmTargetId] || null;
+        },
+
+        loadPromptStageDefaults() {
+            const defaults = {
+                split: {
+                    text: '今日はみんなで雑談するよ。最近あった面白いことをゆっくり話していこう。',
+                    scene_prompt: '当前场景为杂谈，尽量保留自然口语节奏。'
+                },
+                translate: {
+                    segments_text: ['今日はみんな来てくれてありがとう', '次は新曲を歌います'].join('\n'),
+                    previous_context_text: ['1|谢谢大家今天来看直播', '2|接下来想和大家慢慢聊天'].join('\n')
+                },
+                optimize: {
+                    subtitle_chunk_text: ['1|こんフブキー！', '2|今日はまったり雑談です'].join('\n')
+                },
+                scene_identify: {
+                    title: '【Minecraft】建造天空城堡！',
+                    description: '今天继续在我的世界里盖房子。'
+                },
+                video_info_translate: {
+                    title: '【初配信】みんなとおしゃべり',
+                    description: '今日は初めての配信です。よろしくお願いします！',
+                    uploader: '白上フブキ',
+                    default_tid: 21,
+                    tags_text: '雑談, 初配信'
+                }
+            };
+            this.promptInput = JSON.parse(JSON.stringify(defaults[this.promptStage] || {}));
+        },
+
+        parseKeyValueLines(text) {
+            const result = {};
+            for (const rawLine of (text || '').split('\n')) {
+                const line = rawLine.trim();
+                if (!line) continue;
+                const separator = line.indexOf('|');
+                if (separator === -1) continue;
+                result[line.slice(0, separator).trim()] = line.slice(separator + 1).trim();
+            }
+            return result;
+        },
+
+        buildPromptOverrides() {
+            if (this.promptStage === 'split') {
+                return {
+                    text: this.promptInput.text || '',
+                    scene_prompt: this.promptInput.scene_prompt || '',
+                };
+            }
+            if (this.promptStage === 'translate') {
+                return {
+                    segments: (this.promptInput.segments_text || '').split('\n').map(v => v.trim()).filter(Boolean),
+                    previous_context: this.parseKeyValueLines(this.promptInput.previous_context_text || ''),
+                };
+            }
+            if (this.promptStage === 'optimize') {
+                return {
+                    subtitle_chunk: this.parseKeyValueLines(this.promptInput.subtitle_chunk_text || ''),
+                };
+            }
+            if (this.promptStage === 'scene_identify') {
+                return {
+                    title: this.promptInput.title || '',
+                    description: this.promptInput.description || '',
+                };
+            }
+            return {
+                title: this.promptInput.title || '',
+                description: this.promptInput.description || '',
+                uploader: this.promptInput.uploader || '',
+                default_tid: Number(this.promptInput.default_tid || 0),
+                tags: (this.promptInput.tags_text || '').split(',').map(v => v.trim()).filter(Boolean),
+            };
+        },
+
+        async previewPrompt() {
+            this.promptLoading = true;
+            try {
+                this.promptPreview = await this.fetchJson('/api/test-center/prompt-preview', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        stage: this.promptStage,
+                        overrides: this.buildPromptOverrides(),
+                    }),
+                });
+                showToast(`预览已生成：${this.promptStage}`, 'success');
+            } catch (error) {
+                showToast(error.message, 'error');
+            } finally {
+                this.promptLoading = false;
+            }
+        },
+
+        buildConfigRows(referenceItems = []) {
+            const rows = [];
+            const seenGroups = new Set();
+            const groupMeta = {};
+            const items = [...referenceItems].filter(item => item.type !== 'dict');
+
+            for (const item of items) {
+                const parts = item.path.split('.');
+                for (let i = 0; i < parts.length - 1; i++) {
+                    const groupPath = parts.slice(0, i + 1).join('.');
+                    if (!seenGroups.has(groupPath)) {
+                        seenGroups.add(groupPath);
+                        const ancestorPaths = [];
+                        for (let j = 0; j < i; j++) {
+                            ancestorPaths.push(parts.slice(0, j + 1).join('.'));
+                        }
+                        groupMeta[groupPath] = {
+                            key: `group:${groupPath}`,
+                            kind: 'group',
+                            path: groupPath,
+                            label: parts[i],
+                            depth: i,
+                            ancestorPaths,
+                            childFieldCount: 0,
+                        };
+                        rows.push(groupMeta[groupPath]);
+                    }
+                    groupMeta[groupPath].childFieldCount += 1;
+                }
+
+                const ancestorPaths = [];
+                for (let i = 0; i < parts.length - 1; i++) {
+                    ancestorPaths.push(parts.slice(0, i + 1).join('.'));
+                }
+
+                rows.push({
+                    ...item,
+                    key: `field:${item.path}`,
+                    kind: 'field',
+                    label: parts[parts.length - 1],
+                    depth: Math.max(parts.length - 1, 0),
+                    ancestorPaths,
+                    multiline: item.type === 'list'
+                        || (typeof item.current_value === 'string' && (item.current_value.includes('\n') || item.current_value.length > 80))
+                        || (typeof item.example === 'string' && item.example.includes('\n')),
+                });
+            }
+            return rows;
+        },
+
+        buildGroupExpanded(rows = []) {
+            const expanded = {};
+            for (const row of rows) {
+                if (row.kind === 'group') {
+                    expanded[row.path] = false;
+                }
+            }
+            return expanded;
+        },
+
+        rowVisible(row, expandedMap) {
+            if (!row.ancestorPaths || !row.ancestorPaths.length) return true;
+            return row.ancestorPaths.every(path => expandedMap[path] !== false);
+        },
+
+        toggleGroup(expandedMap, path) {
+            expandedMap[path] = !expandedMap[path];
+        },
+
+        nodeOffsetStyle(depth) {
+            return `margin-left: ${depth * 20}px;`;
+        },
+
+        toFieldInputValue(field) {
+            const value = field.current_value !== undefined ? field.current_value : field.example;
+            if (field.type === 'bool') return Boolean(value);
+            if (field.type === 'list') return Array.isArray(value) ? value.join('\n') : '';
+            if (value === null || value === undefined) return '';
+            if (typeof value === 'object') return JSON.stringify(value, null, 2);
+            return String(value);
+        },
+
+        initFieldValueMap(referenceItems = []) {
+            const values = {};
+            for (const item of referenceItems) {
+                if (item.type === 'dict') continue;
+                values[item.path] = this.toFieldInputValue(item);
+            }
+            return values;
+        },
+
+        inferListItemType(field) {
+            const value = field.current_value !== undefined ? field.current_value : field.example;
+            if (Array.isArray(value) && value.length) {
+                if (typeof value[0] === 'number') return Number.isInteger(value[0]) ? 'int' : 'float';
+                if (typeof value[0] === 'boolean') return 'bool';
+            }
+            return 'str';
+        },
+
+        parseTypedValue(field, rawValue) {
+            if (field.type === 'bool') return Boolean(rawValue);
+            if (field.type === 'int') return rawValue === '' ? 0 : parseInt(rawValue, 10);
+            if (field.type === 'float') return rawValue === '' ? 0 : parseFloat(rawValue);
+            if (field.type === 'list') {
+                const itemType = this.inferListItemType(field);
+                return (rawValue || '').split('\n').map(line => line.trim()).filter(Boolean).map(line => {
+                    if (itemType === 'int') return parseInt(line, 10);
+                    if (itemType === 'float') return parseFloat(line);
+                    if (itemType === 'bool') return line.toLowerCase() === 'true';
+                    return line;
+                });
+            }
+            if (field.type === 'null') {
+                if (rawValue === '') return null;
+                if (!Number.isNaN(Number(rawValue)) && rawValue.trim() !== '') return Number(rawValue);
+                if (rawValue === 'true' || rawValue === 'false') return rawValue === 'true';
+                return rawValue;
+            }
+            return rawValue;
+        },
+
+        collectChangedFieldUpdates(rows, valueMap, initialMap) {
+            const changed = {};
+            for (const row of rows) {
+                if (row.kind !== 'field') continue;
+                const path = row.path;
+                if (JSON.stringify(valueMap[path]) !== JSON.stringify(initialMap[path])) {
+                    changed[path] = this.parseTypedValue(row, valueMap[path]);
+                }
+            }
+            return changed;
+        },
+
+        async loadConfigState() {
+            this.configState = await this.fetchJson('/api/test-center/config/main');
+            this.configYaml = this.configState.yaml_text || '';
+            this.configRows = this.buildConfigRows(this.configState.reference_items || []);
+            this.configGroupExpanded = this.buildGroupExpanded(this.configRows);
+            this.configFieldValues = this.initFieldValueMap(this.configState.reference_items || []);
+            this.initialConfigFieldValues = JSON.parse(JSON.stringify(this.configFieldValues));
+        },
+
+        async loadUploadConfigState() {
+            this.uploadConfigState = await this.fetchJson('/api/test-center/config/upload');
+            this.uploadConfigYaml = this.uploadConfigState.yaml_text || '';
+            this.uploadConfigRows = this.buildConfigRows(this.uploadConfigState.reference_items || []);
+            this.uploadConfigGroupExpanded = this.buildGroupExpanded(this.uploadConfigRows);
+            this.uploadConfigFieldValues = this.initFieldValueMap(this.uploadConfigState.reference_items || []);
+            this.initialUploadConfigFieldValues = JSON.parse(JSON.stringify(this.uploadConfigFieldValues));
+        },
+
+        async saveConfigForm() {
+            const updates = this.collectChangedFieldUpdates(this.configRows, this.configFieldValues, this.initialConfigFieldValues);
+            if (!Object.keys(updates).length) {
+                showToast('主配置没有改动', 'info');
+                return;
+            }
+            this.configSaving = true;
+            try {
+                this.configSaveResult = await this.fetchJson('/api/test-center/config/main/form', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({updates}),
+                });
+                await this.loadConfigState();
+                showToast('主配置已保存', 'success');
+            } catch (error) {
+                showToast(error.message, 'error');
+            } finally {
+                this.configSaving = false;
+            }
+        },
+
+        async saveConfigRaw() {
+            try {
+                this.configSaveResult = await this.fetchJson('/api/test-center/config/main', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({content: this.configYaml}),
+                });
+                await this.loadConfigState();
+                showToast('主配置原始 YAML 已保存', 'success');
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        },
+
+        async restoreConfig(backupName) {
+            if (!confirm(`确定恢复备份 ${backupName} 吗？`)) return;
+            try {
+                this.configSaveResult = await this.fetchJson('/api/test-center/config/main/restore', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({backup_name: backupName}),
+                });
+                await this.loadConfigState();
+                showToast(`已恢复备份：${backupName}`, 'success');
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        },
+
+        async saveUploadConfigForm() {
+            const updates = this.collectChangedFieldUpdates(this.uploadConfigRows, this.uploadConfigFieldValues, this.initialUploadConfigFieldValues);
+            if (!Object.keys(updates).length) {
+                showToast('投稿配置没有改动', 'info');
+                return;
+            }
+            this.uploadConfigSaving = true;
+            try {
+                this.uploadConfigSaveResult = await this.fetchJson('/api/test-center/config/upload/form', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({updates}),
+                });
+                await this.loadUploadConfigState();
+                showToast('Upload 配置已保存', 'success');
+            } catch (error) {
+                showToast(error.message, 'error');
+            } finally {
+                this.uploadConfigSaving = false;
+            }
+        },
+
+        async saveUploadConfigRaw() {
+            try {
+                this.uploadConfigSaveResult = await this.fetchJson('/api/test-center/config/upload', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({content: this.uploadConfigYaml}),
+                });
+                await this.loadUploadConfigState();
+                showToast('Upload 原始 YAML 已保存', 'success');
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        },
+
+        async restoreUploadConfig(backupName) {
+            if (!confirm(`确定恢复 Upload 备份 ${backupName} 吗？`)) return;
+            try {
+                this.uploadConfigSaveResult = await this.fetchJson('/api/test-center/config/upload/restore', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({backup_name: backupName}),
+                });
+                await this.loadUploadConfigState();
+                showToast(`已恢复 Upload 备份：${backupName}`, 'success');
+            } catch (error) {
+                showToast(error.message, 'error');
+            }
+        },
+
+        async runEnvironmentCheck(kind) {
+            this.environmentLoading = kind;
+            try {
+                const submission = await this.fetchJson(`/api/test-center/environment/${kind}`, { method: 'POST' });
+                const jobState = await this.waitForTestJob(submission.job_id);
+                this.environmentResult = this.normalizeJobResult(jobState, `检测任务失败：${kind}`);
+                showToast(this.environmentResult.ok === false ? `检测失败：${kind}` : `检测完成：${kind}`, this.environmentResult.ok === false ? 'warning' : 'success');
+            } catch (error) {
+                showToast(error.message, 'error');
+            } finally {
+                this.environmentLoading = '';
+            }
+        },
+
+        async runVideoProbe() {
+            this.environmentLoading = 'video';
+            try {
+                const submission = await this.fetchJson('/api/test-center/environment/video-probe', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ path: this.videoProbePath, video_id: this.videoProbeId }),
+                });
+                const jobState = await this.waitForTestJob(submission.job_id);
+                this.environmentResult = this.normalizeJobResult(jobState, '视频检测任务失败');
+                showToast(this.environmentResult.ok === false ? '视频检测失败' : '视频检测完成', this.environmentResult.ok === false ? 'warning' : 'success');
+            } catch (error) {
+                showToast(error.message, 'error');
+            } finally {
+                this.environmentLoading = '';
+            }
+        },
+    }
+}
+
+document.addEventListener('alpine:init', () => {
+    Alpine.data('testCenterPage', testCenterPage);
+});
+</script>
+{% endblock %}

@@ -9,16 +9,15 @@ from typing import List, Optional
 from datetime import datetime
 from tabulate import tabulate
 
-from ..config import Config, load_config
+from ..config import Config, load_config, write_starter_config
 from ..database import Database
 from ..models import (
     Video, Task, SourceType, TaskStep, TaskStatus,
-    STAGE_GROUPS, expand_stage_group, get_required_stages, DEFAULT_STAGE_SEQUENCE
+    STAGE_GROUPS, expand_stage_group, get_required_stages, DEFAULT_STAGE_SEQUENCE,
+    is_task_status_satisfied,
 )
-from ..pipeline import create_video_from_url, create_video_from_source, detect_source_type, VideoProcessor, schedule_videos
-from ..downloaders import YouTubeDownloader
-from ..services import PlaylistService
 from ..utils.logger import setup_logger
+from ..services.bilibili_support import build_bilibili_uploader, find_local_video_for_aid, resolve_video_file
 
 
 # 全局配置
@@ -26,6 +25,9 @@ CONFIG = None
 LOGGER = None
 os.environ["USE_TF"] = "0"
 os.environ["USE_FLAX"] = "0"
+VideoProcessor = None
+YouTubeDownloader = None
+PlaylistService = None
 
 def get_config(config_path: Optional[str] = None) -> Config:
     """获取配置（延迟加载）
@@ -48,6 +50,55 @@ def get_logger():
     return LOGGER
 
 
+def create_video_from_url(*args, **kwargs):
+    from ..pipeline import create_video_from_url as impl
+    return impl(*args, **kwargs)
+
+
+def create_video_from_source(*args, **kwargs):
+    from ..pipeline import create_video_from_source as impl
+    return impl(*args, **kwargs)
+
+
+def detect_source_type(*args, **kwargs):
+    from ..pipeline import detect_source_type as impl
+    return impl(*args, **kwargs)
+
+
+def schedule_videos(*args, **kwargs):
+    from ..pipeline import schedule_videos as impl
+    return impl(*args, **kwargs)
+
+
+def run_video_batch(*args, **kwargs):
+    from ..pipeline import run_video_batch as impl
+    return impl(*args, **kwargs)
+
+
+def _get_video_processor_cls():
+    global VideoProcessor
+    if VideoProcessor is None:
+        from ..pipeline import VideoProcessor as _VideoProcessor
+        VideoProcessor = _VideoProcessor
+    return VideoProcessor
+
+
+def _get_youtube_downloader_cls():
+    global YouTubeDownloader
+    if YouTubeDownloader is None:
+        from ..downloaders import YouTubeDownloader as _YouTubeDownloader
+        YouTubeDownloader = _YouTubeDownloader
+    return YouTubeDownloader
+
+
+def _get_playlist_service_cls():
+    global PlaylistService
+    if PlaylistService is None:
+        from ..services import PlaylistService as _PlaylistService
+        PlaylistService = _PlaylistService
+    return PlaylistService
+
+
 @click.group()
 @click.option('--config', '-c', type=click.Path(exists=True), help='配置文件路径')
 @click.pass_context
@@ -62,13 +113,15 @@ def cli(ctx, config):
 def init(output):
     """初始化配置文件"""
     try:
-        # 直接从默认配置读取并保存
-        config = load_config()
-        config.to_yaml(output)
+        write_starter_config(output)
         click.echo(f"✓ 已创建默认配置文件: {output}")
-        click.echo(f"请编辑配置文件以设置API密钥等参数")
+        click.echo("下一步至少先确认这些项：")
+        click.echo("1. storage.work_dir / output_dir / database_path / models_dir")
+        click.echo("2. llm.api_key / llm.base_url（或设置环境变量 VAT_LLM_APIKEY）")
+        click.echo("3. 首次 ASR 需要可访问 HuggingFace，或预先把 Whisper 模型缓存放到 storage.models_dir/asr.models_subdir（默认 ./models/whisper）")
+        click.echo("4. 若暂不做下载/上传，cookies 可先留空")
     except Exception as e:
-        click.echo(f"✗ 创建配置文件失败: {e}", err=True)
+        raise click.ClickException(f"创建配置文件失败: {e}") from e
 
 
 @cli.command()
@@ -88,11 +141,14 @@ def download(ctx, url, playlist, file):
     # 从播放列表获取
     if playlist:
         logger.info(f"获取播放列表: {playlist}")
-        downloader = YouTubeDownloader(
+        downloader = _get_youtube_downloader_cls()(
             proxy=config.get_stage_proxy("downloader"),
             video_format=config.downloader.youtube.format,
             cookies_file=config.downloader.youtube.cookies_file,
             remote_components=config.downloader.youtube.remote_components,
+            lock_db_path=config.storage.database_path,
+            download_cooldown=config.downloader.youtube.download_delay,
+            max_concurrent_downloads=getattr(config.concurrency, "max_concurrent_downloads", 1),
         )
         playlist_urls = downloader.get_playlist_urls(playlist)
         urls.extend(playlist_urls)
@@ -247,6 +303,21 @@ def embed(ctx, video_id, process_all, force):
 
 
 @cli.command()
+@click.option('--host', help='监听地址（默认使用配置中的 web.host）')
+@click.option('--port', type=int, help='监听端口（默认使用配置中的 web.port）')
+@click.pass_context
+def web(ctx, host, port):
+    """启动 Web 管理界面"""
+    from ..web.app import run_server
+
+    run_server(
+        host=host,
+        port=port,
+        config_path=ctx.obj.get('config_path'),
+    )
+
+
+@cli.command()
 @click.option('--url', '-u', multiple=True, help='视频源（YouTube URL / 直链 / 本地路径，自动检测类型）')
 @click.option('--playlist', '-p', help='YouTube播放列表URL')
 @click.option('--file', '-f', type=click.Path(exists=True), help='URL/路径列表文件（每行一个，# 开头为注释）')
@@ -275,11 +346,14 @@ def pipeline(ctx, url, playlist, file, title, gpus, force):
     
     if playlist:
         logger.info(f"获取播放列表: {playlist}")
-        downloader = YouTubeDownloader(
+        downloader = _get_youtube_downloader_cls()(
             proxy=config.get_stage_proxy("downloader"),
             video_format=config.downloader.youtube.format,
             cookies_file=config.downloader.youtube.cookies_file,
             remote_components=config.downloader.youtube.remote_components,
+            lock_db_path=config.storage.database_path,
+            download_cooldown=config.downloader.youtube.download_delay,
+            max_concurrent_downloads=getattr(config.concurrency, "max_concurrent_downloads", 1),
         )
         playlist_urls = downloader.get_playlist_urls(playlist)
         sources.extend(playlist_urls)
@@ -389,7 +463,7 @@ def status(ctx, video_id, filter_failed, filter_pending):
                     task_status[task.step] = task
             
             # 统计状态
-            completed_count = sum(1 for t in task_status.values() if t.status == TaskStatus.COMPLETED)
+            completed_count = sum(1 for t in task_status.values() if is_task_status_satisfied(t.status))
             failed_count = sum(1 for t in task_status.values() if t.status == TaskStatus.FAILED)
             running_count = sum(1 for t in task_status.values() if t.status == TaskStatus.RUNNING)
             
@@ -622,7 +696,7 @@ def process(ctx, video_id, process_all, playlist, stages, gpu, force, dry_run, c
     
     if playlist:
         # 从 Playlist 获取信息
-        playlist_service = PlaylistService(db)
+        playlist_service = _get_playlist_service_cls()(db)
         pl = playlist_service.get_playlist(playlist)
         if not pl:
             click.echo(f"错误: Playlist 不存在: {playlist}", err=True)
@@ -761,141 +835,21 @@ def process(ctx, video_id, process_all, playlist, stages, gpu, force, dry_run, c
         upload_interval = config.uploader.bilibili.upload_interval
         download_delay = max(download_delay, upload_interval)
     
-    def process_one_video(args):
-        """处理单个视频（可在线程池中并发调用）"""
-        idx, vid = args
-        video = db.get_video(vid)
-        if not video:
-            logger.warning(f"视频不存在: {vid}")
-            return vid, False, "视频不存在"
-        
-        title = video.title[:30] if video.title else vid
-        logger.info(f"[{idx + 1}/{total}] 开始处理: {title}")
-        
-        try:
-            video_config = deepcopy(config)
-            processor = VideoProcessor(
-                video_id=vid,
-                config=video_config,
-                gpu_id=gpu_id,
-                force=force,
-                video_index=idx,
-                total_videos=total,
-                playlist_id=playlist
-            )
-            success = processor.process(steps=step_names)
-            if success:
-                logger.info(f"[{idx + 1}/{total}] 完成: {title}")
-                return vid, True, None
-            else:
-                logger.warning(f"[{idx + 1}/{total}] 失败: {title}")
-                return vid, False, "处理返回失败"
-        except Exception as e:
-            import traceback
-            logger.error(f"[{idx + 1}/{total}] 失败: {title} - {e}\n{traceback.format_exc()}")
-            return vid, False, str(e)
-    
-    def _run_batch(video_list):
-        """执行一批视频处理，返回 (failed_vids, stopped_early)
-        
-        stopped_early: fail-fast 模式下因失败而提前终止时为 True
-        """
-        failed_vids = []
-        stopped_early = False
-        if concurrency <= 1:
-            for i, (idx, vid) in enumerate(video_list):
-                if i > 0 and download_delay > 0:
-                    logger.info(f"等待 {download_delay:.0f} 秒后处理下一个视频...")
-                    import time
-                    time.sleep(download_delay)
-                _, success, _ = process_one_video((idx, vid))
-                if not success:
-                    failed_vids.append(vid)
-                    if fail_fast:
-                        remaining = len(video_list) - i - 1
-                        if remaining > 0:
-                            logger.warning(f"fail-fast: 视频 {vid} 处理失败，跳过剩余 {remaining} 个视频")
-                        stopped_early = True
-                        break
-        else:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            _fail_fast_triggered = False
-            with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                # 逐个提交任务，遇到失败后不再提交新任务
-                pending_futures = {}
-                video_iter = iter(video_list)
-                
-                # 先填满线程池
-                for _ in range(min(concurrency, len(video_list))):
-                    try:
-                        idx, vid = next(video_iter)
-                        future = executor.submit(process_one_video, (idx, vid))
-                        pending_futures[future] = vid
-                    except StopIteration:
-                        break
-                
-                while pending_futures:
-                    # 等待任意一个完成
-                    done_futures = []
-                    for future in as_completed(pending_futures):
-                        done_futures.append(future)
-                        break  # 每次只处理一个完成的
-                    
-                    for future in done_futures:
-                        vid = pending_futures.pop(future)
-                        try:
-                            _, success, _ = future.result()
-                            if not success:
-                                failed_vids.append(vid)
-                                if fail_fast:
-                                    _fail_fast_triggered = True
-                        except Exception as e:
-                            logger.error(f"并发处理异常: {vid} - {e}")
-                            failed_vids.append(vid)
-                            if fail_fast:
-                                _fail_fast_triggered = True
-                    
-                    # 如果没有触发 fail-fast，继续提交新任务
-                    if not _fail_fast_triggered:
-                        try:
-                            idx, vid = next(video_iter)
-                            future = executor.submit(process_one_video, (idx, vid))
-                            pending_futures[future] = vid
-                        except StopIteration:
-                            pass
-                    elif not pending_futures:
-                        # 所有已提交的任务都完成了，退出
-                        break
-                    # 如果 fail-fast 已触发但还有运行中的任务，继续等待它们完成
-                
-                if _fail_fast_triggered:
-                    stopped_early = True
-                    logger.warning(f"fail-fast: 处理失败，不再启动新任务（已等待运行中的任务完成）")
-        
-        return failed_vids, stopped_early
-    
-    # 执行处理（失败的视频放到队尾重试，最多重试2轮）
-    max_retry_rounds = 2
-    logger.info(f"开始处理 {total} 个视频（并发: {concurrency}）")
-    
-    failed_vids, stopped_early = _run_batch(list(enumerate(video_ids)))
-    
-    if not (fail_fast and stopped_early):
-        for retry_round in range(1, max_retry_rounds + 1):
-            if not failed_vids:
-                break
-            logger.info(f"第 {retry_round} 轮重试: {len(failed_vids)} 个失败视频")
-            retry_list = [(video_ids.index(vid), vid) for vid in failed_vids]
-            failed_vids, stopped_early = _run_batch(retry_list)
-            if fail_fast and stopped_early:
-                break
-    elif failed_vids:
-        logger.info(f"fail-fast 模式：跳过重试")
-    
-    if failed_vids:
-        logger.warning(f"处理完成，{len(failed_vids)} 个视频最终失败: {', '.join(failed_vids[:5])}")
-    else:
-        logger.info("处理完成，全部成功")
+    result = run_video_batch(
+        config=config,
+        video_ids=video_ids,
+        steps=step_names,
+        force=force,
+        gpu_id=gpu_id,
+        concurrency=concurrency,
+        playlist_id=playlist,
+        fail_fast=fail_fast,
+        delay_seconds=download_delay,
+        max_retry_rounds=2,
+        logger_override=logger,
+        db=db,
+        processor_cls=_get_video_processor_cls(),
+    )
     
     # ========== 批量上传后自动 upload sync ==========
     # 条件：stages 包含 upload 且有 playlist 上下文
@@ -948,7 +902,7 @@ def watch(ctx, playlist, interval, once, stages, gpu, concurrency, force, fail_f
     effective_concurrency = concurrency if concurrency is not None else watch_config.default_concurrency
     
     # 验证所有 playlist 存在
-    playlist_service = PlaylistService(db)
+    playlist_service = _get_playlist_service_cls()(db)
     for pl_id in playlist:
         pl = playlist_service.get_playlist(pl_id)
         if not pl:
@@ -963,7 +917,13 @@ def watch(ctx, playlist, interval, once, stages, gpu, concurrency, force, fail_f
         f"once={once}, force={force}"
     )
     
+    from ..services.process_job_submitter import build_process_job_submitter
     from ..services.watch_service import WatchService
+
+    process_job_submitter = build_process_job_submitter(
+        config,
+        config_path=ctx.obj.get('config_path'),
+    )
     
     service = WatchService(
         config=config,
@@ -976,6 +936,7 @@ def watch(ctx, playlist, interval, once, stages, gpu, concurrency, force, fail_f
         force=force,
         fail_fast=fail_fast,
         once=once,
+        process_job_submitter=process_job_submitter,
     )
     
     try:
@@ -1002,7 +963,7 @@ def _auto_season_sync(config, db, logger, playlist_id: str, retry_delay_minutes:
         retry_delay_minutes: 重试等待时间（分钟），默认30分钟
     """
     try:
-        from ..uploaders.bilibili import BilibiliUploader, season_sync, BILIUP_AVAILABLE
+        from ..uploaders.bilibili import BilibiliUploader, BILIUP_AVAILABLE, season_sync
         
         if not BILIUP_AVAILABLE:
             return
@@ -1010,11 +971,19 @@ def _auto_season_sync(config, db, logger, playlist_id: str, retry_delay_minutes:
         bilibili_config = config.uploader.bilibili
         project_root = Path(__file__).parent.parent.parent
         cookies_file = project_root / bilibili_config.cookies_file
+        storage_config = getattr(config, "storage", None)
+        concurrency_config = getattr(config, "concurrency", None)
+        lock_db_path = getattr(storage_config, "database_path", "")
+        upload_interval = getattr(bilibili_config, "upload_interval", 0)
+        max_concurrent_uploads = getattr(concurrency_config, "max_concurrent_uploads", 1)
         
         uploader = BilibiliUploader(
             cookies_file=str(cookies_file),
             line=bilibili_config.line,
-            threads=bilibili_config.threads
+            threads=bilibili_config.threads,
+            lock_db_path=lock_db_path,
+            upload_interval=upload_interval,
+            max_concurrent_uploads=max_concurrent_uploads,
         )
         
         # 第一次尝试
@@ -1042,7 +1011,10 @@ def _auto_season_sync(config, db, logger, playlist_id: str, retry_delay_minutes:
         uploader2 = BilibiliUploader(
             cookies_file=str(cookies_file),
             line=bilibili_config.line,
-            threads=bilibili_config.threads
+            threads=bilibili_config.threads,
+            lock_db_path=lock_db_path,
+            upload_interval=upload_interval,
+            max_concurrent_uploads=max_concurrent_uploads,
         )
         
         logger.info(f"=== Season Sync: 第2次尝试 (playlist={playlist_id}) ===")
@@ -1171,7 +1143,7 @@ def _run_scheduled_uploads(config, db, logger, video_ids, cron_expr, force, dry_
             title = video.title[:30] if video and video.title else vid
             logger.info(f"[UPLOAD-SCHEDULE] 上传 ({uploaded + failed + 1}/{len(queue)}): {title}")
             try:
-                processor = VideoProcessor(
+                processor = _get_video_processor_cls()(
                     video_id=vid,
                     config=config,
                     gpu_id=None,
@@ -1316,7 +1288,7 @@ def _run_dtime_uploads(config, db, logger, video_ids, cron_expr, force, dry_run,
             title = video.title[:30] if video and video.title else vid
             logger.info(f"[DTIME] 上传 ({uploaded + failed + 1}/{len(queue)}): {title}")
             try:
-                processor = VideoProcessor(
+                processor = _get_video_processor_cls()(
                     video_id=vid,
                     config=config,
                     gpu_id=None,
@@ -1406,7 +1378,7 @@ def playlist_add(ctx, url, sync):
     logger = get_logger()
     db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
     
-    playlist_service = PlaylistService(db, config)
+    playlist_service = _get_playlist_service_cls()(db, config)
     
     try:
         result = playlist_service.sync_playlist(
@@ -1465,7 +1437,7 @@ def playlist_sync(ctx, playlist_id):
         click.echo(f"错误: Playlist 不存在: {playlist_id}", err=True)
         return
     
-    playlist_service = PlaylistService(db, config)
+    playlist_service = _get_playlist_service_cls()(db, config)
     
     try:
         result = playlist_service.sync_playlist(
@@ -1518,7 +1490,7 @@ def playlist_refresh(ctx, playlist_id, force_refetch, force_retranslate):
                     "如只需重新翻译，请使用 'vat playlist retranslate'", err=True)
         return
     
-    playlist_service = PlaylistService(db, config)
+    playlist_service = _get_playlist_service_cls()(db, config)
     
     try:
         result = playlist_service.refresh_videos(
@@ -1545,7 +1517,7 @@ def playlist_show(ctx, playlist_id):
     config = get_config(ctx.obj.get('config_path'))
     db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
     
-    playlist_service = PlaylistService(db)
+    playlist_service = _get_playlist_service_cls()(db)
     
     pl = playlist_service.get_playlist(playlist_id)
     if not pl:
@@ -1597,7 +1569,7 @@ def playlist_delete(ctx, playlist_id, delete_videos, yes):
     config = get_config(ctx.obj.get('config_path'))
     db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
     
-    playlist_service = PlaylistService(db)
+    playlist_service = _get_playlist_service_cls()(db)
     pl = playlist_service.get_playlist(playlist_id)
     if not pl:
         click.echo(f"错误: Playlist 不存在: {playlist_id}", err=True)
@@ -1692,7 +1664,7 @@ def upload_video(ctx, video_id, upload_playlist_id, platform, season, dry_run):
             return
     playlist_info = None
     if effective_playlist_id:
-        playlist_service = PlaylistService(db)
+        playlist_service = _get_playlist_service_cls()(db)
         pl = playlist_service.get_playlist(effective_playlist_id)
         if pl:
             pl_upload_config = (pl.metadata or {}).get('upload_config', {})
@@ -1743,7 +1715,10 @@ def upload_video(ctx, video_id, upload_playlist_id, platform, season, dry_run):
         uploader = BilibiliUploader(
             cookies_file=str(cookies_file),
             line=bilibili_config.line,
-            threads=bilibili_config.threads
+            threads=bilibili_config.threads,
+            lock_db_path=config.storage.database_path,
+            upload_interval=bilibili_config.upload_interval,
+            max_concurrent_uploads=getattr(config.concurrency, "max_concurrent_uploads", 1),
         )
         
         # 查找封面
@@ -1850,7 +1825,7 @@ def upload_sync(ctx, playlist, retry_delay):
     db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
     
     # 验证 playlist 存在
-    playlist_service = PlaylistService(db)
+    playlist_service = _get_playlist_service_cls()(db)
     pl = playlist_service.get_playlist(playlist)
     if not pl:
         click.echo(f"错误: Playlist 不存在: {playlist}", err=True)
@@ -1859,7 +1834,7 @@ def upload_sync(ctx, playlist, retry_delay):
     click.echo(f"Playlist: {pl.title} ({playlist})")
     
     try:
-        from ..uploaders.bilibili import BilibiliUploader, season_sync, BILIUP_AVAILABLE
+        from ..uploaders.bilibili import BilibiliUploader, BILIUP_AVAILABLE, season_sync
         
         if not BILIUP_AVAILABLE:
             click.echo("错误: biliup 库不可用，请安装: pip install biliup", err=True)
@@ -1872,7 +1847,10 @@ def upload_sync(ctx, playlist, retry_delay):
         uploader = BilibiliUploader(
             cookies_file=str(cookies_file),
             line=bilibili_config.line,
-            threads=bilibili_config.threads
+            threads=bilibili_config.threads,
+            lock_db_path=config.storage.database_path,
+            upload_interval=bilibili_config.upload_interval,
+            max_concurrent_uploads=getattr(config.concurrency, "max_concurrent_uploads", 1),
         )
         
         # 第一次同步
@@ -1901,7 +1879,10 @@ def upload_sync(ctx, playlist, retry_delay):
             uploader2 = BilibiliUploader(
                 cookies_file=str(cookies_file),
                 line=bilibili_config.line,
-                threads=bilibili_config.threads
+                threads=bilibili_config.threads,
+                lock_db_path=config.storage.database_path,
+                upload_interval=bilibili_config.upload_interval,
+                max_concurrent_uploads=getattr(config.concurrency, "max_concurrent_uploads", 1),
             )
             click.echo("开始重试...")
             result2 = season_sync(db, uploader2, playlist)
@@ -1943,7 +1924,7 @@ def upload_update_info(ctx, playlist, dry_run, yes):
     
     from ..uploaders.template import render_upload_metadata
     
-    playlist_service = PlaylistService(db)
+    playlist_service = _get_playlist_service_cls()(db)
     pl = playlist_service.get_playlist(playlist)
     if not pl:
         click.echo(f"错误: Playlist 不存在: {playlist}", err=True)
@@ -2032,7 +2013,10 @@ def upload_update_info(ctx, playlist, dry_run, yes):
         uploader = BilibiliUploader(
             cookies_file=str(cookies_file),
             line=bilibili_config.line,
-            threads=bilibili_config.threads
+            threads=bilibili_config.threads,
+            lock_db_path=config.storage.database_path,
+            upload_interval=bilibili_config.upload_interval,
+            max_concurrent_uploads=getattr(config.concurrency, "max_concurrent_uploads", 1),
         )
         
         success = 0
@@ -2088,7 +2072,7 @@ def upload_sync_db(ctx, season, playlist, dry_run):
     logger = get_logger()
     db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
     
-    playlist_service = PlaylistService(db)
+    playlist_service = _get_playlist_service_cls()(db)
     pl = playlist_service.get_playlist(playlist)
     if not pl:
         click.echo(f"错误: Playlist 不存在: {playlist}", err=True)
@@ -2103,7 +2087,10 @@ def upload_sync_db(ctx, season, playlist, dry_run):
         uploader = BilibiliUploader(
             cookies_file=str(cookies_file),
             line=bilibili_config.line,
-            threads=bilibili_config.threads
+            threads=bilibili_config.threads,
+            lock_db_path=config.storage.database_path,
+            upload_interval=bilibili_config.upload_interval,
+            max_concurrent_uploads=getattr(config.concurrency, "max_concurrent_uploads", 1),
         )
         
         # 1. 获取合集中的所有视频
@@ -2234,14 +2221,12 @@ def bilibili(ctx):
 
 def _get_bilibili_uploader(ctx):
     """获取 B站上传器实例"""
-    from ..uploaders.bilibili import BilibiliUploader
-    
     config = get_config(ctx.obj.get('config_path'))
-    bilibili_config = config.uploader.bilibili
-    project_root = Path(__file__).parent.parent.parent
-    cookies_file = project_root / bilibili_config.cookies_file
-    
-    return BilibiliUploader(cookies_file=str(cookies_file))
+    return build_bilibili_uploader(
+        config,
+        with_upload_params=False,
+        project_root=Path(__file__).parent.parent.parent,
+    )
 
 
 @bilibili.command('seasons')
@@ -2430,99 +2415,13 @@ def bilibili_rejected(ctx, keyword):
 
 
 def _find_local_video_cli(aid: int, config, db, uploader) -> Optional[Path]:
-    """
-    CLI 侧：根据 aid 查找本地视频文件路径。
-    
-    查找策略（按优先级）：
-    1. 从 B站稿件 source URL 提取 YouTube video ID → DB 查找视频记录 → 本地 final.mp4
-    2. DB 中通过 bilibili_aid 匹配 → 本地 final.mp4
-    3. 通过 B站稿件标题匹配 DB 翻译标题 → 本地 final.mp4
-    4. 直接按 YouTube video ID 查找 output 目录
-    """
-    import re
-    
-    yt_video_id = None
-    bili_title = None
-    
-    # 方法1: source URL / desc 中提取 YouTube video ID → DB
-    try:
-        detail = uploader.get_archive_detail(aid)
-        if detail:
-            archive = detail.get('archive', {})
-            bili_title = archive.get('title', '')
-            # 从 source 字段和 desc 字段中搜索 YouTube URL
-            # 注意：创作中心 API 的 desc 截断到 250 字符，需补充公共 API 获取完整 desc
-            source = archive.get('source', '')
-            desc = archive.get('desc', '')
-            full_desc = uploader._get_full_desc(aid)
-            for text in [source, full_desc or desc, desc]:
-                yt_match = re.search(r'youtube\.com/watch\?v=([a-zA-Z0-9_-]+)', text)
-                if yt_match:
-                    yt_video_id = yt_match.group(1)
-                    break
-            
-            if yt_video_id:
-                click.echo(f"  稿件对应 YouTube 视频: {yt_video_id}")
-                
-                video = db.get_video(yt_video_id)
-                if video:
-                    path = _resolve_video_file_cli(video, config)
-                    if path:
-                        click.echo(f"  通过 YouTube ID 找到本地视频: {path}")
-                        return path
-    except Exception as e:
-        click.echo(f"  通过 source URL 查找失败: {e}", err=True)
-    
-    # 方法2 + 3: 遍历 DB
-    videos = db.list_videos()
-    
-    # 方法2: bilibili_aid 匹配
-    for v in videos:
-        meta = v.metadata or {}
-        if str(meta.get('bilibili_aid', '')) == str(aid):
-            path = _resolve_video_file_cli(v, config)
-            if path:
-                click.echo(f"  通过 bilibili_aid 找到本地视频: {path}")
-                return path
-    
-    # 方法3: 标题匹配
-    if bili_title:
-        clean_title = re.sub(r'\s*\|\s*#\d+\s*$', '', bili_title).strip()
-        for v in videos:
-            meta = v.metadata or {}
-            translated = meta.get('translated', {})
-            t_title = translated.get('title_translated', '') if translated else ''
-            if t_title and clean_title and (clean_title in t_title or t_title in clean_title):
-                path = _resolve_video_file_cli(v, config)
-                if path:
-                    click.echo(f"  通过标题匹配找到本地视频: {v.id} → {path}")
-                    return path
-    
-    # 方法4: output 目录直接查找
-    if yt_video_id:
-        vid_dir = Path(config.storage.output_dir) / yt_video_id
-        for name in ['final.mp4', f'{yt_video_id}.mp4']:
-            candidate = vid_dir / name
-            if candidate.exists():
-                click.echo(f"  通过 output 目录找到视频: {candidate}")
-                return candidate
-    
-    return None
+    """CLI 侧：根据 aid 查找本地视频文件路径。"""
+    return find_local_video_for_aid(aid, config, db, uploader)
 
 
 def _resolve_video_file_cli(video, config) -> Optional[Path]:
     """从视频记录解析本地视频文件路径（final.mp4 优先）"""
-    candidates = []
-    if video.output_dir:
-        candidates.append(Path(video.output_dir) / "final.mp4")
-    vid_dir = Path(config.storage.output_dir) / video.id
-    candidates.append(vid_dir / "final.mp4")
-    candidates.append(vid_dir / f"{video.id}.mp4")
-    
-    for c in candidates:
-        if c.exists():
-            return c
-    return None
+    return resolve_video_file(video, config)
 
 
 def _download_from_bilibili_cli(aid: int, bvid: str, config, logger) -> Optional[Path]:
@@ -2717,7 +2616,7 @@ def upload_playlist(ctx, playlist_id, platform, season, limit, dry_run):
     config = get_config(ctx.obj.get('config_path'))
     db = Database(config.storage.database_path, output_base_dir=config.storage.output_dir)
     
-    playlist_service = PlaylistService(db)
+    playlist_service = _get_playlist_service_cls()(db)
     pl = playlist_service.get_playlist(playlist_id)
     
     if not pl:

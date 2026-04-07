@@ -46,6 +46,17 @@ _VERTEX_TOKEN_HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 logger = setup_logger("llm_client")
 
 
+def reset_llm_runtime_state() -> None:
+    """清空 LLM 客户端与 Vertex token 缓存。"""
+    global _global_client
+    with _client_lock:
+        _global_client = None
+    with _registry_lock:
+        _client_registry.clear()
+    with _vertex_token_lock:
+        _vertex_token_cache.clear()
+
+
 def _get_env_provider() -> str:
     return os.getenv("VAT_LLM_PROVIDER", "openai_compatible").strip() or "openai_compatible"
 

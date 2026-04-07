@@ -12,6 +12,7 @@ Watch 服务单元测试
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,7 @@ from typing import Optional, Dict, List
 import pytest
 
 from vat.services.watch_service import WatchService
+from vat.services.process_job_submitter import build_process_job_submitter
 from vat.models import TaskStep, TaskStatus, DEFAULT_STAGE_SEQUENCE
 
 
@@ -160,15 +162,14 @@ def mock_db(tmp_db):
 
 @pytest.fixture(autouse=True)
 def mock_job_manager():
-    """自动 mock JobManager，使 WatchService 不依赖真实 DB 创建 web_jobs 表。
+    """自动 mock process submitter builder，使 WatchService 不依赖真实 web.jobs。
     
     所有测试自动获得此 fixture。需要检查 submit_job 调用的测试可显式声明参数名获取 mock 实例。
     """
-    with patch('vat.services.watch_service.JobManager') as MockJM:
-        mock_jm = MagicMock()
-        mock_jm.submit_job.return_value = "test-job-id"
-        MockJM.return_value = mock_jm
-        yield mock_jm
+    submitter = MagicMock()
+    submitter.return_value = "test-job-id"
+    with patch('vat.services.watch_service.build_process_job_submitter', return_value=submitter):
+        yield submitter
 
 
 def _insert_task(db_path: str, video_id: str, step: str, status: str):
@@ -446,7 +447,7 @@ class TestWatchOnceMode:
             assert sessions[0]['status'] == 'stopped'
         
         # 没有提交任何任务
-        mock_job_manager.submit_job.assert_not_called()
+        mock_job_manager.assert_not_called()
     
     def test_once_mode_with_new_videos(self, mock_job_manager, mock_config, mock_db, tmp_db):
         """once 模式：有新视频时提交任务"""
@@ -473,10 +474,9 @@ class TestWatchOnceMode:
         service.run()
         
         # 验证通过 JobManager 提交了 process job
-        mock_job_manager.submit_job.assert_called_once()
-        call_kwargs = mock_job_manager.submit_job.call_args.kwargs
+        mock_job_manager.assert_called_once()
+        call_kwargs = mock_job_manager.call_args.kwargs
         assert set(call_kwargs['video_ids']) == {"vid_a", "vid_b"}
-        assert call_kwargs['task_type'] == 'process'
         
         # 验证 session 统计
         with mock_db.get_connection() as conn:
@@ -516,7 +516,7 @@ class TestWatchOnceMode:
         service.run()
         
         # 两个 playlist 各提交一个任务
-        assert mock_job_manager.submit_job.call_count == 2
+        assert mock_job_manager.call_count == 2
         
         # 验证 round 记录数
         with mock_db.get_connection() as conn:
@@ -554,7 +554,7 @@ class TestWatchOnceMode:
         service.run()
         
         # force=True 使 sync 报告的已完成视频也被提交
-        mock_job_manager.submit_job.assert_called_once()
+        mock_job_manager.assert_called_once()
     
     def test_no_new_videos_no_submission(self, mock_job_manager, mock_config, mock_db, tmp_db):
         """sync 无新视频时，即使 playlist 有未完成视频也不提交（防止全量重处理）"""
@@ -574,7 +574,7 @@ class TestWatchOnceMode:
         service.run()
         
         # 无新视频 → 不提交任何任务（即使 playlist 有大量未完成视频）
-        mock_job_manager.submit_job.assert_not_called()
+        mock_job_manager.assert_not_called()
     
     def test_max_new_per_round_limit(self, mock_job_manager, mock_config, mock_db, tmp_db):
         """max_new_videos_per_round 限制每轮提交数量"""
@@ -602,7 +602,7 @@ class TestWatchOnceMode:
         service.run()
         
         # 验证 submit_job 调用中的 video_ids 被截断为 2 个
-        call_kwargs = mock_job_manager.submit_job.call_args.kwargs
+        call_kwargs = mock_job_manager.call_args.kwargs
         assert len(call_kwargs['video_ids']) == 2
     
     def test_sync_failure_continues(self, mock_job_manager, mock_config, mock_db, tmp_db):
@@ -631,7 +631,7 @@ class TestWatchOnceMode:
             assert "Network error" in rd['error']
         
         # 没有提交任何任务
-        mock_job_manager.submit_job.assert_not_called()
+        mock_job_manager.assert_not_called()
     
     def test_mixed_new_and_retry_videos(self, mock_job_manager, mock_config, mock_db, tmp_db):
         """新视频 + 本 session 提交过的失败视频在第二轮混合处理
@@ -665,8 +665,8 @@ class TestWatchOnceMode:
         service.run()
         
         # 验证提交了任务（包含新视频+重试视频）
-        mock_job_manager.submit_job.assert_called_once()
-        video_ids = mock_job_manager.submit_job.call_args.kwargs['video_ids']
+        mock_job_manager.assert_called_once()
+        video_ids = mock_job_manager.call_args.kwargs['video_ids']
         assert "vid_new" in video_ids
         assert "vid_fail" in video_ids
     
@@ -695,8 +695,8 @@ class TestWatchOnceMode:
         
         service.run()
         
-        mock_job_manager.submit_job.assert_called_once()
-        kw = mock_job_manager.submit_job.call_args.kwargs
+        mock_job_manager.assert_called_once()
+        kw = mock_job_manager.call_args.kwargs
         assert kw['video_ids'] == ["v1"]
         assert kw['steps'] == ["download", "whisper"]
         assert kw['gpu_device'] == "cuda:1"
@@ -704,7 +704,6 @@ class TestWatchOnceMode:
         assert kw['force'] is True
         assert kw['fail_fast'] is True
         assert kw['playlist_id'] == "PL_test"
-        assert kw['task_type'] == 'process'
 
 
 class TestEdgeCases:
@@ -721,7 +720,7 @@ class TestEdgeCases:
         )
         
         mock_db.get_video = MagicMock(return_value=FakeVideo(id="v1"))
-        mock_job_manager.submit_job.side_effect = Exception("DB connection failed")
+        mock_job_manager.side_effect = Exception("DB connection failed")
         
         service = WatchService(
             config=mock_config, db=mock_db,
@@ -754,7 +753,7 @@ class TestEdgeCases:
         
         # 不应调用 sync
         mock_pl_service.sync_playlist.assert_not_called()
-        mock_job_manager.submit_job.assert_not_called()
+        mock_job_manager.assert_not_called()
     
     def test_brand_new_video_no_tasks(self, mock_job_manager, mock_config, mock_db, tmp_db):
         """全新视频（DB 中无任何 task 记录）应被视为可处理"""
@@ -778,8 +777,8 @@ class TestEdgeCases:
         service.run()
         
         # 应提交任务
-        mock_job_manager.submit_job.assert_called_once()
-        video_ids = mock_job_manager.submit_job.call_args.kwargs['video_ids']
+        mock_job_manager.assert_called_once()
+        video_ids = mock_job_manager.call_args.kwargs['video_ids']
         assert "brand_new" in video_ids
     
     def test_force_overrides_existing_session(self, mock_config, mock_db, tmp_db):
@@ -879,8 +878,8 @@ class TestFullLifecycle:
         service.run()
         
         # 验证 submit_job 调用的 video_ids 包含正确的视频
-        mock_job_manager.submit_job.assert_called_once()
-        video_ids = mock_job_manager.submit_job.call_args.kwargs['video_ids']
+        mock_job_manager.assert_called_once()
+        video_ids = mock_job_manager.call_args.kwargs['video_ids']
         
         assert "v_new1" in video_ids, "全新视频 v_new1 应被提交"
         assert "v_new2" in video_ids, "全新视频 v_new2 应被提交"
@@ -932,8 +931,8 @@ class TestFullLifecycle:
         service1.run()
         
         # 验证第 1 轮提交了 v1, v2
-        assert mock_job_manager.submit_job.call_count == 1
-        vid_ids_r1 = mock_job_manager.submit_job.call_args.kwargs['video_ids']
+        assert mock_job_manager.call_count == 1
+        vid_ids_r1 = mock_job_manager.call_args.kwargs['video_ids']
         assert "v1" in vid_ids_r1 and "v2" in vid_ids_r1
         
         # ====== 模拟任务执行结果 ======
@@ -945,7 +944,7 @@ class TestFullLifecycle:
         _insert_task(tmp_db, "v2", TaskStep.WHISPER.value, TaskStatus.FAILED.value)
         
         # ====== 第 2 轮 ======
-        mock_job_manager.submit_job.reset_mock()
+        mock_job_manager.reset_mock()
         
         mock_pl_service2 = MagicMock()
         mock_pl_service2.get_playlist.return_value = FakePlaylist(id="PL_retry")
@@ -967,8 +966,8 @@ class TestFullLifecycle:
         service2.run()
         
         # 验证第 2 轮提交了 v2(重试) + v3(新)，但不包含 v1(已完成)
-        mock_job_manager.submit_job.assert_called_once()
-        vid_ids_r2 = mock_job_manager.submit_job.call_args.kwargs['video_ids']
+        mock_job_manager.assert_called_once()
+        vid_ids_r2 = mock_job_manager.call_args.kwargs['video_ids']
         assert "v2" in vid_ids_r2, "失败的 v2 应被重试"
         assert "v3" in vid_ids_r2, "新视频 v3 应被提交"
         assert "v1" not in vid_ids_r2, "已完成的 v1 不应被重新提交"
@@ -1068,7 +1067,7 @@ class TestFullLifecycle:
         
         # 模拟 3 次运行（超过 max_retries=2）
         for i in range(3):
-            mock_job_manager.submit_job.reset_mock()
+            mock_job_manager.reset_mock()
             svc = WatchService(
                 config=mock_config, db=mock_db,
                 playlist_ids=["PL_max"], once=True,
@@ -1082,10 +1081,10 @@ class TestFullLifecycle:
             
             if i < 2:
                 # 前 2 次应提交重试
-                assert mock_job_manager.submit_job.call_count == 1, f"第 {i+1} 次应提交重试"
+                assert mock_job_manager.call_count == 1, f"第 {i+1} 次应提交重试"
             else:
                 # 第 3 次超过限制，不再重试
-                mock_job_manager.submit_job.assert_not_called()
+                mock_job_manager.assert_not_called()
 
 
 class TestJobManagerCommandConstruction:
@@ -1106,7 +1105,7 @@ class TestJobManagerCommandConstruction:
         }
         cmd = JobManager._build_tools_command('watch', params)
         
-        assert cmd[:5] == ["python", "-m", "vat", "tools", "watch"]
+        assert cmd[:5] == [sys.executable, "-m", "vat", "tools", "watch"]
         assert "--playlist" in cmd
         assert "PL_A" in cmd
         assert "PL_B" in cmd
@@ -1159,3 +1158,48 @@ class TestJobManagerCommandConstruction:
         assert len(playlist_indices) == 3
         for idx in playlist_indices:
             assert cmd[idx + 1] in ['PL_1', 'PL_2', 'PL_3']
+
+
+class TestProcessJobSubmitterConfigPropagation:
+    def test_build_process_job_submitter_passes_config_path_to_job_manager(self):
+        fake_config = MagicMock()
+        fake_config.storage.database_path = "/tmp/custom.db"
+
+        captured = {}
+
+        class FakeJobManager:
+            def __init__(self, db_path, log_dir, config_path=None):
+                captured["init"] = {
+                    "db_path": db_path,
+                    "log_dir": log_dir,
+                    "config_path": config_path,
+                }
+
+            def submit_process_job(self, **kwargs):
+                captured["submit"] = kwargs
+                return "job-123"
+
+        with patch("vat.web.jobs.JobManager", FakeJobManager):
+            submitter = build_process_job_submitter(fake_config, config_path="config/custom.yaml")
+            job_id = submitter(
+                video_ids=["vid1"],
+                steps=["download"],
+                gpu_device="auto",
+                force=False,
+                concurrency=1,
+                playlist_id="PL1",
+                fail_fast=False,
+            )
+
+        assert job_id == "job-123"
+        assert captured["init"]["db_path"] == "/tmp/custom.db"
+        assert captured["init"]["config_path"] == "config/custom.yaml"
+        assert captured["submit"] == {
+            "video_ids": ["vid1"],
+            "steps": ["download"],
+            "gpu_device": "auto",
+            "force": False,
+            "concurrency": 1,
+            "playlist_id": "PL1",
+            "fail_fast": False,
+        }

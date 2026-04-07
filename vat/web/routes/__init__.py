@@ -9,6 +9,7 @@ from .prompts import router as prompts_router
 from .bilibili import router as bilibili_router
 from .watch import router as watch_router
 from .database import router as database_router
+from .test_center import router as test_center_router
 
 __all__ = [
     "videos_router",
@@ -19,4 +20,5 @@ __all__ = [
     "bilibili_router",
     "watch_router",
     "database_router",
+    "test_center_router",
 ]

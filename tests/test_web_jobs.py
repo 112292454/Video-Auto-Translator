@@ -5,6 +5,7 @@ web/jobs.py 单元测试
 不测试子进程启动（需要真实 CLI 环境）。
 """
 import os
+import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -46,6 +47,47 @@ class TestJobManagerCRUD:
     def test_list_empty(self, job_env):
         jm, _, _ = job_env
         assert jm.list_jobs() == []
+
+    def test_find_latest_job_is_not_limited_to_last_200_rows(self, job_env):
+        jm, _, _ = job_env
+        import json
+        from datetime import datetime, timedelta
+
+        with jm._get_connection() as conn:
+            target_time = datetime(2026, 3, 24, 12, 0, 0)
+            conn.execute("""
+                INSERT INTO web_jobs (
+                    job_id, video_ids, steps, gpu_device, force, status, log_file, created_at,
+                    task_type, task_params
+                ) VALUES (?, ?, ?, 'auto', 0, 'running', NULL, ?, ?, ?)
+            """, (
+                "target-job",
+                json.dumps([]),
+                json.dumps(["sync-playlist"]),
+                target_time.isoformat(),
+                "sync-playlist",
+                json.dumps({"playlist_id": "PL_TARGET"}),
+            ))
+
+            for idx in range(205):
+                created_at = target_time + timedelta(minutes=idx + 1)
+                conn.execute("""
+                    INSERT INTO web_jobs (
+                        job_id, video_ids, steps, gpu_device, force, status, log_file, created_at,
+                        task_type, task_params
+                    ) VALUES (?, ?, ?, 'auto', 0, 'completed', NULL, ?, ?, ?)
+                """, (
+                    f"newer-{idx}",
+                    json.dumps([]),
+                    json.dumps(["sync-playlist"]),
+                    created_at.isoformat(),
+                    "sync-playlist",
+                    json.dumps({"playlist_id": f"PL_{idx}"}),
+                ))
+
+        job = jm.find_latest_job("sync-playlist", {"playlist_id": "PL_TARGET"})
+        assert job is not None
+        assert job.job_id == "target-job"
 
 
 class TestWebJobSerialization:
@@ -249,6 +291,17 @@ class TestVideoDeduplication:
         assert "v1" not in result
         assert result == {"v2", "v3"}
 
+    def test_skipped_step_unblocks_video(self, env):
+        """requested step 为 skipped 也视为该 job 已满足。"""
+        jm, db_path = env
+        self._insert_running_job(jm, "job1", ["v1", "v2"], ["download", "whisper"])
+        self._insert_task(db_path, "v1", "download", "completed")
+        self._insert_task(db_path, "v1", "whisper", "skipped")
+
+        result = jm.get_running_video_ids()
+        assert "v1" not in result
+        assert result == {"v2"}
+
     def test_partially_completed_still_blocked(self, env):
         """v1 只完成 download 未完成 whisper → 仍阻塞"""
         jm, db_path = env
@@ -311,6 +364,28 @@ class TestVideoDeduplication:
         result = jm.get_running_video_ids()
         assert result == set()
 
+    def test_task_params_todo_video_ids_are_included_in_hide_processing_set(self, env):
+        """running job 的 task_params 待处理视频也应被首页过滤隐藏。"""
+        jm, db_path = env
+        import json
+        from datetime import datetime
+
+        with jm._get_connection() as conn:
+            conn.execute("""
+                INSERT INTO web_jobs (
+                    job_id, video_ids, steps, status, created_at, task_params
+                ) VALUES (?, ?, ?, 'running', ?, ?)
+            """, (
+                "job1",
+                json.dumps(["v_processing"]),
+                json.dumps(["download"]),
+                datetime.now().isoformat(),
+                json.dumps({"todo_video_ids": ["v_todo"]}),
+            ))
+
+        result = jm.get_running_and_queued_video_ids()
+        assert result == {"v_processing", "v_todo"}
+
 
 class TestTaskParamsPersistence:
     """测试 task_params 统一持久化：process 特有参数存入 task_params JSON 字段"""
@@ -333,6 +408,60 @@ class TestTaskParamsPersistence:
                     )
 
             assert jm.list_jobs() == []
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_submit_process_job_uses_process_boundary(self):
+        """submit_process_job 应固定 process 边界并合并 process 参数。"""
+        import tempfile, shutil
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmpdir, "test.db")
+            log_dir = os.path.join(tmpdir, "logs")
+            jm = JobManager(db_path, log_dir)
+
+            from unittest.mock import patch
+            with patch.object(jm, '_start_job_process'):
+                job_id = jm.submit_process_job(
+                    video_ids=["v1"],
+                    steps=["upload"],
+                    playlist_id="PL_abc",
+                    upload_batch_size=3,
+                    upload_mode="dtime",
+                    upload_cron="0 12 * * *",
+                )
+
+            job = jm.get_job(job_id)
+            assert job is not None
+            assert job.task_type == 'process'
+            assert job.task_params['playlist_id'] == 'PL_abc'
+            assert job.task_params['upload_batch_size'] == 3
+            assert job.task_params['upload_mode'] == 'dtime'
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_submit_tools_job_uses_tools_boundary(self):
+        """submit_tools_job 应固定 tools 边界并补齐空 video_ids。"""
+        import tempfile, shutil
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmpdir, "test.db")
+            log_dir = os.path.join(tmpdir, "logs")
+            jm = JobManager(db_path, log_dir)
+
+            from unittest.mock import patch
+            with patch.object(jm, '_start_job_process'):
+                job_id = jm.submit_tools_job(
+                    task_type="refresh-playlist",
+                    task_params={"playlist_id": "PL1"},
+                )
+
+            job = jm.get_job(job_id)
+            assert job is not None
+            assert job.video_ids == []
+            assert job.steps == ["refresh-playlist"]
+            assert job.task_type == 'refresh-playlist'
+            assert job.task_params == {"playlist_id": "PL1"}
         finally:
             shutil.rmtree(tmpdir)
 
@@ -439,6 +568,22 @@ class TestTaskParamsPersistence:
         idx_m = cmd.index("--upload-mode")
         assert cmd[idx_m + 1] == "dtime"
 
+    def test_build_process_command_includes_group_config_path(self):
+        """process 子进程应继承 web 启动时的 group 级 --config。"""
+        cmd = JobManager._build_process_command(
+            video_ids=["v1"],
+            steps=["download"],
+            gpu_device="auto",
+            force=False,
+            concurrency=1,
+            upload_cron=None,
+            fail_fast=False,
+            task_params={},
+            config_path="config/custom.yaml",
+        )
+        assert cmd[:5] == [sys.executable, "-m", "vat", "-c", "config/custom.yaml"]
+        assert cmd[5] == "process"
+
     def test_build_process_command_empty_task_params(self):
         """task_params 为空时不生成额外参数"""
         cmd = JobManager._build_process_command(
@@ -517,7 +662,24 @@ class TestTaskParamsPersistence:
         assert cmd[idx + 1] == "120"
 
 
-class TestProcessJobResultContracts:
+    def test_submit_tools_job_rejects_unknown_task_type(self):
+        """submit_tools_job 对未知 tools task_type 应 fail-fast。"""
+        import tempfile, shutil
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmpdir, "test.db")
+            log_dir = os.path.join(tmpdir, "logs")
+            jm = JobManager(db_path, log_dir)
+
+            with pytest.raises(ValueError, match="Unknown tools task_type"):
+                jm.submit_tools_job(task_type="unknown-type")
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_build_tools_command_rejects_unknown_task_type(self):
+        """_build_tools_command 对未知 tools task_type 应 fail-fast。"""
+        with pytest.raises(ValueError, match="Unknown tools task_type"):
+            JobManager._build_tools_command("unknown-type", {})
     @pytest.fixture
     def env(self):
         import sqlite3, shutil

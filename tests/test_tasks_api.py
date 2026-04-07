@@ -33,7 +33,8 @@ class _FakeJobManager:
         self.jobs = {}
         self.update_calls = []
         self.delete_calls = []
-        self.submit_calls = []
+        self.submit_process_calls = []
+        self.submit_tools_calls = []
         self.running_video_ids = set()
 
     def cancel_job(self, task_id):
@@ -51,7 +52,14 @@ class _FakeJobManager:
         return True
 
     def submit_job(self, **kwargs):
-        self.submit_calls.append(kwargs)
+        raise AssertionError("tasks route 应通过 submit_process_job / submit_tools_job 边界提交任务")
+
+    def submit_process_job(self, **kwargs):
+        self.submit_process_calls.append(kwargs)
+        return "retry-new-task"
+
+    def submit_tools_job(self, **kwargs):
+        self.submit_tools_calls.append(kwargs)
         return "retry-new-task"
 
     def list_jobs(self, limit=50):
@@ -133,7 +141,7 @@ class TestExecuteTaskApi:
 
         assert response.status_code == 400
         assert "定时上传仅可用于 upload 阶段" in response.json()["detail"]
-        assert job_manager.submit_calls == []
+        assert job_manager.submit_process_calls == []
 
     @pytest.mark.anyio
     async def test_execute_task_rejects_running_video_conflicts(self, app, client):
@@ -152,7 +160,7 @@ class TestExecuteTaskApi:
 
         assert response.status_code == 409
         assert "v1" in response.json()["detail"]
-        assert job_manager.submit_calls == []
+        assert job_manager.submit_process_calls == []
 
     @pytest.mark.anyio
     async def test_execute_task_force_invalidates_from_earliest_requested_step(self, app, client, monkeypatch):
@@ -176,7 +184,7 @@ class TestExecuteTaskApi:
             ("v1", TaskStep.DOWNLOAD),
             ("v2", TaskStep.DOWNLOAD),
         ]
-        assert job_manager.submit_calls[0]["steps"] == ["translate", "download"]
+        assert job_manager.submit_process_calls[0]["steps"] == ["translate", "download"]
 
     @pytest.mark.anyio
     async def test_execute_task_returns_cli_preview_when_requested(self, app, client, monkeypatch):
@@ -201,7 +209,7 @@ class TestExecuteTaskApi:
         assert response.status_code == 200
         assert response.json()["status"] == "submitted"
         assert response.json()["cli_command"] == "cli:asr"
-        assert job_manager.submit_calls[0]["steps"] == ["whisper", "split"]
+        assert job_manager.submit_process_calls[0]["steps"] == ["whisper", "split"]
 
 
 class TestCancelTaskApi:
@@ -354,16 +362,18 @@ class TestRetryTaskApi:
             "original_task_id": "job-stale",
         }
         assert job_manager.update_calls == ["job-stale"]
-        assert job_manager.submit_calls == [{
+        assert job_manager.submit_process_calls == [{
             "video_ids": ["v1"],
             "steps": ["download"],
             "gpu_device": "auto",
             "force": False,
             "concurrency": 1,
+            "playlist_id": None,
             "upload_cron": None,
+            "upload_batch_size": 1,
+            "upload_mode": "cron",
             "fail_fast": False,
-            "task_type": "process",
-            "task_params": {},
+            "delay_start": 0,
         }]
 
     @pytest.mark.anyio
@@ -378,7 +388,7 @@ class TestRetryTaskApi:
 
         assert response.status_code == 400
         assert response.json()["detail"] == "Task is still running"
-        assert job_manager.submit_calls == []
+        assert job_manager.submit_process_calls == []
         assert job_manager.update_calls == ["job-running"]
 
     @pytest.mark.anyio
@@ -410,14 +420,34 @@ class TestRetryTaskApi:
             "original_task_id": "job-original",
         }
         assert job_manager.update_calls == ["job-original"]
-        assert job_manager.submit_calls == [{
-            "video_ids": ["v1", "v2"],
-            "steps": ["download", "translate"],
-            "gpu_device": "cuda:1",
-            "force": True,
-            "concurrency": 3,
-            "upload_cron": "0 8 * * *",
-            "fail_fast": True,
-            "task_type": "process",
-            "task_params": {"playlist_id": "pl-1", "upload_mode": "dtime"},
+
+    @pytest.mark.anyio
+    async def test_retry_tools_task_uses_tools_boundary(self, app, client):
+        job_manager = _FakeJobManager()
+        app.include_router(router)
+        app.dependency_overrides[get_job_manager] = lambda: job_manager
+        job_manager.jobs["job-watch"] = _make_job(
+            "job-watch",
+            status=JobStatus.FAILED,
+            video_ids=[],
+            steps=["watch"],
+            task_type="watch",
+            task_params={"playlist_ids": ["PL1"], "once": True},
+        )
+
+        async with client as ac:
+            response = await ac.post("/api/tasks/job-watch/retry")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "status": "submitted",
+            "new_task_id": "retry-new-task",
+            "original_task_id": "job-watch",
+        }
+        assert job_manager.update_calls == ["job-watch"]
+        assert job_manager.submit_process_calls == []
+        assert job_manager.submit_tools_calls == [{
+            "task_type": "watch",
+            "task_params": {"playlist_ids": ["PL1"], "once": True},
+            "steps": ["watch"],
         }]

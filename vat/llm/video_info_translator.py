@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 
 from .client import get_or_create_client
+from .facade import call_text_llm, extract_json_block
 from vat.utils.logger import setup_logger
 
 
@@ -332,15 +333,12 @@ class VideoInfoTranslator:
             raise ValueError("翻译失败：title 为空，无法进行有意义的翻译")
         if not uploader or not uploader.strip():
             logger.warning("uploader 为空，LLM 将缺少频道/主播上下文，翻译质量可能下降")
-        
-        # 构建prompt
-        tags_str = ", ".join(tags) if tags else "无"
-        prompt = TRANSLATE_VIDEO_INFO_PROMPT.format(
+        request = self.build_translate_llm_request(
             title=title,
-            description=description[:2000] if description else "无",  # 限制描述长度
-            tags=tags_str,
-            uploader=uploader or "未知",
-            zones_info=self._build_zones_info()
+            description=description,
+            tags=tags,
+            uploader=uploader,
+            default_tid=default_tid,
         )
         
         # 重试机制：JSON解析错误或网络问题时重试
@@ -350,23 +348,17 @@ class VideoInfoTranslator:
         
         for attempt in range(max_retries):
             try:
-                client = self._get_client()
-                response = client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": "你是一个专业的视频内容翻译专家。请严格按JSON格式输出。"},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.7,
+                content = call_text_llm(
+                    model=request["model"],
+                    messages=request["messages"],
+                    temperature=request["temperature"],
+                    api_key=request["api_key"],
+                    base_url=request["base_url"],
+                    proxy=request["proxy"],
                 )
-                
-                content = response.choices[0].message.content.strip()
-                
+
                 # 提取JSON
-                if "```json" in content:
-                    content = content.split("```json")[1].split("```")[0].strip()
-                elif "```" in content:
-                    content = content.split("```")[1].split("```")[0].strip()
+                content = extract_json_block(content)
                 
                 result = json.loads(content)
                 
@@ -428,6 +420,39 @@ class VideoInfoTranslator:
         if content:
             logger.debug(f"最后响应: {content[:500]}")
         raise RuntimeError(error_msg)
+
+    def build_translate_llm_request(
+        self,
+        *,
+        title: str,
+        description: str,
+        tags: List[str],
+        uploader: str = "",
+        default_tid: int = 21,
+    ) -> Dict[str, Any]:
+        """构建视频信息翻译阶段真实发送的 LLM 请求。"""
+        assert title and title.strip(), "调用契约错误: title 不能为空"
+        tags_str = ", ".join(tags) if tags else "无"
+        prompt = TRANSLATE_VIDEO_INFO_PROMPT.format(
+            title=title,
+            description=description[:2000] if description else "无",
+            tags=tags_str,
+            uploader=uploader or "未知",
+            zones_info=self._build_zones_info(),
+        )
+        return {
+            "stage": "video_info_translate",
+            "model": self.model,
+            "temperature": 0.7,
+            "api_key": self.api_key,
+            "base_url": self.base_url,
+            "proxy": self.proxy,
+            "default_tid": default_tid,
+            "messages": [
+                {"role": "system", "content": "你是一个专业的视频内容翻译专家。请严格按JSON格式输出。"},
+                {"role": "user", "content": prompt},
+            ],
+        }
     
     def _strip_uploader_prefix(self, title: str, uploader: str) -> str:
         """

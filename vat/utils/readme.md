@@ -158,21 +158,21 @@ logger.info("处理开始")
 
 ## 9. 资源锁（resource_lock.py）
 
-基于 SQLite 的跨进程资源锁，用于协调多个 VAT 进程（watch 自动提交 + 用户手动执行）间的下载和上传速率。详见 `docs/WATCH_MODE_SPEC.md` §3.4。
+基于 SQLite 的跨进程资源锁，用于协调多个 VAT 进程（watch 自动提交 + 用户手动执行）间的下载和上传速率。当前真实接入点在 `YouTubeDownloader.download()` 与 `BilibiliUploader` 的真实上传方法中。详见 `docs/WATCH_MODE_SPEC.md` §3.4。
 
 ### 资源类型
 
 | 资源 | 最大并发 | 最小间隔 | 锁超时 |
 |------|----------|----------|--------|
-| `youtube_download` | 1 | 配置项 `download_delay` | 30 分钟 |
-| `bilibili_upload` | 1 | 配置项 `upload_interval` | 60 分钟 |
+| `youtube_download` | 配置项 `concurrency.max_concurrent_downloads`（默认 1） | 配置项 `download_delay` | 30 分钟 |
+| `bilibili_upload` | 配置项 `concurrency.max_concurrent_uploads`（默认 1） | 配置项 `upload_interval` | 60 分钟 |
 
 ### 使用方式
 
 ```python
 from vat.utils.resource_lock import resource_lock
 
-with resource_lock('youtube_download', db_dir, timeout=300) as lock:
+with resource_lock(db_path, 'youtube_download', timeout_seconds=300, max_concurrent=1):
     do_download()
 # 自动释放 + 冷却间隔控制
 ```

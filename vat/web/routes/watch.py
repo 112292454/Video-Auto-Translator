@@ -16,12 +16,17 @@ from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from vat.config import load_config
 from vat.database import Database
 from vat.services.watch_service import WatchService
-from vat.web.deps import get_db
+from vat.web.deps import get_db, get_web_config
 
 router = APIRouter(prefix="/api/watch", tags=["watch"])
+
+
+def _get_job_manager():
+    """获取 JobManager 实例。"""
+    from vat.web.routes.tasks import get_job_manager
+    return get_job_manager()
 
 
 class WatchStartRequest(BaseModel):
@@ -125,15 +130,13 @@ async def get_session_rounds(
 @router.post("/start")
 async def start_watch(req: WatchStartRequest):
     """启动新的 Watch Session（通过 JobManager 提交子进程）"""
-    from vat.web.jobs import JobManager
     from vat.services import PlaylistService
-    from pathlib import Path
     
-    config = load_config()
+    config = get_web_config()
     db = get_db()
     
     # 验证 playlist 存在
-    playlist_service = PlaylistService(db)
+    playlist_service = PlaylistService(db, config)
     for pl_id in req.playlist_ids:
         pl = playlist_service.get_playlist(pl_id)
         if not pl:
@@ -157,9 +160,8 @@ async def start_watch(req: WatchStartRequest):
                 status_code=409
             )
     
-    # 通过 JobManager 提交 watch 任务
-    log_dir = Path(config.storage.database_path).parent / "job_logs"
-    job_manager = JobManager(config.storage.database_path, str(log_dir))
+    # 通过统一入口获取 JobManager，避免 watch 路由再维护一套构造逻辑
+    job_manager = _get_job_manager()
     
     task_params = {
         'playlist_ids': req.playlist_ids,
@@ -176,11 +178,10 @@ async def start_watch(req: WatchStartRequest):
     if req.concurrency is not None:
         task_params['concurrency'] = req.concurrency
     
-    job_id = job_manager.submit_job(
-        video_ids=[],
-        steps=[],
+    job_id = job_manager.submit_tools_job(
         task_type='watch',
         task_params=task_params,
+        steps=[],
     )
     
     return {"job_id": job_id, "message": "Watch 任务已提交"}

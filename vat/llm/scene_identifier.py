@@ -2,7 +2,7 @@
 import yaml
 from pathlib import Path
 from typing import Dict, Any, Optional
-from vat.llm import call_llm
+from vat.llm.facade import call_text_llm
 from vat.utils.logger import setup_logger
 
 logger = setup_logger("scene_identifier")
@@ -65,33 +65,18 @@ class SceneIdentifier:
             return self._get_default_scene()
         
         try:
-            # 构建 system prompt
-            system_prompt = self._build_system_prompt()
-            
-            # 构建 user prompt
-            user_prompt = f"""Title: {title}
-
-Description: {description if description else "(no description)"}
-
-Output: """
-            
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
+            request = self.build_detect_scene_llm_request(title=title, description=description)
             
             # 调用 LLM
-            response = call_llm(
-                messages=messages, model=self.model, temperature=0.1,
-                api_key=self.api_key, base_url=self.base_url,
-                proxy=self.proxy,
+            scene_id = call_text_llm(
+                messages=request["messages"],
+                model=request["model"],
+                temperature=request["temperature"],
+                api_key=request["api_key"],
+                base_url=request["base_url"],
+                proxy=request["proxy"],
             )
-            
-            if not response or not response.choices:
-                logger.error("LLM 返回为空")
-                return self._get_default_scene()
-            
-            scene_id = response.choices[0].message.content.strip().lower()
+            scene_id = scene_id.lower()
             
             # 验证场景 ID 是否有效
             if not self._is_valid_scene(scene_id):
@@ -110,6 +95,33 @@ Output: """
         except Exception as e:
             logger.error(f"场景识别失败: {e}，使用默认场景")
             return self._get_default_scene()
+
+    def build_detect_scene_llm_request(
+        self,
+        *,
+        title: str,
+        description: str = "",
+    ) -> Dict[str, Any]:
+        """构建场景识别阶段真实发送的 LLM 请求。"""
+        assert title, "调用契约错误: title 不能为空"
+        system_prompt = self._build_system_prompt()
+        user_prompt = f"""Title: {title}
+
+Description: {description if description else "(no description)"}
+
+Output: """
+        return {
+            "stage": "scene_identify",
+            "model": self.model,
+            "temperature": 0.1,
+            "api_key": self.api_key,
+            "base_url": self.base_url,
+            "proxy": self.proxy,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
     
     def _build_system_prompt(self) -> str:
         """构建场景识别的 system prompt"""
