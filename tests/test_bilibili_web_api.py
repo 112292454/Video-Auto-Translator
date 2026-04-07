@@ -42,6 +42,14 @@ class _FakeJobManager:
         self.jobs = {}
         self.update_calls = []
         self.log_lines = {}
+        self.submit_tools_calls = []
+
+    def submit_job(self, **kwargs):
+        raise AssertionError("bilibili route 应通过 submit_tools_job 边界提交 tools 任务")
+
+    def submit_tools_job(self, **kwargs):
+        self.submit_tools_calls.append(kwargs)
+        return f"job-{len(self.submit_tools_calls)}"
 
     def update_job_status(self, job_id):
         self.update_calls.append(job_id)
@@ -275,6 +283,84 @@ class TestSyncSeasonTitlesRoute:
 
 class TestBilibiliJobStatusRoutes:
     @pytest.mark.anyio
+    async def test_rejected_list_derives_fix_status_from_web_jobs(self, app, client, monkeypatch):
+        job_manager = _FakeJobManager()
+        job_manager.jobs["job-fix"] = _make_job(
+            "job-fix",
+            task_type="fix-violation",
+            task_params={"aid": 123},
+            status=JobStatus.RUNNING,
+        )
+
+        class _FakeUploader:
+            def get_rejected_videos(self, keyword=""):
+                return [{
+                    "aid": 123,
+                    "bvid": "BV1xx",
+                    "title": "测试视频",
+                    "reject_reason": "违规",
+                    "problems": [{
+                        "reason": "违规",
+                        "violation_time": "00:01",
+                        "violation_position": "片头",
+                        "modify_advise": "遮罩",
+                        "time_ranges": [[1, 3]],
+                        "is_full_video": False,
+                    }],
+                }]
+
+        app.include_router(router)
+        monkeypatch.setattr("vat.web.routes.bilibili._get_job_manager", lambda: job_manager)
+        monkeypatch.setattr("vat.web.routes.bilibili._get_uploader", lambda with_upload_params=False: _FakeUploader())
+
+        async with client as ac:
+            response = await ac.get("/bilibili/rejected")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["videos"][0]["fix_status"] == "masking"
+
+    @pytest.mark.anyio
+    async def test_rejected_list_ignores_completed_fix_job_for_still_rejected_video(self, app, client, monkeypatch):
+        job_manager = _FakeJobManager()
+        job_manager.jobs["job-fix"] = _make_job(
+            "job-fix",
+            task_type="fix-violation",
+            task_params={"aid": 123},
+            status=JobStatus.COMPLETED,
+        )
+
+        class _FakeUploader:
+            def get_rejected_videos(self, keyword=""):
+                return [{
+                    "aid": 123,
+                    "bvid": "BV1xx",
+                    "title": "测试视频",
+                    "reject_reason": "违规",
+                    "problems": [{
+                        "reason": "违规",
+                        "violation_time": "00:01",
+                        "violation_position": "片头",
+                        "modify_advise": "遮罩",
+                        "time_ranges": [[1, 3]],
+                        "is_full_video": False,
+                    }],
+                }]
+
+        app.include_router(router)
+        monkeypatch.setattr("vat.web.routes.bilibili._get_job_manager", lambda: job_manager)
+        monkeypatch.setattr("vat.web.routes.bilibili._get_uploader", lambda with_upload_params=False: _FakeUploader())
+
+        async with client as ac:
+            response = await ac.get("/bilibili/rejected")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["videos"][0]["fix_status"] is None
+
+    @pytest.mark.anyio
     async def test_fix_status_can_resolve_job_without_legacy_memory_state(self, app, client, monkeypatch):
         job_manager = _FakeJobManager()
         job_manager.jobs["job-fix"] = _make_job(
@@ -286,7 +372,6 @@ class TestBilibiliJobStatusRoutes:
 
         app.include_router(router)
         monkeypatch.setattr("vat.web.routes.bilibili._get_job_manager", lambda: job_manager)
-        monkeypatch.setattr("vat.web.routes.bilibili._fix_tasks", {})
 
         async with client as ac:
             response = await ac.get("/bilibili/fix/123/status")
@@ -309,7 +394,6 @@ class TestBilibiliJobStatusRoutes:
 
         app.include_router(router)
         monkeypatch.setattr("vat.web.routes.bilibili._get_job_manager", lambda: job_manager)
-        monkeypatch.setattr("vat.web.routes.bilibili._sync_tasks", {})
 
         async with client as ac:
             response = await ac.get("/bilibili/season-sync/PL1/status")
@@ -319,3 +403,85 @@ class TestBilibiliJobStatusRoutes:
         assert response.json()["job_id"] == "job-sync"
         assert response.json()["message"] == "sync failed"
         assert job_manager.update_calls == ["job-sync"]
+
+
+class TestBilibiliJobSubmissionRoutes:
+    @pytest.mark.anyio
+    async def test_fix_route_submits_tools_job(self, app, client, monkeypatch, tmp_path):
+        job_manager = _FakeJobManager()
+        video_path = tmp_path / "local.mp4"
+        video_path.write_text("video")
+
+        app.include_router(router)
+        monkeypatch.setattr("vat.web.routes.bilibili._get_job_manager", lambda: job_manager)
+        monkeypatch.setattr("vat.web.routes.bilibili._find_local_video", lambda aid: video_path)
+
+        async with client as ac:
+            response = await ac.post(
+                "/bilibili/fix/123",
+                json={
+                    "margin": 2.0,
+                    "mask_text": "自定义遮罩",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        assert response.json()["job_id"] == "job-1"
+        assert response.json()["video_path"] == str(video_path)
+        assert job_manager.submit_tools_calls == [{
+            "task_type": "fix-violation",
+            "task_params": {
+                "aid": 123,
+                "margin": 2.0,
+                "mask_text": "自定义遮罩",
+                "video_path": str(video_path),
+            },
+            "steps": ["fix-violation"],
+        }]
+
+    @pytest.mark.anyio
+    async def test_season_sync_route_submits_tools_job(self, app, client, monkeypatch):
+        job_manager = _FakeJobManager()
+        fake_db = SimpleNamespace(update_video=lambda *args, **kwargs: None)
+        fake_playlist = SimpleNamespace(
+            id="PL1",
+            metadata={"upload_config": {"season_id": 42}},
+        )
+        fake_video = SimpleNamespace(id="vid-1", metadata={"bilibili_aid": 1001})
+
+        class _FakePlaylistService:
+            def __init__(self, db):
+                self.db = db
+
+            def get_playlist(self, playlist_id):
+                assert playlist_id == "PL1"
+                return fake_playlist
+
+            def get_playlist_videos(self, playlist_id):
+                assert playlist_id == "PL1"
+                return [fake_video]
+
+        app.include_router(router)
+        monkeypatch.setattr("vat.web.routes.bilibili._get_job_manager", lambda: job_manager)
+        monkeypatch.setattr("vat.web.routes.bilibili.get_db", lambda: fake_db)
+        monkeypatch.setattr("vat.web.routes.bilibili.get_upload_config_manager", lambda: SimpleNamespace(load=lambda: SimpleNamespace(bilibili=SimpleNamespace(season_id=None))))
+        monkeypatch.setattr("vat.services.playlist_service.PlaylistService", _FakePlaylistService)
+
+        async with client as ac:
+            response = await ac.post("/bilibili/season-sync/PL1")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "message": "同步任务已启动 (playlist=PL1, season=42)",
+            "job_id": "job-1",
+            "patched": 1,
+        }
+        assert job_manager.submit_tools_calls == [{
+            "task_type": "season-sync",
+            "task_params": {
+                "playlist_id": "PL1",
+            },
+            "steps": ["season-sync"],
+        }]

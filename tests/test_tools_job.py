@@ -96,9 +96,9 @@ class TestBuildToolsCommand(TestCase):
         self.assertIn('--aid', cmd)
 
     def test_unknown_task_type(self):
-        """未知 task_type 应返回基础命令"""
-        cmd = JobManager._build_tools_command('unknown-type', {})
-        self.assertEqual(cmd, [sys.executable, '-m', 'vat', 'tools', 'unknown-type'])
+        """未知 task_type 应 fail-fast。"""
+        with self.assertRaisesRegex(ValueError, 'Unknown tools task_type'):
+            JobManager._build_tools_command('unknown-type', {})
 
     def test_watch_command_includes_group_config_path(self):
         cmd = JobManager._build_tools_command(
@@ -108,6 +108,56 @@ class TestBuildToolsCommand(TestCase):
         )
         self.assertEqual(cmd[:6], [sys.executable, '-m', 'vat', '-c', 'config/custom.yaml', 'tools'])
         self.assertEqual(cmd[6], 'watch')
+
+    def test_test_center_command(self):
+        cmd = JobManager._build_tools_command(
+            'test-center',
+            {'kind': 'llm', 'target_id': 'translate'},
+            config_path='config/custom.yaml',
+        )
+        self.assertEqual(cmd[:6], [sys.executable, '-m', 'vat', '-c', 'config/custom.yaml', 'tools'])
+        self.assertEqual(cmd[6], 'test-center')
+        self.assertIn('--kind', cmd)
+        self.assertIn('llm', cmd)
+        self.assertIn('--target-id', cmd)
+        self.assertIn('translate', cmd)
+
+
+class TestFindLocalVideoForAid(TestCase):
+    def test_falls_back_to_bilibili_title_match(self):
+        from vat.cli.tools import _find_local_video_for_aid
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            output_dir = Path(tmpdir) / "outputs"
+            output_dir.mkdir()
+            video_dir = output_dir / "yt123"
+            video_dir.mkdir()
+            expected = video_dir / "final.mp4"
+            expected.write_text("video")
+
+            config = SimpleNamespace(storage=SimpleNamespace(output_dir=str(output_dir)))
+            video = SimpleNamespace(
+                id="yt123",
+                output_dir=None,
+                metadata={"translated": {"title_translated": "测试标题"}},
+            )
+            db = MagicMock()
+            db.get_video.return_value = None
+            db.list_videos.return_value = [video]
+
+            uploader = MagicMock()
+            uploader.get_archive_detail.return_value = {
+                "archive": {"title": "测试标题 | #3", "source": "", "desc": ""}
+            }
+            uploader._get_full_desc.return_value = ""
+
+            path = _find_local_video_for_aid(123, config, db, uploader)
+
+            self.assertEqual(path, expected)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir)
 
 
 class TestDetermineToolsJobResult(TestCase):
@@ -178,6 +228,22 @@ class TestDetermineToolsJobResult(TestCase):
         status, error, progress = self.jm._determine_tools_job_result(job)
         self.assertEqual(status, JobStatus.FAILED)
 
+    def test_get_result_payload_parses_result_json_marker(self):
+        log_file = os.path.join(self.tmpdir, 'result.log')
+        Path(log_file).write_text('[RESULT_JSON] {"ok": true, "kind": "llm"}\n[SUCCESS] done')
+
+        with self.jm._get_connection() as conn:
+            conn.execute("""
+                INSERT INTO web_jobs (
+                    job_id, video_ids, steps, gpu_device, force, status, pid, log_file, created_at,
+                    task_type, task_params, cancel_requested
+                ) VALUES (?, '[]', '["test-center"]', 'auto', 0, 'completed', NULL, ?, CURRENT_TIMESTAMP, ?, ?, 0)
+            """, ('job-result', log_file, 'test-center', json.dumps({'kind': 'llm'})))
+
+        payload = self.jm.get_result_payload('job-result')
+
+        self.assertEqual(payload, {"ok": True, "kind": "llm"})
+
 
 class TestToolsJobLifecycle(TestCase):
     """测试 tools job 在 JobManager.update_job_status 中的状态收敛。"""
@@ -221,14 +287,19 @@ class TestToolsJobLifecycle(TestCase):
         self.assertEqual(job.status, JobStatus.COMPLETED)
         self.assertEqual(job.progress, 1.0)
 
-    def test_update_job_status_marks_tools_job_failed_from_failed_log(self):
-        self._insert_running_job("job-failed", "[FAILED] boom")
+    def test_update_job_status_marks_tools_job_failed_from_result_json_failure(self):
+        self._insert_running_job(
+            "job-result-failed",
+            '[RESULT_JSON] {"ok": false, "kind": "whisper", "error": "boom"}\n[FAILED] test-center:whisper: boom',
+        )
 
         with patch.object(self.jm, "_is_process_alive", return_value=False):
-            self.jm.update_job_status("job-failed")
+            self.jm.update_job_status("job-result-failed")
 
-        job = self.jm.get_job("job-failed")
+        job = self.jm.get_job("job-result-failed")
         self.assertEqual(job.status, JobStatus.FAILED)
+        self.assertEqual(job.error, 'test-center:whisper: boom')
+
         self.assertIn("boom", job.error)
 
     def test_update_job_status_prioritizes_cancel_requested_for_tools_job(self):
@@ -340,6 +411,28 @@ class TestToolsConfigPropagation(TestCase):
         self.assertEqual(captured['config_path'], 'config/custom.yaml')
 
 
+class TestToolsTestCenter(TestCase):
+    def test_failure_emits_failed_marker_and_result_json(self):
+        from click.testing import CliRunner
+        from vat.cli.tools import tools_test_center
+
+        with patch('vat.web.deps.set_web_config_path') as mock_set_config, \
+             patch('vat.web.services.test_center.run_whisper_check', side_effect=RuntimeError('boom')):
+            result = CliRunner().invoke(
+                tools_test_center,
+                ['--kind', 'whisper'],
+                obj={'config_path': 'config/custom.yaml'},
+                catch_exceptions=False,
+            )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn('[RESULT_JSON]', result.output)
+        self.assertIn('"ok": false', result.output)
+        self.assertIn('[FAILED]', result.output)
+        self.assertNotIn('[SUCCESS]', result.output)
+        mock_set_config.assert_called_once_with('config/custom.yaml')
+
+
 class TestWebJobToolsFields(TestCase):
     """测试 WebJob 的 tools 相关字段"""
 
@@ -440,7 +533,7 @@ class TestToolsTaskTypes(TestCase):
         expected = {
             'fix-violation', 'sync-playlist', 'refresh-playlist',
             'retranslate-playlist', 'upload-sync', 'update-info',
-            'sync-db', 'season-sync', 'watch',
+            'sync-db', 'season-sync', 'watch', 'test-center',
         }
         self.assertEqual(TOOLS_TASK_TYPES, expected)
 

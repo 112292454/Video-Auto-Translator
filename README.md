@@ -402,11 +402,12 @@ vat watch -p PLAYLIST_ID --gpu cuda:0 --concurrency 2
 | `vat tools update-info --playlist ID` | 批量更新已上传视频的标题和简介 |
 | `vat tools sync-db --season S --playlist ID` | 从B站合集同步信息回数据库 |
 | `vat tools season-sync --playlist ID` | 合集同步（添加+排序） |
+| `vat tools test-center --kind whisper` | 供 WebUI 测试中心调用的后台检测任务（LLM/ffmpeg/Whisper/视频探测） |
 | `vat watch -p PLAYLIST_ID` | 自动监控 Playlist 并处理新视频（持续运行） |
 | `vat watch -p PL1 -p PL2 -i 30` | 同时监控多个 Playlist，30 分钟间隔 |
 | `vat watch -p PLAYLIST_ID --once` | 单次检查后退出（可搭配系统 cron） |
 
-> `vat tools` 子命令与原有 CLI 命令功能相同，区别在于输出标准化进度标记（`[N%]`/`[SUCCESS]`/`[FAILED]`），可被 WebUI 的 JobManager 作为子进程调度和监控。
+> `vat tools` 子命令与原有 CLI 命令功能相同，区别在于输出标准化标记（`[N%]`/`[RESULT_JSON]`/`[SUCCESS]`/`[FAILED]`），可被 WebUI 的 JobManager 作为子进程调度和监控。
 
 ### 输出文件
 

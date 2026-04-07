@@ -38,7 +38,7 @@ def build_process_job_submitter(
         playlist_id: str,
         fail_fast: bool,
     ) -> Optional[str]:
-        return job_manager.submit_job(
+        return job_manager.submit_process_job(
             video_ids=video_ids,
             steps=steps,
             gpu_device=gpu_device,
@@ -46,7 +46,6 @@ def build_process_job_submitter(
             concurrency=concurrency,
             playlist_id=playlist_id,
             fail_fast=fail_fast,
-            task_type='process',
         )
 
     return submitter

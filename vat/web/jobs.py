@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from vat.utils.logger import setup_logger
 
 logger = setup_logger("web.jobs")
+RESULT_JSON_MARKER = "[RESULT_JSON]"
 
 
 class JobStatus(Enum):
@@ -42,6 +43,7 @@ TOOLS_TASK_TYPES = {
     'sync-db',
     'season-sync',
     'watch',
+    'test-center',
 }
 
 
@@ -255,7 +257,55 @@ class JobManager:
         
         logger.info(f"任务已提交: {job_id}, type={task_type}, 步骤: {steps}")
         return job_id
-    
+
+    def submit_process_job(
+        self,
+        *,
+        video_ids: List[str],
+        steps: List[str],
+        gpu_device: str = "auto",
+        force: bool = False,
+        concurrency: int = 1,
+        playlist_id: Optional[str] = None,
+        upload_cron: Optional[str] = None,
+        upload_batch_size: int = 1,
+        upload_mode: str = 'cron',
+        fail_fast: bool = False,
+        delay_start: int = 0,
+    ) -> str:
+        """通过显式 process 边界提交视频处理任务。"""
+        return self.submit_job(
+            video_ids=video_ids,
+            steps=steps,
+            gpu_device=gpu_device,
+            force=force,
+            concurrency=concurrency,
+            playlist_id=playlist_id,
+            upload_cron=upload_cron,
+            upload_batch_size=upload_batch_size,
+            upload_mode=upload_mode,
+            fail_fast=fail_fast,
+            delay_start=delay_start,
+            task_type='process',
+        )
+
+    def submit_tools_job(
+        self,
+        *,
+        task_type: str,
+        task_params: Optional[Dict] = None,
+        steps: Optional[List[str]] = None,
+    ) -> str:
+        """通过显式 tools 边界提交非 process 任务。"""
+        if task_type not in TOOLS_TASK_TYPES:
+            raise ValueError(f"Unknown tools task_type: {task_type}")
+        return self.submit_job(
+            video_ids=[],
+            steps=steps or [task_type],
+            task_type=task_type,
+            task_params=task_params,
+        )
+
     def _start_job_process(
         self,
         job_id: str,
@@ -402,14 +452,17 @@ class JobManager:
         config_path: Optional[str] = None,
     ) -> List[str]:
         """根据 task_type 和 params 构建 vat tools <subcommand> 命令
-        
+
         每个 task_type 对应一个 vat tools 子命令，参数从 params dict 映射到 CLI 选项。
         """
+        if task_type not in TOOLS_TASK_TYPES:
+            raise ValueError(f"Unknown tools task_type: {task_type}")
+
         cmd = [sys.executable, "-m", "vat"]
         if config_path:
             cmd.extend(["-c", config_path])
         cmd.extend(["tools", task_type])
-        
+
         # 通用映射：params 中的 key 转换为 CLI 选项
         # 布尔值 True → --flag，False → 不加
         # 其他值 → --key value
@@ -462,8 +515,14 @@ class JobManager:
                 'force': '--force',
                 'fail_fast': '--fail-fast',
             },
+            'test-center': {
+                'kind': '--kind',
+                'target_id': '--target-id',
+                'video_id': '--video-id',
+                'path': '--path',
+            },
         }
-        
+
         mapping = PARAM_MAP.get(task_type, {})
         for key, flag in mapping.items():
             value = params.get(key)
@@ -478,7 +537,7 @@ class JobManager:
                     cmd.extend([flag, str(item)])
             else:
                 cmd.extend([flag, str(value)])
-        
+
         return cmd
     
     def get_job(self, job_id: str) -> Optional[WebJob]:
@@ -1088,7 +1147,31 @@ class JobManager:
                 return [line.rstrip() for line in lines[-tail_lines:]]
         except Exception as e:
             return [f"读取日志失败: {e}"]
-    
+
+    def get_result_payload(self, job_id: str) -> Optional[Dict]:
+        """从 job 日志中的 [RESULT_JSON] 标记解析结构化结果。"""
+        job = self.get_job(job_id)
+        if not job or not job.log_file:
+            return None
+
+        log_path = Path(job.log_file)
+        if not log_path.exists():
+            return None
+
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                for raw_line in reversed(f.readlines()):
+                    line = raw_line.strip()
+                    if not line.startswith(RESULT_JSON_MARKER):
+                        continue
+                    payload_text = line[len(RESULT_JSON_MARKER):].strip()
+                    if not payload_text:
+                        return None
+                    return json.loads(payload_text)
+        except Exception as exc:
+            logger.warning(f"解析 job 结果失败: job={job_id}, error={exc}")
+        return None
+
     def delete_job(self, job_id: str) -> bool:
         """删除任务记录（仅删除已完成/失败/取消的任务）"""
         job = self.get_job(job_id)

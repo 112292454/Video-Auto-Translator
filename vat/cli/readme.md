@@ -112,6 +112,7 @@ vat process -p <playlist_id> --stages upload --dry-run
 `vat tools` 为 WebUI 的 JobManager 提供标准化输出格式：
 
 - `[N%]` — 进度百分比
+- `[RESULT_JSON]` — 结构化结果（供 WebUI 轮询读取）
 - `[SUCCESS]` — 任务成功
 - `[FAILED]` — 任务失败
 

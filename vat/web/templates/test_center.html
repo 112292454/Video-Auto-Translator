@@ -832,6 +832,28 @@ function testCenterPage() {
             return data;
         },
 
+        sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        },
+
+        normalizeJobResult(jobState, fallbackMessage) {
+            if (jobState.result) return jobState.result;
+            return {
+                ok: false,
+                error: jobState.message || fallbackMessage || '任务执行失败',
+            };
+        },
+
+        async waitForTestJob(jobId) {
+            while (true) {
+                const jobState = await this.fetchJson(`/api/test-center/jobs/${jobId}`);
+                if (['completed', 'failed', 'cancelled'].includes(jobState.status)) {
+                    return jobState;
+                }
+                await this.sleep(1000);
+            }
+        },
+
         formatJson(value) {
             if (!value) return '';
             try {
@@ -885,11 +907,13 @@ function testCenterPage() {
         async runLlmTarget(targetId) {
             this.llmRunning[targetId] = true;
             try {
-                const result = await this.fetchJson('/api/test-center/llm/run', {
+                const submission = await this.fetchJson('/api/test-center/llm/run', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({target_id: targetId}),
                 });
+                const jobState = await this.waitForTestJob(submission.job_id);
+                const result = this.normalizeJobResult(jobState, `测试任务失败：${targetId}`);
                 this.llmResults[targetId] = result;
                 this.selectedLlmTargetId = targetId;
                 showToast(result.ok ? `测试成功：${targetId}` : `测试失败：${targetId}`, result.ok ? 'success' : 'warning');
@@ -903,7 +927,9 @@ function testCenterPage() {
         async runAllLlmTargets() {
             this.llmLoadingAll = true;
             try {
-                const result = await this.fetchJson('/api/test-center/llm/run-all', {method: 'POST'});
+                const submission = await this.fetchJson('/api/test-center/llm/run-all', {method: 'POST'});
+                const jobState = await this.waitForTestJob(submission.job_id);
+                const result = this.normalizeJobResult(jobState, '全部 LLM 测试任务失败');
                 for (const item of result.results || []) {
                     this.llmResults[item.target_id] = item;
                 }
@@ -1275,7 +1301,9 @@ function testCenterPage() {
         async runEnvironmentCheck(kind) {
             this.environmentLoading = kind;
             try {
-                this.environmentResult = await this.fetchJson(`/api/test-center/environment/${kind}`, { method: 'POST' });
+                const submission = await this.fetchJson(`/api/test-center/environment/${kind}`, { method: 'POST' });
+                const jobState = await this.waitForTestJob(submission.job_id);
+                this.environmentResult = this.normalizeJobResult(jobState, `检测任务失败：${kind}`);
                 showToast(this.environmentResult.ok === false ? `检测失败：${kind}` : `检测完成：${kind}`, this.environmentResult.ok === false ? 'warning' : 'success');
             } catch (error) {
                 showToast(error.message, 'error');
@@ -1287,11 +1315,13 @@ function testCenterPage() {
         async runVideoProbe() {
             this.environmentLoading = 'video';
             try {
-                this.environmentResult = await this.fetchJson('/api/test-center/environment/video-probe', {
+                const submission = await this.fetchJson('/api/test-center/environment/video-probe', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ path: this.videoProbePath, video_id: this.videoProbeId }),
                 });
+                const jobState = await this.waitForTestJob(submission.job_id);
+                this.environmentResult = this.normalizeJobResult(jobState, '视频检测任务失败');
                 showToast(this.environmentResult.ok === false ? '视频检测失败' : '视频检测完成', this.environmentResult.ok === false ? 'warning' : 'success');
             } catch (error) {
                 showToast(error.message, 'error');

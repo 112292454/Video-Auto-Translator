@@ -5,7 +5,9 @@ services 模块单元测试
 """
 import os
 import tempfile
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 import pytest
 from vat.database import Database
 from vat.models import (
@@ -139,7 +141,56 @@ class TestPlaylistProgress:
         assert wh['failed'] == 1
 
 
-class TestManualPlaylistAndVideoInfo:
+class TestBilibiliSupport:
+
+    def test_build_bilibili_uploader_preserves_read_only_and_upload_modes(self, monkeypatch):
+        from vat.services.bilibili_support import build_bilibili_uploader
+
+        fake_config = SimpleNamespace(
+            uploader=SimpleNamespace(
+                bilibili=SimpleNamespace(
+                    cookies_file="data/bili.json",
+                    line="ws",
+                    threads=8,
+                    upload_interval=12,
+                )
+            ),
+            storage=SimpleNamespace(database_path="/tmp/vat.db"),
+            concurrency=SimpleNamespace(max_concurrent_uploads=5),
+        )
+
+        calls = []
+
+        def fake_uploader(**kwargs):
+            calls.append(kwargs)
+            return kwargs
+
+        monkeypatch.setattr("vat.services.bilibili_support.BilibiliUploader", fake_uploader)
+
+        read_only = build_bilibili_uploader(
+            fake_config,
+            with_upload_params=False,
+            project_root=Path("/repo"),
+        )
+        upload_ready = build_bilibili_uploader(
+            fake_config,
+            with_upload_params=True,
+            project_root=Path("/repo"),
+        )
+
+        assert read_only["cookies_file"] == "/repo/data/bili.json"
+        assert read_only["lock_db_path"] == "/tmp/vat.db"
+        assert read_only["upload_interval"] == 12
+        assert read_only["max_concurrent_uploads"] == 5
+        assert "line" not in read_only
+        assert "threads" not in read_only
+
+        assert upload_ready["line"] == "ws"
+        assert upload_ready["threads"] == 8
+        assert upload_ready["cookies_file"] == "/repo/data/bili.json"
+        assert calls == [read_only, upload_ready]
+
+
 
     def test_create_manual_playlist_persists_metadata(self, db):
         service = PlaylistService(db)

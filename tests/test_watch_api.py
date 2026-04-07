@@ -298,17 +298,66 @@ class TestStopSession:
         resp = await tc.post("/api/watch/sessions/s1/stop")
         assert resp.status_code == 400
     
+
+
+class _FakeWatchJobManager:
+    def __init__(self):
+        self.submit_tools_calls = []
+
+    def submit_job(self, **kwargs):
+        raise AssertionError("watch route 应通过 submit_tools_job 边界提交 tools 任务")
+
+    def submit_tools_job(self, **kwargs):
+        self.submit_tools_calls.append(kwargs)
+        return "job-watch-1"
+
+
+class TestStartWatch:
+
     @pytest.mark.anyio
-    @patch('vat.web.routes.watch.WatchService._is_pid_alive', return_value=False)
-    async def test_stop_dead_process(self, mock_alive, client):
-        """进程已死时标记为 stopped"""
-        tc, db_path = client
-        _insert_session(db_path, "s1", ["PL_A"], status="running", pid=99999)
-        
-        resp = await tc.post("/api/watch/sessions/s1/stop")
+    async def test_start_watch_submits_tools_job(self, client, monkeypatch):
+        tc, _ = client
+        job_manager = _FakeWatchJobManager()
+
+        class _FakePlaylistService:
+            def __init__(self, db, config):
+                self.db = db
+                self.config = config
+
+            def get_playlist(self, playlist_id):
+                return {"id": playlist_id}
+
+        monkeypatch.setattr("vat.web.routes.watch._get_job_manager", lambda: job_manager)
+        monkeypatch.setattr("vat.web.routes.watch.get_web_config", lambda: object())
+        monkeypatch.setattr("vat.services.PlaylistService", _FakePlaylistService)
+
+        resp = await tc.post(
+            "/api/watch/start",
+            json={
+                "playlist_ids": ["PL1", "PL2"],
+                "interval": 120,
+                "stages": "download,translate",
+                "gpu_device": "cuda:0",
+                "concurrency": 2,
+                "force": True,
+                "fail_fast": True,
+                "once": True,
+            },
+        )
+
         assert resp.status_code == 200
-        assert "已不存在" in resp.json()['message']
-        
-        # 验证状态已更新
-        resp2 = await tc.get("/api/watch/sessions/s1")
-        assert resp2.json()['status'] == 'stopped'
+        assert resp.json() == {"job_id": "job-watch-1", "message": "Watch 任务已提交"}
+        assert job_manager.submit_tools_calls == [{
+            "task_type": "watch",
+            "task_params": {
+                "playlist_ids": ["PL1", "PL2"],
+                "once": True,
+                "force": True,
+                "fail_fast": True,
+                "interval": 120,
+                "stages": "download,translate",
+                "gpu": "cuda:0",
+                "concurrency": 2,
+            },
+            "steps": [],
+        }]

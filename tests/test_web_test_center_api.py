@@ -1,8 +1,12 @@
 """web 测试中心 API 契约测试。"""
 
+from datetime import datetime
+
 import httpx
 import pytest
 from fastapi import FastAPI
+
+from vat.web.jobs import JobStatus, WebJob
 
 
 @pytest.fixture(params=["asyncio"])
@@ -21,7 +25,154 @@ def client(app):
     return httpx.AsyncClient(transport=transport, base_url="http://testserver")
 
 
-class TestWebTestCenterApi:
+def _make_job(
+    job_id,
+    *,
+    status=JobStatus.RUNNING,
+    progress=0.0,
+    error=None,
+    task_type="test-center",
+    task_params=None,
+):
+    return WebJob(
+        job_id=job_id,
+        video_ids=[],
+        steps=[task_type],
+        gpu_device="auto",
+        force=False,
+        status=status,
+        pid=4321 if status == JobStatus.RUNNING else None,
+        log_file=None,
+        progress=progress,
+        error=error,
+        created_at=datetime(2026, 4, 5, 12, 0, 0),
+        started_at=None,
+        finished_at=None,
+        task_type=task_type,
+        task_params=task_params or {},
+        cancel_requested=False,
+    )
+
+
+class _FakeJobManager:
+    def __init__(self):
+        self.jobs = {}
+        self.results = {}
+        self.submit_tools_calls = []
+        self.update_calls = []
+        self.log_lines = {}
+
+    def submit_job(self, **kwargs):
+        raise AssertionError("test-center route 应通过 submit_tools_job 边界提交 tools 任务")
+
+    def submit_tools_job(self, **kwargs):
+        self.submit_tools_calls.append(kwargs)
+        job_id = f"job-{len(self.submit_tools_calls)}"
+        self.jobs[job_id] = _make_job(
+            job_id,
+            status=JobStatus.RUNNING,
+            task_type=kwargs.get("task_type", "test-center"),
+            task_params=kwargs.get("task_params", {}),
+        )
+        return job_id
+
+    def update_job_status(self, job_id):
+        self.update_calls.append(job_id)
+
+    def get_job(self, job_id):
+        return self.jobs.get(job_id)
+
+    def get_result_payload(self, job_id):
+        return self.results.get(job_id)
+
+    def get_log_content(self, job_id, tail_lines=3):
+        return self.log_lines.get(job_id, [])
+
+    def find_latest_job(self, task_type, task_params_subset=None, statuses=None, limit=200):
+        expected = task_params_subset or {}
+        allowed = set(statuses or [])
+        for job in self.jobs.values():
+            if job.task_type != task_type:
+                continue
+            if allowed and job.status not in allowed:
+                continue
+            params = job.task_params or {}
+            if all(params.get(key) == value for key, value in expected.items()):
+                return job
+        return None
+
+
+
+
+class TestJobSupportContracts:
+    def test_submit_or_reuse_job_reuses_active_job(self):
+        from vat.web.routes.job_support import submit_or_reuse_job
+
+        job_manager = _FakeJobManager()
+        running_job = _make_job(
+            "job-existing",
+            status=JobStatus.RUNNING,
+            task_params={"kind": "llm", "target_id": "translate"},
+        )
+        job_manager.jobs[running_job.job_id] = running_job
+
+        result = submit_or_reuse_job(
+            job_manager,
+            task_type="test-center",
+            task_params={"kind": "llm", "target_id": "translate"},
+            active_statuses=[JobStatus.PENDING, JobStatus.RUNNING],
+            steps=["test-center"],
+            limit=20,
+        )
+
+        assert result == {"job_id": "job-existing", "status": "running"}
+        assert job_manager.update_calls == ["job-existing"]
+        assert job_manager.submit_tools_calls == []
+
+
+    def test_submit_or_reuse_job_uses_submit_tools_boundary(self):
+        from vat.web.routes.job_support import submit_or_reuse_job
+
+        job_manager = _FakeJobManager()
+
+        result = submit_or_reuse_job(
+            job_manager,
+            task_type="test-center",
+            task_params={"kind": "llm-all"},
+            steps=["test-center"],
+            limit=20,
+        )
+
+        assert result == {"job_id": "job-1", "status": "submitted"}
+
+
+    def test_build_job_status_payload_supports_result_loader(self):
+        from vat.web.routes.job_support import build_job_status_payload
+
+        job_manager = _FakeJobManager()
+        job_manager.jobs["job-1"] = _make_job(
+            "job-1",
+            status=JobStatus.COMPLETED,
+            progress=1.0,
+            error=None,
+            task_params={"kind": "llm-all"},
+        )
+        job_manager.results["job-1"] = {"ok": True}
+
+        payload = build_job_status_payload(
+            job_manager,
+            "job-1",
+            result_loader=job_manager.get_result_payload,
+        )
+
+        assert payload == {
+            "job_id": "job-1",
+            "status": "completed",
+            "progress": 1.0,
+            "message": "",
+            "result": {"ok": True},
+        }
+
     @pytest.mark.anyio
     async def test_list_llm_targets_returns_service_payload(self, app, client, monkeypatch):
         from vat.web.routes.test_center import router
@@ -44,59 +195,69 @@ class TestWebTestCenterApi:
         assert [item["id"] for item in response.json()["targets"]] == ["translate", "optimize"]
 
     @pytest.mark.anyio
-    async def test_run_llm_target_dispatches_request_body(self, app, client, monkeypatch):
+    async def test_run_llm_target_submits_background_job(self, app, client, monkeypatch):
         from vat.web.routes.test_center import router
 
-        captured = {}
+        job_manager = _FakeJobManager()
         app.include_router(router)
-
-        def fake_run(target_id):
-            captured["target_id"] = target_id
-            return {"target_id": target_id, "ok": True, "response_text": "OK"}
-
+        monkeypatch.setattr("vat.web.routes.test_center.get_job_manager", lambda: job_manager, raising=False)
         monkeypatch.setattr(
             "vat.web.routes.test_center.test_center_service.run_llm_connectivity_test",
-            fake_run,
+            lambda target_id: (_ for _ in ()).throw(AssertionError("should not call service inline")),
         )
 
         async with client as ac:
             response = await ac.post("/api/test-center/llm/run", json={"target_id": "translate"})
 
         assert response.status_code == 200
-        assert captured["target_id"] == "translate"
-        assert response.json()["response_text"] == "OK"
+        assert response.json()["job_id"] == "job-1"
+        assert response.json()["status"] == "submitted"
+        assert job_manager.submit_tools_calls == [
+            {
+                "task_type": "test-center",
+                "task_params": {"kind": "llm", "target_id": "translate"},
+                "steps": ["test-center"],
+            }
+        ]
 
     @pytest.mark.anyio
-    async def test_run_llm_target_returns_structured_error_when_service_raises(self, app, client, monkeypatch):
+    async def test_run_llm_target_reuses_existing_running_job(self, app, client, monkeypatch):
         from vat.web.routes.test_center import router
 
+        job_manager = _FakeJobManager()
         app.include_router(router)
-        monkeypatch.setattr(
-            "vat.web.routes.test_center.test_center_service.run_llm_connectivity_test",
-            lambda target_id: (_ for _ in ()).throw(ValueError(f"boom:{target_id}")),
+        running_job = _make_job(
+            "job-existing",
+            status=JobStatus.RUNNING,
+            task_params={"kind": "llm", "target_id": "translate"},
         )
+        job_manager.jobs[running_job.job_id] = running_job
+        monkeypatch.setattr("vat.web.routes.test_center.get_job_manager", lambda: job_manager, raising=False)
 
         async with client as ac:
             response = await ac.post("/api/test-center/llm/run", json={"target_id": "translate"})
 
         assert response.status_code == 200
-        assert response.json() == {"ok": False, "error": "boom:translate"}
+        assert response.json()["job_id"] == "job-existing"
+        assert response.json()["status"] == "running"
+        assert job_manager.submit_tools_calls == []
+
 
     @pytest.mark.anyio
-    async def test_run_all_llm_targets_dispatches_service(self, app, client, monkeypatch):
+    async def test_run_all_llm_targets_submits_background_job(self, app, client, monkeypatch):
         from vat.web.routes.test_center import router
 
+        job_manager = _FakeJobManager()
         app.include_router(router)
-        monkeypatch.setattr(
-            "vat.web.routes.test_center.test_center_service.run_all_llm_connectivity_tests",
-            lambda: {"results": [{"target_id": "split", "ok": True}]},
-        )
+        monkeypatch.setattr("vat.web.routes.test_center.get_job_manager", lambda: job_manager, raising=False)
 
         async with client as ac:
             response = await ac.post("/api/test-center/llm/run-all")
 
         assert response.status_code == 200
-        assert response.json()["results"][0]["target_id"] == "split"
+        assert response.json()["job_id"] == "job-1"
+        assert response.json()["status"] == "submitted"
+        assert job_manager.submit_tools_calls[0]["task_params"] == {"kind": "llm-all"}
 
     @pytest.mark.anyio
     async def test_prompt_preview_returns_service_result(self, app, client, monkeypatch):
@@ -328,31 +489,81 @@ class TestWebTestCenterApi:
     async def test_run_ffmpeg_check_calls_service(self, app, client, monkeypatch):
         from vat.web.routes.test_center import router
 
+        job_manager = _FakeJobManager()
         app.include_router(router)
-        monkeypatch.setattr(
-            "vat.web.routes.test_center.test_center_service.run_ffmpeg_check",
-            lambda: {"ok": True, "ffmpeg": {"available": True}},
-        )
+        monkeypatch.setattr("vat.web.routes.test_center.get_job_manager", lambda: job_manager, raising=False)
 
         async with client as ac:
             response = await ac.post("/api/test-center/environment/ffmpeg")
 
         assert response.status_code == 200
-        assert response.json()["ffmpeg"]["available"] is True
+        assert response.json()["job_id"] == "job-1"
+        assert response.json()["status"] == "submitted"
+        assert job_manager.submit_tools_calls[0]["task_params"] == {"kind": "ffmpeg"}
 
     @pytest.mark.anyio
-    async def test_run_whisper_check_calls_service(self, app, client, monkeypatch):
+    async def test_run_whisper_check_submits_background_job(self, app, client, monkeypatch):
         from vat.web.routes.test_center import router
 
+        job_manager = _FakeJobManager()
         app.include_router(router)
-        monkeypatch.setattr(
-            "vat.web.routes.test_center.test_center_service.run_whisper_check",
-            lambda: {"ok": True, "transcription": {"segments": 0}, "model_source": {"repo_id": "large-v3"}},
-        )
+        monkeypatch.setattr("vat.web.routes.test_center.get_job_manager", lambda: job_manager, raising=False)
 
         async with client as ac:
             response = await ac.post("/api/test-center/environment/whisper")
 
         assert response.status_code == 200
-        assert response.json()["transcription"]["segments"] == 0
-        assert response.json()["model_source"]["repo_id"] == "large-v3"
+        assert response.json()["job_id"] == "job-1"
+        assert response.json()["status"] == "submitted"
+        assert job_manager.submit_tools_calls[0]["task_params"] == {"kind": "whisper"}
+
+    @pytest.mark.anyio
+    async def test_run_video_probe_submits_background_job(self, app, client, monkeypatch):
+        from vat.web.routes.test_center import router
+
+        job_manager = _FakeJobManager()
+        app.include_router(router)
+        monkeypatch.setattr("vat.web.routes.test_center.get_job_manager", lambda: job_manager, raising=False)
+
+        async with client as ac:
+            response = await ac.post(
+                "/api/test-center/environment/video-probe",
+                json={"video_id": "vid-1", "path": "/tmp/sample.mp4"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["job_id"] == "job-1"
+        assert response.json()["status"] == "submitted"
+        assert job_manager.submit_tools_calls[0]["task_params"] == {
+            "kind": "video-probe",
+            "video_id": "vid-1",
+            "path": "/tmp/sample.mp4",
+        }
+
+    @pytest.mark.anyio
+    async def test_get_test_job_status_returns_result_payload(self, app, client, monkeypatch):
+        from vat.web.routes.test_center import router
+
+        job_manager = _FakeJobManager()
+        app.include_router(router)
+        job = _make_job(
+            "job-1",
+            status=JobStatus.COMPLETED,
+            progress=1.0,
+            task_params={"kind": "whisper"},
+        )
+        job_manager.jobs[job.job_id] = job
+        job_manager.results[job.job_id] = {"ok": True, "transcription": {"segments": 3}}
+        monkeypatch.setattr("vat.web.routes.test_center.get_job_manager", lambda: job_manager, raising=False)
+
+        async with client as ac:
+            response = await ac.get("/api/test-center/jobs/job-1")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "job_id": "job-1",
+            "status": "completed",
+            "progress": 1.0,
+            "message": "",
+            "result": {"ok": True, "transcription": {"segments": 3}},
+        }

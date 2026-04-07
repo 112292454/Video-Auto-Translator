@@ -1175,7 +1175,7 @@ class TestProcessJobSubmitterConfigPropagation:
                     "config_path": config_path,
                 }
 
-            def submit_job(self, **kwargs):
+            def submit_process_job(self, **kwargs):
                 captured["submit"] = kwargs
                 return "job-123"
 
@@ -1194,4 +1194,12 @@ class TestProcessJobSubmitterConfigPropagation:
         assert job_id == "job-123"
         assert captured["init"]["db_path"] == "/tmp/custom.db"
         assert captured["init"]["config_path"] == "config/custom.yaml"
-        assert captured["submit"]["task_type"] == "process"
+        assert captured["submit"] == {
+            "video_ids": ["vid1"],
+            "steps": ["download"],
+            "gpu_device": "auto",
+            "force": False,
+            "concurrency": 1,
+            "playlist_id": "PL1",
+            "fail_fast": False,
+        }

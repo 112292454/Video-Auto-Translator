@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
+from vat.web.jobs import JobStatus
+from vat.web.routes.job_support import build_job_status_payload, submit_or_reuse_job
+from vat.web.routes.tasks import get_job_manager
 from vat.web.services import test_center as test_center_service
 
 router = APIRouter(prefix="/api/test-center", tags=["test-center"])
@@ -39,11 +42,18 @@ class VideoProbeRequest(BaseModel):
     path: str = ""
 
 
-async def _run_safe_test(func, *args):
-    try:
-        return await run_in_threadpool(func, *args)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+_ACTIVE_JOB_STATUSES = [JobStatus.PENDING, JobStatus.RUNNING]
+
+
+def _submit_test_center_job(task_params: Dict[str, Any]) -> Dict[str, Any]:
+    return submit_or_reuse_job(
+        get_job_manager(),
+        task_type="test-center",
+        task_params=task_params,
+        steps=["test-center"],
+        active_statuses=_ACTIVE_JOB_STATUSES,
+        limit=20,
+    )
 
 
 @router.get("/llm/targets")
@@ -53,15 +63,15 @@ async def list_llm_targets():
 
 @router.post("/llm/run")
 async def run_llm_target(body: RunTargetRequest):
-    return await _run_safe_test(
-        test_center_service.run_llm_connectivity_test,
-        body.target_id,
+    return await run_in_threadpool(
+        _submit_test_center_job,
+        {"kind": "llm", "target_id": body.target_id},
     )
 
 
 @router.post("/llm/run-all")
 async def run_all_llm_targets():
-    return await _run_safe_test(test_center_service.run_all_llm_connectivity_tests)
+    return await run_in_threadpool(_submit_test_center_job, {"kind": "llm-all"})
 
 
 @router.post("/prompt-preview")
@@ -121,18 +131,31 @@ async def restore_upload_config(body: RestoreConfigRequest):
 
 @router.post("/environment/ffmpeg")
 async def run_ffmpeg_check():
-    return await _run_safe_test(test_center_service.run_ffmpeg_check)
+    return await run_in_threadpool(_submit_test_center_job, {"kind": "ffmpeg"})
 
 
 @router.post("/environment/whisper")
 async def run_whisper_check():
-    return await _run_safe_test(test_center_service.run_whisper_check)
+    return await run_in_threadpool(_submit_test_center_job, {"kind": "whisper"})
 
 
 @router.post("/environment/video-probe")
 async def run_video_probe(body: VideoProbeRequest):
-    return await _run_safe_test(
-        test_center_service.run_video_probe,
-        body.video_id,
-        body.path,
+    return await run_in_threadpool(
+        _submit_test_center_job,
+        {"kind": "video-probe", "video_id": body.video_id, "path": body.path},
     )
+
+
+@router.get("/jobs/{job_id}")
+async def get_test_center_job_status(job_id: str):
+    job_manager = get_job_manager()
+    payload = await run_in_threadpool(
+        build_job_status_payload,
+        job_manager,
+        job_id,
+        result_loader=job_manager.get_result_payload,
+    )
+    if not payload:
+        raise HTTPException(404, "Test center job not found")
+    return payload

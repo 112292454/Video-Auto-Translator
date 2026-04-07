@@ -4,6 +4,7 @@ CLI tools 子命令组
 提供统一的 tools 入口，支持 JobManager 作为子进程调用。
 每个子命令包装现有功能逻辑，输出标准化进度标记：
   - [N%]      进度百分比
+  - [RESULT_JSON] 结构化结果
   - [SUCCESS]  任务成功完成
   - [FAILED]   任务失败
 
@@ -16,12 +17,16 @@ CLI tools 子命令组
   vat tools update-info --playlist PL_xxx
   vat tools sync-db --season 12345 --playlist PL_xxx
   vat tools season-sync --playlist PL_xxx
+  vat tools test-center --kind whisper
 """
+import json
+import traceback
 import sys
 import click
 from pathlib import Path
 
 from .commands import cli, get_config, get_logger
+from ..services.bilibili_support import build_bilibili_uploader, find_local_video_for_aid
 
 
 def _emit(msg: str):
@@ -45,6 +50,11 @@ def _progress(pct: int):
     _emit(f"[{pct}%]")
 
 
+def _emit_result_json(payload):
+    """输出结构化结果，供 WebUI 轮询接口解析。"""
+    _emit(f"[RESULT_JSON] {json.dumps(payload, ensure_ascii=False)}")
+
+
 def _get_config_and_db(ctx):
     """获取 config 和 db 实例"""
     from ..config import load_config
@@ -57,17 +67,10 @@ def _get_config_and_db(ctx):
 
 def _get_bilibili_uploader(config):
     """创建 BilibiliUploader 实例"""
-    from ..uploaders.bilibili import BilibiliUploader
-    bilibili_config = config.uploader.bilibili
-    project_root = Path(__file__).parent.parent.parent
-    cookies_file = project_root / bilibili_config.cookies_file
-    return BilibiliUploader(
-        cookies_file=str(cookies_file),
-        line=bilibili_config.line,
-        threads=bilibili_config.threads,
-        lock_db_path=config.storage.database_path,
-        upload_interval=bilibili_config.upload_interval,
-        max_concurrent_uploads=getattr(config.concurrency, "max_concurrent_uploads", 1),
+    return build_bilibili_uploader(
+        config,
+        with_upload_params=True,
+        project_root=Path(__file__).parent.parent.parent,
     )
 
 
@@ -85,6 +88,58 @@ def _get_playlist_service(config, db):
 def tools():
     """工具任务（支持 job 化管理，可由 WebUI 或 CLI 发起）"""
     pass
+
+
+@tools.command('test-center')
+@click.option(
+    '--kind',
+    required=True,
+    type=click.Choice(['llm', 'llm-all', 'ffmpeg', 'whisper', 'video-probe']),
+    help='测试中心任务类型',
+)
+@click.option('--target-id', default='', help='LLM 测试目标 ID')
+@click.option('--video-id', default='', help='视频探测用的视频 ID')
+@click.option('--path', 'probe_path', default='', type=click.Path(), help='视频探测用的文件路径')
+@click.pass_context
+def tools_test_center(ctx, kind, target_id, video_id, probe_path):
+    """执行测试中心任务（供 WebUI 通过 JobManager 子进程调用）。"""
+    from ..web.deps import set_web_config_path
+    from ..web.services import test_center as test_center_service
+
+    config_path = ctx.obj.get('config_path') if ctx.obj else None
+    set_web_config_path(config_path)
+
+    try:
+        _progress(5)
+
+        if kind == 'llm':
+            if not target_id:
+                raise click.ClickException('--target-id 不能为空')
+            result = test_center_service.run_llm_connectivity_test(target_id)
+        elif kind == 'llm-all':
+            result = test_center_service.run_all_llm_connectivity_tests()
+        elif kind == 'ffmpeg':
+            result = test_center_service.run_ffmpeg_check()
+        elif kind == 'whisper':
+            result = test_center_service.run_whisper_check()
+        elif kind == 'video-probe':
+            result = test_center_service.run_video_probe(video_id=video_id, path=probe_path)
+        else:
+            raise click.ClickException(f'未知测试类型: {kind}')
+
+        _emit_result_json(result)
+        _progress(100)
+        _success(f'test-center:{kind}')
+    except Exception as exc:
+        result = {
+            'ok': False,
+            'error': str(exc),
+            'traceback': traceback.format_exc(),
+            'kind': kind,
+        }
+        _emit_result_json(result)
+        _progress(100)
+        _failed(f'test-center:{kind}: {exc}')
 
 
 # =============================================================================
@@ -272,39 +327,8 @@ def _post_fix_actions(db, uploader, config, aid: int):
 
 
 def _find_local_video_for_aid(aid, config, db, uploader):
-    """通过 B站稿件信息查找本地视频文件（复用 CLI 的查找逻辑）"""
-    import re
-
-    try:
-        detail = uploader.get_archive_detail(aid)
-        if detail:
-            archive = detail.get('archive', {})
-            source = archive.get('source', '')
-            desc = archive.get('desc', '')
-            full_desc = uploader._get_full_desc(aid)
-
-            yt_video_id = None
-            for text in [source, full_desc or desc, desc]:
-                yt_match = re.search(r'youtube\.com/watch\?v=([a-zA-Z0-9_-]+)', text)
-                if yt_match:
-                    yt_video_id = yt_match.group(1)
-                    break
-
-            if yt_video_id:
-                video = db.get_video(yt_video_id)
-                if video:
-                    candidates = []
-                    if video.output_dir:
-                        candidates.append(Path(video.output_dir) / "final.mp4")
-                    vid_dir = Path(config.storage.output_dir) / video.id
-                    candidates.append(vid_dir / "final.mp4")
-                    candidates.append(vid_dir / f"{video.id}.mp4")
-                    for c in candidates:
-                        if c.exists():
-                            return c
-    except Exception:
-        pass
-    return None
+    """通过 B站稿件信息查找本地视频文件。"""
+    return find_local_video_for_aid(aid, config, db, uploader)
 
 
 # =============================================================================

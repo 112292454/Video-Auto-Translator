@@ -196,7 +196,7 @@ async def execute_task(
                 db.invalidate_downstream_tasks(video_id, first_step)
     
     # 提交任务（启动子进程）
-    job_id = job_manager.submit_job(
+    job_id = job_manager.submit_process_job(
         video_ids=request.video_ids,
         steps=steps,
         gpu_device=request.gpu_device,
@@ -207,7 +207,7 @@ async def execute_task(
         upload_batch_size=request.upload_batch_size,
         upload_mode=request.upload_mode,
         fail_fast=request.fail_fast,
-        delay_start=request.delay_start
+        delay_start=request.delay_start,
     )
     
     # 生成等价 CLI 命令（可选）
@@ -340,20 +340,27 @@ async def retry_task(
     if job.status == JobStatus.RUNNING:
         raise HTTPException(400, "Task is still running")
     
-    # 使用原任务的参数创建新任务
-    # task_params 已包含所有 task-specific 参数（playlist_id, upload_mode 等），
-    # 通用参数从 WebJob 字段读取
-    new_job_id = job_manager.submit_job(
-        video_ids=job.video_ids,
-        steps=job.steps,
-        gpu_device=job.gpu_device,
-        force=job.force,
-        concurrency=job.concurrency,
-        upload_cron=job.upload_cron,
-        fail_fast=job.fail_fast,
-        task_type=job.task_type,
-        task_params=job.task_params,
-    )
+    task_params = job.task_params or {}
+    if job.task_type == 'process':
+        new_job_id = job_manager.submit_process_job(
+            video_ids=job.video_ids,
+            steps=job.steps,
+            gpu_device=job.gpu_device,
+            force=job.force,
+            concurrency=job.concurrency,
+            playlist_id=task_params.get('playlist_id'),
+            upload_cron=job.upload_cron,
+            upload_batch_size=task_params.get('upload_batch_size', 1),
+            upload_mode=task_params.get('upload_mode', 'cron'),
+            fail_fast=job.fail_fast,
+            delay_start=task_params.get('delay_start', 0),
+        )
+    else:
+        new_job_id = job_manager.submit_tools_job(
+            task_type=job.task_type,
+            task_params=task_params,
+            steps=job.steps,
+        )
     
     return {
         "status": "submitted",

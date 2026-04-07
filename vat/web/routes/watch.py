@@ -178,11 +178,10 @@ async def start_watch(req: WatchStartRequest):
     if req.concurrency is not None:
         task_params['concurrency'] = req.concurrency
     
-    job_id = job_manager.submit_job(
-        video_ids=[],
-        steps=[],
+    job_id = job_manager.submit_tools_job(
         task_type='watch',
         task_params=task_params,
+        steps=[],
     )
     
     return {"job_id": job_id, "message": "Watch 任务已提交"}

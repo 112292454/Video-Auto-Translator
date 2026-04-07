@@ -411,6 +411,60 @@ class TestTaskParamsPersistence:
         finally:
             shutil.rmtree(tmpdir)
 
+    def test_submit_process_job_uses_process_boundary(self):
+        """submit_process_job 应固定 process 边界并合并 process 参数。"""
+        import tempfile, shutil
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmpdir, "test.db")
+            log_dir = os.path.join(tmpdir, "logs")
+            jm = JobManager(db_path, log_dir)
+
+            from unittest.mock import patch
+            with patch.object(jm, '_start_job_process'):
+                job_id = jm.submit_process_job(
+                    video_ids=["v1"],
+                    steps=["upload"],
+                    playlist_id="PL_abc",
+                    upload_batch_size=3,
+                    upload_mode="dtime",
+                    upload_cron="0 12 * * *",
+                )
+
+            job = jm.get_job(job_id)
+            assert job is not None
+            assert job.task_type == 'process'
+            assert job.task_params['playlist_id'] == 'PL_abc'
+            assert job.task_params['upload_batch_size'] == 3
+            assert job.task_params['upload_mode'] == 'dtime'
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_submit_tools_job_uses_tools_boundary(self):
+        """submit_tools_job 应固定 tools 边界并补齐空 video_ids。"""
+        import tempfile, shutil
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmpdir, "test.db")
+            log_dir = os.path.join(tmpdir, "logs")
+            jm = JobManager(db_path, log_dir)
+
+            from unittest.mock import patch
+            with patch.object(jm, '_start_job_process'):
+                job_id = jm.submit_tools_job(
+                    task_type="refresh-playlist",
+                    task_params={"playlist_id": "PL1"},
+                )
+
+            job = jm.get_job(job_id)
+            assert job is not None
+            assert job.video_ids == []
+            assert job.steps == ["refresh-playlist"]
+            assert job.task_type == 'refresh-playlist'
+            assert job.task_params == {"playlist_id": "PL1"}
+        finally:
+            shutil.rmtree(tmpdir)
+
     def test_process_params_merged_into_task_params(self):
         """process 任务的 playlist_id/upload_batch_size/upload_mode 应合并到 task_params"""
         import json, sqlite3, tempfile, shutil
@@ -607,18 +661,25 @@ class TestTaskParamsPersistence:
         idx = cmd.index("--delay-start")
         assert cmd[idx + 1] == "120"
 
-    def test_build_tools_command_includes_group_config_path_for_watch(self):
-        """tools/watch 子进程应继承 web 启动时的 group 级 --config。"""
-        cmd = JobManager._build_tools_command(
-            "watch",
-            {"playlist_ids": ["PL1"], "once": True},
-            config_path="config/custom.yaml",
-        )
-        assert cmd[:6] == [sys.executable, "-m", "vat", "-c", "config/custom.yaml", "tools"]
-        assert cmd[6] == "watch"
 
+    def test_submit_tools_job_rejects_unknown_task_type(self):
+        """submit_tools_job 对未知 tools task_type 应 fail-fast。"""
+        import tempfile, shutil
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmpdir, "test.db")
+            log_dir = os.path.join(tmpdir, "logs")
+            jm = JobManager(db_path, log_dir)
 
-class TestProcessJobResultContracts:
+            with pytest.raises(ValueError, match="Unknown tools task_type"):
+                jm.submit_tools_job(task_type="unknown-type")
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_build_tools_command_rejects_unknown_task_type(self):
+        """_build_tools_command 对未知 tools task_type 应 fail-fast。"""
+        with pytest.raises(ValueError, match="Unknown tools task_type"):
+            JobManager._build_tools_command("unknown-type", {})
     @pytest.fixture
     def env(self):
         import sqlite3, shutil

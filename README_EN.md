@@ -374,11 +374,12 @@ See [Watch Mode Spec](docs/WATCH_MODE_SPEC.md) for detailed design.
 | `vat tools season-sync --playlist ID` | Season sync (add + sort) |
 | `vat tools update-info --playlist ID` | Batch update uploaded video title/desc |
 | `vat tools sync-db --season S --playlist ID` | Sync Bilibili season info back to DB |
+| `vat tools test-center --kind whisper` | Background self-check task used by the WebUI test center |
 | `vat watch -p PLAYLIST_ID` | Auto-monitor Playlist and process new videos (persistent) |
 | `vat watch -p PL1 -p PL2 -i 30` | Monitor multiple Playlists, 30-min interval |
 | `vat watch -p PLAYLIST_ID --once` | Single check then exit (can combine with system cron) |
 
-> `vat tools` subcommands share functionality with other CLI commands but output standardized progress markers (`[N%]`/`[SUCCESS]`/`[FAILED]`) for WebUI JobManager subprocess scheduling and monitoring.
+> `vat tools` subcommands share functionality with other CLI commands but output standardized markers (`[N%]`/`[RESULT_JSON]`/`[SUCCESS]`/`[FAILED]`) for WebUI JobManager subprocess scheduling and monitoring.
 
 ### Output Files
 

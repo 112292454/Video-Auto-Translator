@@ -17,6 +17,7 @@ from ..models import (
     is_task_status_satisfied,
 )
 from ..utils.logger import setup_logger
+from ..services.bilibili_support import build_bilibili_uploader, find_local_video_for_aid, resolve_video_file
 
 
 # 全局配置
@@ -2220,18 +2221,11 @@ def bilibili(ctx):
 
 def _get_bilibili_uploader(ctx):
     """获取 B站上传器实例"""
-    from ..uploaders.bilibili import BilibiliUploader
-    
     config = get_config(ctx.obj.get('config_path'))
-    bilibili_config = config.uploader.bilibili
-    project_root = Path(__file__).parent.parent.parent
-    cookies_file = project_root / bilibili_config.cookies_file
-    
-    return BilibiliUploader(
-        cookies_file=str(cookies_file),
-        lock_db_path=config.storage.database_path,
-        upload_interval=bilibili_config.upload_interval,
-        max_concurrent_uploads=getattr(config.concurrency, "max_concurrent_uploads", 1),
+    return build_bilibili_uploader(
+        config,
+        with_upload_params=False,
+        project_root=Path(__file__).parent.parent.parent,
     )
 
 
@@ -2421,99 +2415,13 @@ def bilibili_rejected(ctx, keyword):
 
 
 def _find_local_video_cli(aid: int, config, db, uploader) -> Optional[Path]:
-    """
-    CLI 侧：根据 aid 查找本地视频文件路径。
-    
-    查找策略（按优先级）：
-    1. 从 B站稿件 source URL 提取 YouTube video ID → DB 查找视频记录 → 本地 final.mp4
-    2. DB 中通过 bilibili_aid 匹配 → 本地 final.mp4
-    3. 通过 B站稿件标题匹配 DB 翻译标题 → 本地 final.mp4
-    4. 直接按 YouTube video ID 查找 output 目录
-    """
-    import re
-    
-    yt_video_id = None
-    bili_title = None
-    
-    # 方法1: source URL / desc 中提取 YouTube video ID → DB
-    try:
-        detail = uploader.get_archive_detail(aid)
-        if detail:
-            archive = detail.get('archive', {})
-            bili_title = archive.get('title', '')
-            # 从 source 字段和 desc 字段中搜索 YouTube URL
-            # 注意：创作中心 API 的 desc 截断到 250 字符，需补充公共 API 获取完整 desc
-            source = archive.get('source', '')
-            desc = archive.get('desc', '')
-            full_desc = uploader._get_full_desc(aid)
-            for text in [source, full_desc or desc, desc]:
-                yt_match = re.search(r'youtube\.com/watch\?v=([a-zA-Z0-9_-]+)', text)
-                if yt_match:
-                    yt_video_id = yt_match.group(1)
-                    break
-            
-            if yt_video_id:
-                click.echo(f"  稿件对应 YouTube 视频: {yt_video_id}")
-                
-                video = db.get_video(yt_video_id)
-                if video:
-                    path = _resolve_video_file_cli(video, config)
-                    if path:
-                        click.echo(f"  通过 YouTube ID 找到本地视频: {path}")
-                        return path
-    except Exception as e:
-        click.echo(f"  通过 source URL 查找失败: {e}", err=True)
-    
-    # 方法2 + 3: 遍历 DB
-    videos = db.list_videos()
-    
-    # 方法2: bilibili_aid 匹配
-    for v in videos:
-        meta = v.metadata or {}
-        if str(meta.get('bilibili_aid', '')) == str(aid):
-            path = _resolve_video_file_cli(v, config)
-            if path:
-                click.echo(f"  通过 bilibili_aid 找到本地视频: {path}")
-                return path
-    
-    # 方法3: 标题匹配
-    if bili_title:
-        clean_title = re.sub(r'\s*\|\s*#\d+\s*$', '', bili_title).strip()
-        for v in videos:
-            meta = v.metadata or {}
-            translated = meta.get('translated', {})
-            t_title = translated.get('title_translated', '') if translated else ''
-            if t_title and clean_title and (clean_title in t_title or t_title in clean_title):
-                path = _resolve_video_file_cli(v, config)
-                if path:
-                    click.echo(f"  通过标题匹配找到本地视频: {v.id} → {path}")
-                    return path
-    
-    # 方法4: output 目录直接查找
-    if yt_video_id:
-        vid_dir = Path(config.storage.output_dir) / yt_video_id
-        for name in ['final.mp4', f'{yt_video_id}.mp4']:
-            candidate = vid_dir / name
-            if candidate.exists():
-                click.echo(f"  通过 output 目录找到视频: {candidate}")
-                return candidate
-    
-    return None
+    """CLI 侧：根据 aid 查找本地视频文件路径。"""
+    return find_local_video_for_aid(aid, config, db, uploader)
 
 
 def _resolve_video_file_cli(video, config) -> Optional[Path]:
     """从视频记录解析本地视频文件路径（final.mp4 优先）"""
-    candidates = []
-    if video.output_dir:
-        candidates.append(Path(video.output_dir) / "final.mp4")
-    vid_dir = Path(config.storage.output_dir) / video.id
-    candidates.append(vid_dir / "final.mp4")
-    candidates.append(vid_dir / f"{video.id}.mp4")
-    
-    for c in candidates:
-        if c.exists():
-            return c
-    return None
+    return resolve_video_file(video, config)
 
 
 def _download_from_bilibili_cli(aid: int, bvid: str, config, logger) -> Optional[Path]:
