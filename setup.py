@@ -28,7 +28,7 @@ setup(
     description="视频自动化翻译流水线系统",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/VAT",
+    url="https://github.com/ZeyuanGuo/Video-Auto-Translator",
     packages=find_packages(),
     package_data={
         "vat": [

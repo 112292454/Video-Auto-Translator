@@ -58,7 +58,7 @@ Reflect 不是多次 LLM 调用，而是单次调用中输出 3 个字段（init
 ### ASR-6: initial_prompt 无通用有效方案
 
 - **现象**：测试了多种写法，绝大部分情况效果变差
-- **状态**：暂不使用。详见 [ASR 参数指南](asr_parameters_guide.md)
+- **状态**：暂不使用。详见 [ASR 评估报告](ASR_EVALUATION_REPORT.md)
 
 *ASR-7、Split-1、Split-2 已修复，归档至 [docs/archive/fixed_issues.md](archive/fixed_issues.md)*
 

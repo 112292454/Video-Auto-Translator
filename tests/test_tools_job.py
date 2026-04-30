@@ -122,6 +122,16 @@ class TestBuildToolsCommand(TestCase):
         self.assertIn('--target-id', cmd)
         self.assertIn('translate', cmd)
 
+    def test_replace_videos_command_skip_verified(self):
+        cmd = JobManager._build_tools_command(
+            'replace-videos',
+            {'job_id': 'job-1', 'dry_run': True, 'skip_verified': True},
+        )
+        self.assertIn('--job-id', cmd)
+        self.assertIn('job-1', cmd)
+        self.assertIn('--dry-run', cmd)
+        self.assertIn('--skip-verified', cmd)
+
 
 class TestFindLocalVideoForAid(TestCase):
     def test_falls_back_to_bilibili_title_match(self):
@@ -533,7 +543,7 @@ class TestToolsTaskTypes(TestCase):
         expected = {
             'fix-violation', 'sync-playlist', 'refresh-playlist',
             'retranslate-playlist', 'upload-sync', 'update-info',
-            'sync-db', 'season-sync', 'watch', 'test-center',
+            'replace-videos', 'sync-db', 'season-sync', 'watch', 'test-center',
         }
         self.assertEqual(TOOLS_TASK_TYPES, expected)
 

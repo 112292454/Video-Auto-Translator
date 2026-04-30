@@ -2,6 +2,7 @@
 
 import pytest
 from vat.asr.asr_data import ASRData, ASRDataSeg
+from vat.subtitle_utils.codecs import asr_data_from_srt
 
 
 def _seg(text, start, end, translated=""):
@@ -301,7 +302,7 @@ class TestDedupChainEffects:
 
 
 class TestAssDisplayNormalization:
-    def test_to_ass_normalizes_translated_display_text_without_mutating_segments(self):
+    def test_to_ass_normalizes_visible_display_text_without_mutating_segments(self):
         style = (
             "[V4+ Styles]\n"
             "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
@@ -312,13 +313,15 @@ class TestAssDisplayNormalization:
             "Style: Secondary,Arial,30,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,"
             "0,0,1,2,0,2,10,10,15,1"
         )
-        asr = ASRData([_seg("原文「你好」", 0, 1000, "译文“你好”“引用”「台词」『标题』，。；：？！…")])
+        asr = ASRData([_seg("原文，测试。", 0, 1000, "译文“你好”“引用”「台词」『标题』，。；：？！…")])
 
         ass = asr.to_ass(style_str=style)
 
         assert '{\\blur0}译文"你好""引用"「台词」『标题』？！…' in ass
-        assert "{\\blur0}原文「你好」" in ass
+        assert "{\\blur0}原文 测试" in ass
         assert "译文“你好”“引用”「台词」『标题』，。；：？！…" not in ass
+        assert "原文，测试。" not in ass
+        assert asr.segments[0].text == "原文，测试。"
         assert asr.segments[0].translated_text == "译文“你好”“引用”「台词」『标题』，。；：？！…"
 
     def test_to_ass_replaces_mid_sentence_punctuation_with_spaces(self):
@@ -339,3 +342,94 @@ class TestAssDisplayNormalization:
         assert "{\\blur0}苹果 香蕉 葡萄 梨？！…" in ass
         assert "{\\blur0}苹果香蕉葡萄梨？！…" not in ass
         assert asr.segments[0].translated_text == "苹果，香蕉：葡萄；梨。？！…"
+
+    def test_to_ass_normalizes_japanese_and_ascii_commas_in_visible_text(self):
+        style = (
+            "[V4+ Styles]\n"
+            "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,"
+            "Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
+            "Alignment,MarginL,MarginR,MarginV,Encoding\n"
+            "Style: Default,Arial,40,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,"
+            "0,0,1,2,0,2,10,10,15,1\n"
+            "Style: Secondary,Arial,30,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,"
+            "0,0,1,2,0,2,10,10,15,1"
+        )
+        asr = ASRData([_seg("あ、どうもー、こん, hello.", 0, 1000, "啊，大家好，hello.")])
+
+        ass = asr.to_ass(style_str=style)
+
+        assert "{\\blur0}あ どうもー こん hello" in ass
+        assert "{\\blur0}啊 大家好 hello" in ass
+        assert "あ、どうもー、こん, hello." not in ass
+        assert "啊，大家好，hello." not in ass
+
+
+class TestSrtBilingualDetection:
+    def test_asr_data_from_srt_detects_japanese_original_and_chinese_translation_with_noise_block(self):
+        srt = """1
+00:00:00,000 --> 00:00:01,000
+あ、どうもー、こん、あ、もうちょっと私こっち
+啊，大家好～那个，啊，我再往这边挪一点点。
+
+2
+00:00:01,000 --> 00:00:02,000
+今日はオーバークック２で遊びます
+今天玩胡闹厨房2。
+
+3
+00:00:02,000 --> 00:00:03,000
+tjjaa
+"""
+
+        asr = asr_data_from_srt(srt)
+
+        assert asr.segments[0].text == "あ、どうもー、こん、あ、もうちょっと私こっち"
+        assert asr.segments[0].translated_text == "啊，大家好～那个，啊，我再往这边挪一点点。"
+        assert asr.segments[1].text == "今日はオーバークック２で遊びます"
+        assert asr.segments[1].translated_text == "今天玩胡闹厨房2。"
+
+    def test_asr_data_from_srt_ignores_identical_chants_when_detecting_bilingual_lyrics(self):
+        srt = """1
+00:00:00,000 --> 00:00:01,000
+Oh Yeah!
+Oh Yeah！
+
+2
+00:00:01,000 --> 00:00:02,000
+Oh Yeah!
+Oh Yeah！
+
+3
+00:00:02,000 --> 00:00:03,000
+Oh Yeah!
+Oh Yeah！
+
+4
+00:00:03,000 --> 00:00:04,000
+Oh Yeah!
+Oh Yeah！
+
+5
+00:00:04,000 --> 00:00:05,000
+無数の星の中
+在无数星辰之中
+
+6
+00:00:05,000 --> 00:00:06,000
+光は君がくれた
+是你给予了我光芒
+
+7
+00:00:06,000 --> 00:00:07,000
+ハイファイブ!
+High Five！
+"""
+
+        asr = asr_data_from_srt(srt)
+
+        assert asr.segments[0].text == "Oh Yeah!"
+        assert asr.segments[0].translated_text == "Oh Yeah！"
+        assert asr.segments[4].text == "無数の星の中"
+        assert asr.segments[4].translated_text == "在无数星辰之中"
+        assert asr.segments[6].text == "ハイファイブ!"
+        assert asr.segments[6].translated_text == "High Five！"

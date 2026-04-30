@@ -1,6 +1,7 @@
 """Bilibili 上传器基础 API 契约测试。"""
 
 from contextlib import contextmanager
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -305,6 +306,40 @@ class TestReplacementUploadContracts:
             "lock_ttl_seconds": 7200,
             "max_concurrent": 2,
         }]
+
+    def test_upload_replacement_file_temporarily_bypasses_env_proxy(self, tmp_path, monkeypatch):
+        uploader = _make_uploader(tmp_path)
+        video = tmp_path / "replacement.mp4"
+        video.write_bytes(b"00")
+        snapshots = []
+        proxy_vars = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+        for name in proxy_vars:
+            monkeypatch.setenv(name, f"http://proxy-for-{name}")
+
+        @contextmanager
+        def fake_resource_lock(**_kwargs):
+            yield object()
+
+        class _EnvCheckingBiliClient(_FakeBiliClient):
+            def login_by_cookies(self, raw_cookie_data):
+                snapshots.append({name: os.environ.get(name) for name in proxy_vars})
+                super().login_by_cookies(raw_cookie_data)
+
+            def upload_file(self, path, lines, tasks):
+                snapshots.append({name: os.environ.get(name) for name in proxy_vars})
+                return super().upload_file(path, lines, tasks)
+
+        monkeypatch.setattr("vat.uploaders.bilibili.resource_lock", fake_resource_lock, raising=False)
+        monkeypatch.setattr("vat.uploaders.bilibili.Data", _FakeData)
+        monkeypatch.setattr("vat.uploaders.bilibili.BiliBili", lambda _data: _EnvCheckingBiliClient(upload_result={"filename": "repl.mp4"}))
+
+        filename = uploader._upload_replacement_file(video, {"title": "old", "desc": "old desc"})
+
+        assert filename == "repl.mp4"
+        assert snapshots
+        assert all(all(value is None for value in snapshot.values()) for snapshot in snapshots)
+        for name in proxy_vars:
+            assert os.environ[name] == f"http://proxy-for-{name}"
 
 
 class TestValidateCredentialsContracts:

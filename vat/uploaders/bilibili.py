@@ -4,8 +4,10 @@ B站上传器实现
 直接使用 biliup 库的 Web 端 API 上传（TV 端 API 已停用）
 """
 import json
+import os
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
@@ -15,6 +17,24 @@ from vat.utils.logger import setup_logger
 from vat.utils.resource_lock import resource_lock
 
 logger = setup_logger("uploader.bilibili")
+
+_HTTP_PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+
+
+@contextmanager
+def _without_http_proxy_env():
+    """临时关闭全局 HTTP(S) 代理，用于 B 站上传/创作中心直连。"""
+    old_values = {name: os.environ.get(name) for name in _HTTP_PROXY_ENV_VARS}
+    for name in _HTTP_PROXY_ENV_VARS:
+        os.environ.pop(name, None)
+    try:
+        yield
+    finally:
+        for name, value in old_values.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 BiliBili = None
 Data = None
@@ -385,6 +405,9 @@ class BilibiliUploader(BaseUploader):
         self._load_cookie()
         
         session = requests.Session()
+        # B 站创作中心接口在当前部署环境下经全局 HTTP(S)_PROXY 会出现
+        # SSLEOFError；BilibiliUploader 没有单独的代理配置，认证接口默认直连。
+        session.trust_env = False
         # 设置 cookies 到正确的域名
         for name, value in self.cookie_data.items():
             session.cookies.set(name, value, domain='.bilibili.com')
@@ -1543,24 +1566,25 @@ class BilibiliUploader(BaseUploader):
             video_part.desc = old_video.get('desc', '')
 
             with self._upload_lock("_upload_replacement_file"):
-                with BiliBili(video_part) as bili:
-                    bili.login_by_cookies(self._raw_cookie_data)
+                with _without_http_proxy_env():
+                    with BiliBili(video_part) as bili:
+                        bili.login_by_cookies(self._raw_cookie_data)
 
-                    new_video_path = Path(new_video_path)
-                    uploaded = bili.upload_file(str(new_video_path), lines=self.line, tasks=self.threads)
-                    logger.info(f"  upload_file 返回值: {uploaded}")
+                        new_video_path = Path(new_video_path)
+                        uploaded = bili.upload_file(str(new_video_path), lines=self.line, tasks=self.threads)
+                        logger.info(f"  upload_file 返回值: {uploaded}")
 
-                    if not uploaded:
-                        logger.error("视频文件上传失败: 返回值为空")
-                        return None
+                        if not uploaded:
+                            logger.error("视频文件上传失败: 返回值为空")
+                            return None
 
-                    new_filename = uploaded.get('bili_filename') or uploaded.get('filename')
-                    if not new_filename:
-                        logger.error(f"视频文件上传后无 filename 字段: {uploaded}")
-                        return None
+                        new_filename = uploaded.get('bili_filename') or uploaded.get('filename')
+                        if not new_filename:
+                            logger.error(f"视频文件上传后无 filename 字段: {uploaded}")
+                            return None
 
-                    logger.info(f"  新视频上传成功: filename={new_filename}")
-                    return new_filename
+                        logger.info(f"  新视频上传成功: filename={new_filename}")
+                        return new_filename
         except Exception as e:
             logger.error(f"上传新视频文件异常: {e}")
             return None

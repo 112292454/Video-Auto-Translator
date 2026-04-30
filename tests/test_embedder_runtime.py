@@ -2697,6 +2697,50 @@ class TestFFmpegWrapperHardEmbedPlanning:
         assert cmd[cmd.index("-c:a") + 1] == "copy"
         assert cmd[-2:] == ["-y", str(out)]
 
+    def test_build_hard_embed_ffmpeg_command_maps_cuda_visible_devices_single_gpu(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        out = tmp_path / "out.mp4"
+
+        cmd = wrapper._build_hard_embed_ffmpeg_command(
+            video_path=video,
+            output_path=out,
+            vf="subtitles='sub.srt'",
+            video_codec="hevc",
+            audio_codec="copy",
+            crf=28,
+            preset="p4",
+            gpu_id=2,
+            original_bitrate=1000,
+        )
+
+        assert cmd[cmd.index("-hwaccel_device") + 1] == "0"
+        assert cmd[cmd.index("-gpu") + 1] == "0"
+
+    def test_build_hard_embed_ffmpeg_command_maps_cuda_visible_devices_multi_gpu(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1,2,3")
+        wrapper = FFmpegWrapper()
+        video = tmp_path / "video.mp4"
+        out = tmp_path / "out.mp4"
+
+        cmd = wrapper._build_hard_embed_ffmpeg_command(
+            video_path=video,
+            output_path=out,
+            vf="subtitles='sub.srt'",
+            video_codec="hevc",
+            audio_codec="copy",
+            crf=28,
+            preset="p4",
+            gpu_id=2,
+            original_bitrate=1000,
+        )
+
+        assert cmd[cmd.index("-hwaccel_device") + 1] == "1"
+        assert cmd[cmd.index("-gpu") + 1] == "1"
+
     def test_build_hard_embed_ffmpeg_command_falls_back_to_hevc_when_av1_nvenc_unavailable(self, monkeypatch, tmp_path):
         monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
         wrapper = FFmpegWrapper()

@@ -30,6 +30,8 @@ docs/superpowers/
 .cursor/
 .specstory/
 .windsurf/
+.playwright-mcp/
+.task_*.txt
 *.swp
 *.swo
 *~

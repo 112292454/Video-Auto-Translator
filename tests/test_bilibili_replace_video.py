@@ -1,6 +1,7 @@
 """replace_video 契约测试。"""
 
 from pathlib import Path
+from contextlib import nullcontext
 from unittest.mock import MagicMock
 
 import pytest
@@ -26,6 +27,8 @@ def _make_uploader(tmp_path):
     uploader.get_video_detail = MagicMock(return_value=None)
     uploader._get_full_desc = MagicMock(return_value=None)
     uploader.cookies_file = tmp_path / "cookies.json"
+    uploader.lock_db_path = str(tmp_path / "locks.db")
+    uploader._upload_lock = MagicMock(return_value=nullcontext())
     return uploader
 
 
@@ -80,8 +83,8 @@ class TestReplaceVideoContracts:
         session = MagicMock()
         uploader._get_authenticated_session.return_value = session
         client = _FakeBiliClient(upload_result={"unexpected": "value"})
-        monkeypatch.setattr("biliup.plugins.bili_webup.BiliBili", lambda _data: client)
-        monkeypatch.setattr("biliup.plugins.bili_webup.Data", _FakeData)
+        monkeypatch.setattr("vat.uploaders.bilibili.BiliBili", lambda _data: client)
+        monkeypatch.setattr("vat.uploaders.bilibili.Data", _FakeData)
 
         assert uploader.replace_video(12345, tmp_path / "new.mp4") is False
         session.post.assert_not_called()
@@ -109,8 +112,8 @@ class TestReplaceVideoContracts:
         session.post.return_value = _make_response({"code": 0})
         uploader._get_authenticated_session.return_value = session
         client = _FakeBiliClient(upload_result={"filename": "new-file-name"})
-        monkeypatch.setattr("biliup.plugins.bili_webup.BiliBili", lambda _data: client)
-        monkeypatch.setattr("biliup.plugins.bili_webup.Data", _FakeData)
+        monkeypatch.setattr("vat.uploaders.bilibili.BiliBili", lambda _data: client)
+        monkeypatch.setattr("vat.uploaders.bilibili.Data", _FakeData)
 
         result = uploader.replace_video(12345, tmp_path / "new.mp4")
 
@@ -138,8 +141,8 @@ class TestReplaceVideoContracts:
         session.post.return_value = _make_response({"code": -1, "message": "edit failed"})
         uploader._get_authenticated_session.return_value = session
         client = _FakeBiliClient(upload_result={"filename": "new-file-name"})
-        monkeypatch.setattr("biliup.plugins.bili_webup.BiliBili", lambda _data: client)
-        monkeypatch.setattr("biliup.plugins.bili_webup.Data", _FakeData)
+        monkeypatch.setattr("vat.uploaders.bilibili.BiliBili", lambda _data: client)
+        monkeypatch.setattr("vat.uploaders.bilibili.Data", _FakeData)
 
         result = uploader.replace_video(12345, tmp_path / "new.mp4")
 

@@ -1,6 +1,7 @@
 """
 FFmpeg视频处理封装
 """
+import os
 import re
 import time
 import tempfile
@@ -747,6 +748,28 @@ class FFmpegWrapper:
             logger.error(error_msg)
             raise RuntimeError(error_msg)
 
+    def _resolve_ffmpeg_gpu_id(self, gpu_id: int) -> int:
+        """将物理 GPU 编号映射为 FFmpeg 进程可见的 CUDA 设备编号。"""
+        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if not visible_devices:
+            return gpu_id
+
+        visible_gpu_ids = [part.strip() for part in visible_devices.split(",") if part.strip()]
+        if not visible_gpu_ids or not all(part.isdigit() for part in visible_gpu_ids):
+            return gpu_id
+
+        gpu_id_text = str(gpu_id)
+        if gpu_id_text not in visible_gpu_ids:
+            return gpu_id
+
+        mapped_gpu_id = visible_gpu_ids.index(gpu_id_text)
+        if mapped_gpu_id != gpu_id:
+            logger.info(
+                f"CUDA_VISIBLE_DEVICES={visible_devices}; "
+                f"FFmpeg GPU {gpu_id} 映射为可见索引 {mapped_gpu_id}"
+            )
+        return mapped_gpu_id
+
     def _build_hard_embed_ffmpeg_command(
         self,
         *,
@@ -761,6 +784,8 @@ class FFmpegWrapper:
         original_bitrate: int,
     ) -> List[str]:
         """构建硬字幕合成使用的 FFmpeg 命令。"""
+        ffmpeg_gpu_id = self._resolve_ffmpeg_gpu_id(gpu_id)
+
         if video_codec in ['libx265', 'hevc']:
             actual_codec = 'hevc_nvenc'
         elif video_codec == 'av1':
@@ -793,7 +818,7 @@ class FFmpegWrapper:
             ]
 
         codec_params.extend([
-            '-gpu', str(gpu_id),
+            '-gpu', str(ffmpeg_gpu_id),
             '-spatial_aq', '1',
             '-temporal_aq', '1',
         ])
@@ -801,7 +826,7 @@ class FFmpegWrapper:
         return [
             'ffmpeg',
             '-hwaccel', 'cuda',
-            '-hwaccel_device', str(gpu_id),
+            '-hwaccel_device', str(ffmpeg_gpu_id),
             '-i', str(video_path),
             '-vf', vf,
             '-c:v', actual_codec,

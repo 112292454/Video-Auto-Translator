@@ -40,6 +40,7 @@ TOOLS_TASK_TYPES = {
     'retranslate-playlist',
     'upload-sync',
     'update-info',
+    'replace-videos',
     'sync-db',
     'season-sync',
     'watch',
@@ -496,6 +497,17 @@ class JobManager:
             'update-info': {
                 'playlist_id': '--playlist',
                 'dry_run': '--dry-run',
+            },
+            'replace-videos': {
+                'job_id': '--job-id',
+                'video_ids': '--video-id',
+                'limit': '--limit',
+                'dry_run': '--dry-run',
+                'check_remote': '--check-remote',
+                'skip_verified': '--skip-verified',
+                'yes': '--yes',
+                'sleep_seconds': '--sleep-seconds',
+                'verify_metadata': '--verify-metadata',
             },
             'sync-db': {
                 'season_id': '--season',

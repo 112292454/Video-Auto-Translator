@@ -15,6 +15,7 @@ CLI tools 子命令组
   vat tools retranslate-playlist --playlist PL_xxx
   vat tools upload-sync --playlist PL_xxx
   vat tools update-info --playlist PL_xxx
+  vat tools replace-videos --job-id JOB_ID --dry-run
   vat tools sync-db --season 12345 --playlist PL_xxx
   vat tools season-sync --playlist PL_xxx
   vat tools test-center --kind whisper
@@ -78,6 +79,110 @@ def _get_playlist_service(config, db):
     """创建 PlaylistService 实例"""
     from ..services.playlist_service import PlaylistService
     return PlaylistService(db, config)
+
+
+def _load_web_job_video_ids(db, job_id: str):
+    """从 web_jobs 记录读取视频 ID 列表。"""
+    import sqlite3
+
+    with sqlite3.connect(str(db.db_path)) as conn:
+        row = conn.execute(
+            "SELECT video_ids FROM web_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+    if not row:
+        raise click.ClickException(f"找不到 web job: {job_id}")
+    return json.loads(row[0] or "[]")
+
+
+def _collect_replace_video_candidates(db, *, job_id=None, video_ids=None, limit=0, skip_verified=False):
+    """收集可执行 B站稿件视频文件替换的候选项。"""
+    from ..models import TaskStep, TaskStatus
+
+    selected_ids = []
+    if job_id:
+        selected_ids.extend(_load_web_job_video_ids(db, job_id))
+    selected_ids.extend(video_ids or [])
+    selected_ids = list(dict.fromkeys(selected_ids))
+
+    candidates = []
+    skipped = []
+    for video_id in selected_ids:
+        video = db.get_video(video_id)
+        if not video:
+            skipped.append({"video_id": video_id, "reason": "video_not_found"})
+            continue
+
+        embed_task = db.get_task(video_id, TaskStep.EMBED)
+        if not embed_task or embed_task.status != TaskStatus.COMPLETED:
+            skipped.append({
+                "video_id": video_id,
+                "reason": f"embed_not_completed:{embed_task.status.value if embed_task else 'missing'}",
+            })
+            continue
+
+        metadata = video.metadata or {}
+        aid = metadata.get("bilibili_aid")
+        if not aid:
+            skipped.append({"video_id": video_id, "reason": "missing_bilibili_aid"})
+            continue
+
+        output_dir = Path(video.output_dir or "")
+        final_video = output_dir / "final.mp4"
+        if not final_video.exists() or final_video.stat().st_size <= 0:
+            skipped.append({"video_id": video_id, "reason": "missing_or_empty_final_mp4"})
+            continue
+
+        final_stat = final_video.stat()
+        if skip_verified:
+            replace_op = dict((metadata.get("bilibili_ops") or {}).get("replace_video") or {})
+            if (
+                replace_op.get("state") == "verified"
+                and replace_op.get("new_video_path") == str(final_video)
+                and replace_op.get("new_video_size") == final_stat.st_size
+                and replace_op.get("new_video_mtime_ns") == final_stat.st_mtime_ns
+            ):
+                skipped.append({"video_id": video_id, "reason": "already_verified_current_final_mp4"})
+                continue
+
+        candidates.append({
+            "video": video,
+            "video_id": video_id,
+            "aid": int(aid),
+            "final_video": final_video,
+            "title": video.title or video_id,
+        })
+
+    if limit and limit > 0:
+        candidates = candidates[:limit]
+    return candidates, skipped
+
+
+def _snapshot_replace_context(context):
+    """提取替换前后需要保持不变的远端元信息。"""
+    archive = dict(context.get("archive") or {})
+    videos = list(context.get("old_videos") or [])
+    first_video = dict(videos[0]) if videos else {}
+    return {
+        "title": archive.get("title", ""),
+        "desc": archive.get("desc", ""),
+        "tag": archive.get("tag", ""),
+        "tid": archive.get("tid"),
+        "copyright": archive.get("copyright"),
+        "source": archive.get("source", ""),
+        "part_count": len(videos),
+        "part_title": first_video.get("title", ""),
+        "part_desc": first_video.get("desc", ""),
+    }
+
+
+def _compare_replace_snapshots(before, after):
+    """比较替换前后应保持不变的远端元信息。"""
+    changed = []
+    for key in ("title", "desc", "tag", "tid", "copyright", "source", "part_count", "part_title", "part_desc"):
+        if before.get(key) != after.get(key):
+            changed.append(key)
+    return changed
 
 
 # =============================================================================
@@ -621,6 +726,173 @@ def tools_update_info(ctx, playlist, dry_run):
 
     except Exception as e:
         _failed(str(e))
+
+
+# =============================================================================
+# replace-videos: 批量替换已上传稿件的视频文件
+# =============================================================================
+
+@tools.command('replace-videos')
+@click.option('--job-id', default='', help='只处理该 Web job 中的视频 ID')
+@click.option('--video-id', 'video_ids', multiple=True, help='额外指定视频 ID，可重复传入')
+@click.option('--limit', default=0, type=int, help='最多处理多少个候选视频；0 表示不限制')
+@click.option('--dry-run', is_flag=True, help='仅列出候选，不上传、不编辑稿件')
+@click.option('--check-remote', is_flag=True, help='dry-run 时也读取远端稿件元信息，验证可加载 title/desc/tags')
+@click.option('--skip-verified', is_flag=True, help='跳过已成功替换且 final.mp4 未变化的视频')
+@click.option('--yes', is_flag=True, help='确认执行真实替换；非 dry-run 必须传入')
+@click.option('--sleep-seconds', default=3.0, type=float, help='真实替换时每个稿件之间的等待秒数')
+@click.option('--verify-metadata/--no-verify-metadata', default=True, help='真实替换后检查标题/简介/标签等元信息是否保持不变')
+@click.pass_context
+def tools_replace_videos(ctx, job_id, video_ids, limit, dry_run, check_remote, skip_verified, yes, sleep_seconds, verify_metadata):
+    """批量替换 B站已有稿件的视频文件，不新建投稿、不重新渲染简介。"""
+    import time
+    from ..services.bilibili_workflows import replace_video_with_recovery
+
+    if not job_id and not video_ids:
+        _failed("必须提供 --job-id 或至少一个 --video-id")
+        return
+    if not dry_run and not yes:
+        _failed("真实替换需要显式传入 --yes")
+        return
+
+    config, db = _get_config_and_db(ctx)
+    candidates, skipped = _collect_replace_video_candidates(
+        db,
+        job_id=job_id or None,
+        video_ids=list(video_ids),
+        limit=limit,
+        skip_verified=skip_verified,
+    )
+
+    _emit(f"候选视频: {len(candidates)} 个，跳过: {len(skipped)} 个")
+    for item in candidates:
+        size_mb = item["final_video"].stat().st_size / 1024 / 1024
+        _emit(f"  av{item['aid']} {item['video_id']} {size_mb:.1f}MB {item['title'][:60]}")
+    if skipped:
+        reasons = {}
+        for item in skipped:
+            reasons[item["reason"]] = reasons.get(item["reason"], 0) + 1
+        _emit(f"跳过原因: {reasons}")
+
+    result_payload = {
+        "job_id": job_id or None,
+        "candidate_count": len(candidates),
+        "skipped_count": len(skipped),
+        "skipped": skipped[:50],
+        "success": 0,
+        "failed": 0,
+        "metadata_warnings": [],
+        "details": [],
+        "dry_run": bool(dry_run),
+        "skip_verified": bool(skip_verified),
+    }
+
+    uploader = None
+    if dry_run:
+        if check_remote and candidates:
+            uploader = _get_bilibili_uploader(config)
+            for idx, item in enumerate(candidates, 1):
+                context = uploader._load_replace_video_context(item["aid"])
+                if context:
+                    snap = _snapshot_replace_context(context)
+                    _emit(
+                        f"[check {idx}/{len(candidates)}] av{item['aid']} "
+                        f"title={snap['title'][:40]} desc={len(snap['desc'])} tags={snap['tag'][:80]}"
+                    )
+                    result_payload["details"].append({
+                        "video_id": item["video_id"],
+                        "aid": item["aid"],
+                        "remote_loaded": True,
+                        "desc_len": len(snap["desc"]),
+                        "part_count": snap["part_count"],
+                    })
+                else:
+                    _emit(f"[check {idx}/{len(candidates)}] av{item['aid']} 远端上下文加载失败")
+                    result_payload["details"].append({
+                        "video_id": item["video_id"],
+                        "aid": item["aid"],
+                        "remote_loaded": False,
+                    })
+        _emit_result_json(result_payload)
+        _success("dry-run 完成")
+        return
+
+    uploader = _get_bilibili_uploader(config)
+    total = len(candidates)
+    if total == 0:
+        _emit_result_json(result_payload)
+        _success("没有可替换的视频")
+        return
+
+    for idx, item in enumerate(candidates, 1):
+        pct = int(100 * (idx - 1) / total)
+        _progress(pct)
+        aid = item["aid"]
+        video_id = item["video_id"]
+        final_video = item["final_video"]
+        _emit(f"[{idx}/{total}] 替换 av{aid} <- {video_id}/final.mp4")
+
+        before = None
+        if verify_metadata:
+            context = uploader._load_replace_video_context(aid)
+            if not context:
+                _emit("  远端上下文加载失败，跳过该稿件")
+                result_payload["failed"] += 1
+                result_payload["details"].append({
+                    "video_id": video_id,
+                    "aid": aid,
+                    "success": False,
+                    "message": "远端上下文加载失败",
+                })
+                continue
+            before = _snapshot_replace_context(context)
+
+        result = replace_video_with_recovery(db, uploader, aid, final_video)
+        detail = {
+            "video_id": video_id,
+            "aid": aid,
+            "success": bool(result.get("success")),
+            "message": result.get("message", ""),
+        }
+        if result.get("success"):
+            result_payload["success"] += 1
+            _emit(f"  替换提交成功: av{aid}")
+            if verify_metadata and before:
+                after_context = uploader._load_replace_video_context(aid)
+                if after_context:
+                    after = _snapshot_replace_context(after_context)
+                    changed = _compare_replace_snapshots(before, after)
+                    detail["metadata_changed_fields"] = changed
+                    if changed:
+                        warning = {"video_id": video_id, "aid": aid, "fields": changed}
+                        result_payload["metadata_warnings"].append(warning)
+                        _emit(f"  ⚠ 元信息字段变化: {changed}")
+                    else:
+                        _emit("  元信息校验通过: title/desc/tags/tid 未变化")
+                else:
+                    detail["metadata_check"] = "after_context_failed"
+                    result_payload["metadata_warnings"].append({
+                        "video_id": video_id,
+                        "aid": aid,
+                        "fields": ["after_context_failed"],
+                    })
+                    _emit("  ⚠ 替换后远端上下文加载失败，无法校验元信息")
+        else:
+            result_payload["failed"] += 1
+            _emit(f"  替换失败: {detail['message']}")
+
+        result_payload["details"].append(detail)
+        if idx < total and sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+    _progress(100)
+    _emit_result_json(result_payload)
+    if result_payload["failed"] == 0 and not result_payload["metadata_warnings"]:
+        _success(f"完成: {result_payload['success']} 个稿件已替换")
+    elif result_payload["failed"] == 0:
+        _failed(f"替换完成但有 {len(result_payload['metadata_warnings'])} 个元信息校验警告")
+    else:
+        _failed(f"{result_payload['success']} 成功, {result_payload['failed']} 失败")
 
 
 # =============================================================================

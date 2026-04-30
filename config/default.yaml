@@ -1,8 +1,11 @@
 # VAT 默认配置文件
-# 请根据实际环境修改相关路径和参数
+# 首次使用请优先运行 `vat init` 生成 `config/config.yaml`，再按自己的环境修改。
+# 本文件同时作为完整字段参考；不建议新手直接整份照抄。
+# 下方出现的作者环境绝对路径与 `llm.credentials_path` 仅为示例，必须改成你自己的环境。
 
 # =============================================================================
 # 存储配置 - 所有文件和模型的路径管理
+# 注意：本段中的 /local/gzy/... 绝对路径只是作者环境示例，不能直接照抄。
 # =============================================================================
 storage:
   work_dir: "/local/gzy/4090/vat/work"              # 工作目录（临时文件、处理中的文件）
@@ -39,23 +42,19 @@ downloader:
     remote_components: ["ejs:github"]       # yt-dlp 远程组件，解决 YouTube JS challenge
                                             # 推荐 ["ejs:github"]，留空列表 [] 表示不启用
     download_delay: 30                       # 批量下载视频间的延迟（秒），防止 YouTube 限流。0 表示不延迟
-  
+
   # 场景识别（下载时根据标题/简介判断视频场景，极简单的分类任务）
   # 留空则继承全局 llm 配置
-  scene_identify:
-    model: "gpt-5.4"                      # 断句使用的 LLM 模型（断句对模型要求低，用便宜模型即可）
-    api_key: "${SUB2API_KEY}"         # 中转站 API Key
-    base_url: "http://gammalab.nginx.show:11455"
-  
-  # 视频信息翻译（下载/同步时翻译标题、描述、标签，推荐B站分区，需要一定润色能力）
-  # 留空则继承全局 llm 配置
-  # video_info_translate:
+  # scene_identify:
   #   model: "gpt-5.4"                      # 断句使用的 LLM 模型（断句对模型要求低，用便宜模型即可）
   #   api_key: "${SUB2API_KEY}"         # 中转站 API Key
   #   base_url: "http://gammalab.nginx.show:11455"
-  # model: "gemini-3-pro-preview"                      # 若需要润色能力，可用稍好的模型
-  #   api_key: "${VAT_RESELLER_APIKEY}"         # 中转站 API Key
-  #   base_url: "https://api.videocaptioner.cn" # 中转站 Base URL
+
+  # 视频信息翻译（下载/同步时翻译标题、描述、标签，推荐B站分区，需要一定润色能力）
+  # 留空则继承全局 llm 配置
+  video_info_translate:
+    model: "gemini-3-flash-preview"              # 翻译模型（默认继承全局 llm；当前默认走 Vertex ADC）
+    api_key: "${VAT_GEMINI_KEY}"         # 中转站 API Key
 
 # =============================================================================
 # 语音识别配置
@@ -122,9 +121,9 @@ asr:
     min_words_english: 1                    # 英文每句最小单词数（软性建议）
     recommend_words_cjk: 12                 # 中文/日文每句推荐字符数（软性建议，理想长度）
     recommend_words_english: 8              # 英文每句推荐单词数（软性建议，理想长度）
-    model: "gpt-5.4"                      # 断句使用的 LLM 模型（断句对模型要求低，用便宜模型即可）
-    api_key: "${SUB2API_KEY}"         # 中转站 API Key
-    base_url: "http://gammalab.nginx.show:11455" #"https://api.videocaptioner.cn" # 中转站 Base URL
+    model: "gpt-5.5"                      # 断句使用的 LLM 模型（断句对模型要求低，用便宜模型即可）
+    # api_key: "${SUB2API_KEY}"         # 中转站 API Key
+    # base_url: "http://gammalab.nginx.show:11455" #"https://api.videocaptioner.cn" # 中转站 Base URL
     
     # 模型升级链：断句失败时自动尝试更强模型（默认关闭）
     allow_model_upgrade: false              # 是否启用模型升级
@@ -173,11 +172,8 @@ translator:
   # LLM 翻译器配置 (在线)
   llm:
     model: "gemini-3-flash-preview"              # 翻译模型（默认继承全局 llm；当前默认走 Vertex ADC）
-    # api_key: ""                             # 留空 = 使用全局 llm 配置
+    api_key: "${VAT_GEMINI_KEY}"                             # 留空 = 使用全局 llm 配置
     # base_url: ""                            # 留空 = 使用全局 llm 配置
-    # model: "kimi-k2.5"                          # 优化模型
-    # api_key: "${VAT_VOLC_APIKEY}"               # 火山引擎 API Key
-    # base_url: "https://ark.cn-beijing.volces.com/api/coding/v3"  # 火山引擎方舟 API
     enable_reflect: true                    # 反思翻译（启用后质量更高，但消耗更多 token）
     batch_size: 100                          # 每批处理的字幕数量
     thread_num: 3                            # 并发线程数（Vertex Gemini 共享容量下 10 容易触发 429；默认保守设为 3）
@@ -193,9 +189,9 @@ translator:
     optimize:
       enable: true                          # 是否启用字幕优化（修正错别字、统一术语）
       custom_prompt: "fubuki"                     # 优化自定义提示词文件名
-      model: "kimi-k2.5"                          # 优化模型
-      api_key: "${VAT_VOLC_APIKEY}"               # 火山引擎 API Key
-      base_url: "https://ark.cn-beijing.volces.com/api/coding/v3"  # 火山引擎方舟 API
+      # model: "kimi-k2.5"                          # 优化模型
+      # api_key: "${VAT_VOLC_APIKEY}"               # 火山引擎 API Key
+      # base_url: "https://ark.cn-beijing.volces.com/api/coding/v3"  # 火山引擎方舟 API
       batch_size: 100                        # 覆写批大小（大 BS 减少 API 调用次数）
       thread_num: 10                          # 覆写线程数（火山引擎建议低并发）
   
@@ -286,11 +282,12 @@ logging:
 llm:
   provider: "openai_compatible"                  # openai_compatible / vertex_native
   auth_mode: "adc"                           # Vertex Native 认证方式：api_key / adc；当前项目默认使用 adc
-  api_key: "${BYTECAT_KEY}"                                # Vertex ADC 不使用 API key；若未来切回 openai_compatible/Vertex API key，再填对应 key
-  base_url: "https://www.bytecatcode.org"                               # Vertex Native 留空；若未来切回 openai_compatible，再填兼容端点
-  model: "gemini-3-flash-preview"            # 全局默认模型（各阶段未指定 model 时的 fallback）
+  api_key: "${VAT_GPT_KEY}"                                # Vertex ADC 不使用 API key；若未来切回 openai_compatible/Vertex API key，再填对应 key
+  base_url: "http://gamma.nginx.show:11455"                               # Vertex Native 留空；若未来切回 openai_compatible，再填兼容端点
+  model: "gpt-5.5"            # 全局默认模型（各阶段未指定 model 时的 fallback）
   location: "global"                         # Vertex Native 使用的区域
   project_id: "vertex-490203"                # Vertex ADC 使用的 GCP project_id
+  # `credentials_path` 是作者环境示例路径；请改成你自己的 service account JSON 绝对路径。
   credentials_path: "/home/gzy/.ssh/vat_vertex.json"  # Vertex ADC service account JSON 绝对路径
 
 # =============================================================================

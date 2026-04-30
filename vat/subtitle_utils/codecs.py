@@ -3,6 +3,7 @@
 import json
 import platform
 import re
+import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List
 
@@ -135,23 +136,54 @@ def asr_data_from_srt(srt_str: str) -> "ASRData":
         r"(\d{2}):(\d{2}):(\d{1,2})[.,](\d{3})\s-->\s(\d{2}):(\d{2}):(\d{1,2})[.,](\d{3})"
     )
     blocks = re.split(r"\n\s*\n", srt_str.strip())
+    kana_pattern = re.compile(r"[\u3040-\u30ff]")
+    cjk_pattern = re.compile(r"[\u4e00-\u9fff]")
+
+    def normalized_parallel_text(text: str) -> str:
+        text = unicodedata.normalize("NFKC", text).casefold()
+        return re.sub(r"[\W_\s]+", "", text, flags=re.UNICODE)
+
+    def is_non_discriminative_parallel_line(block: str) -> bool:
+        """两行归一化后相同的歌词/口号不参与双语判定比例。"""
+        lines = block.splitlines()
+        if len(lines) != 4:
+            return False
+        left = normalized_parallel_text(lines[2])
+        right = normalized_parallel_text(lines[3])
+        return bool(left) and left == right
 
     def is_different_lang(block: str) -> bool:
         lines = block.splitlines()
         if len(lines) != 4:
             return False
+        left = lines[2].strip()
+        right = lines[3].strip()
+        left_has_kana = bool(kana_pattern.search(left))
+        right_has_kana = bool(kana_pattern.search(right))
+        left_has_cjk = bool(cjk_pattern.search(left))
+        right_has_cjk = bool(cjk_pattern.search(right))
+        if left_has_kana != right_has_kana and (left_has_cjk or right_has_cjk):
+            return True
         try:
-            return detect(lines[2]) != detect(lines[3])
+            return detect(left) != detect(right)
         except LangDetectException:
             return False
 
-    all_four_lines = all(len(b.splitlines()) == 4 for b in blocks)
-    sample = blocks[:50]
-    sample_size = len(sample)
+    valid_blocks = [
+        b for b in blocks
+        if len(b.splitlines()) >= 3 and srt_time_pattern.match(b.splitlines()[1])
+    ]
+    four_line_blocks = [b for b in valid_blocks if len(b.splitlines()) == 4]
+    sample = four_line_blocks[:50]
+    decisive_sample = [
+        b for b in sample
+        if not is_non_discriminative_parallel_line(b)
+    ]
+    sample_size = len(decisive_sample)
     is_bilingual = (
         sample_size > 0
-        and all_four_lines
-        and sum(map(is_different_lang, sample)) / sample_size >= 0.7
+        and len(four_line_blocks) / max(len(valid_blocks), 1) >= 0.5
+        and sum(map(is_different_lang, decisive_sample)) / sample_size >= 0.7
     )
 
     for block in blocks:

@@ -19,6 +19,7 @@ class _Session:
     def __init__(self):
         self.cookies = _CookieJar()
         self.headers = {}
+        self.trust_env = True
 
 
 class TestLoadCookieContracts:
@@ -82,3 +83,4 @@ class TestAuthenticatedSessionContracts:
         assert "user-agent" in session.headers
         assert session.headers["referer"] == "https://member.bilibili.com/"
         assert session.headers["origin"] == "https://member.bilibili.com"
+        assert session.trust_env is False

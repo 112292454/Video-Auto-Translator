@@ -153,8 +153,8 @@ JobManager 通过轮询子进程 stdout 解析标准化标记：
 
 ```bash
 # 开发模式
-uvicorn vat.web.app:app --host 0.0.0.0 --port 8000 --reload
+uvicorn vat.web.app:app --host 0.0.0.0 --port 13579 --reload
 
 # 或通过 CLI
-vat web --port 8000
+vat web
 ```

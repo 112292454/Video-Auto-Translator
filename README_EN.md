@@ -17,7 +17,7 @@ Supports both **CLI** and **Web UI**. The CLI is the core capability layer; the 
 If this is your first time using VAT, do not start with playlists, watch mode, upload, or WebUI. First make sure one local video can run through the minimum path:
 
 ```bash
-git clone <repo-url> && cd vat
+git clone https://github.com/ZeyuanGuo/Video-Auto-Translator.git && cd vat
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -196,7 +196,7 @@ Core principles:
 ### Installation
 
 ```bash
-git clone <repo-url> && cd vat
+git clone https://github.com/ZeyuanGuo/Video-Auto-Translator.git && cd vat
 pip install -r requirements.txt
 pip install -e .
 ```
@@ -247,7 +247,7 @@ Each stage (split, translate, optimize) supports independent `api_key` / `base_u
 
 Proxy also supports per-stage overrides: `proxy.http_proxy` is the global default; use `proxy.llm`, `proxy.translate`, `proxy.downloader`, etc. to specify independent proxies per component. LLM stage fallback chain: stage-specific → `proxy.llm` → `proxy.http_proxy`.
 
-See [`config/default.yaml`](config/default.yaml) for full reference.
+For day-to-day edits, use [`config/config.yaml`](config/config.yaml) first; [`config/default.yaml`](config/default.yaml) is only a full field/comment reference.
 
 ---
 
@@ -400,6 +400,8 @@ data/videos/<VIDEO_ID>/
 
 The Web UI is a visual wrapper around CLI capabilities. All tasks execute via CLI subprocesses, fully decoupled from the web server lifecycle — restarting the web server does not affect running tasks.
 
+If this is your first deployment or you suspect a configuration/environment problem, go to the Web UI Test Center (`/test`) for self-checks first.
+
 ```bash
 # Start (default port 13579)
 vat web
@@ -511,7 +513,8 @@ vat/
 └── models.py             # Data model definitions
 ```
 
-Each module directory contains its own documentation.
+Direct maintainer entry points for the most important module docs: [CLI module docs](vat/cli/readme.md), [Web module docs](vat/web/readme.md), and [Services module docs](vat/services/readme.md).
+For deeper module docs, see [ASR module docs](vat/asr/readme.md), [Embedder module docs](vat/embedder/readme.md), [Translator module docs](vat/translator/readme.md), [Uploaders module docs](vat/uploaders/readme.md), [Pipeline module docs](vat/pipeline/readme.md), [LLM module docs](vat/llm/readme.md), [Downloaders module docs](vat/downloaders/readme.md), [Subtitle Utils module docs](vat/subtitle_utils/readme.md), and [Utils module docs](vat/utils/readme.md).
 
 ---
 
@@ -543,11 +546,11 @@ Different video types may require different ASR parameters:
 - Voice-only (podcasts): enable VAD
 - Heavy background music: consider enabling vocal separation
 
-See [ASR Parameters Guide](docs/asr_parameters_guide.md) for details.
+See the [ASR Evaluation Report](docs/ASR_EVALUATION_REPORT.md) for tested parameter combinations and conclusions.
 
 ### GPU Allocation
 
-See [GPU Allocation Spec](docs/archive/gpu_allocation_spec.md) for multi-GPU task distribution strategies.
+See the archived reference [GPU Allocation Spec (Archived)](docs/archive/gpu_allocation_spec.md) for multi-GPU task distribution strategies.
 
 ---
 
@@ -559,11 +562,11 @@ See [GPU Allocation Spec](docs/archive/gpu_allocation_spec.md) for multi-GPU tas
 | [Translation & ASR Evaluation](docs/TRANSLATION_AND_ASR_EVALUATION.md) | Domestic/overseas LLM translation comparison, ASR enhancement experiments |
 | [Qwen3-Omni Captioner Evaluation](docs/qwen3_omni_caption.md) | Reproduction, expanded testing, conclusions, and future usage guidance for the audio summary model |
 | [Prompt Optimization Guide](docs/prompt_optimization_guide.md) | Translation/optimization prompt writing |
-| [GPU Allocation Spec](docs/archive/gpu_allocation_spec.md) | Multi-GPU scheduling strategy |
+| [GPU Allocation Spec (Archived)](docs/archive/gpu_allocation_spec.md) | Multi-GPU scheduling strategy |
 | [WebUI Manual](docs/webui_manual.md) | Web UI operation guide |
 | [YouTube Subtitles](docs/youtube_manual_subtitles.md) | YouTube manual subtitle detection and usage |
 | [Subtitle Style Guide](docs/subtitle_style_guide.md) | ASS subtitle style template guide |
-| [Multi-Source Download Design](docs/archive/design_multi_source_download.md) | Local file/direct link/YouTube multi-source download architecture |
+| [Multi-Source Download Design (Archived)](docs/archive/design_multi_source_download.md) | Local file/direct link/YouTube multi-source download architecture |
 | [Known Issues](docs/known_issues.md) | Known limitations and LLM cost reference |
 | [Watch Mode Spec](docs/WATCH_MODE_SPEC.md) | Watch mode design and implementation |
 | [ASR Enhancement Experiment](docs/ASR_ENHANCEMENT_EXPERIMENT.md) | Empty chunk retry, chunk parameter tuning experiments |

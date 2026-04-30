@@ -518,13 +518,17 @@ def replace_video_with_recovery(
         result["message"] = f"DB 中未找到 av{aid} 对应的视频记录"
         return result
 
+    new_video = Path(new_video_path)
+    new_video_stat = new_video.stat() if new_video.exists() else None
     _update_bilibili_op_state(
         db,
         video_id,
         "replace_video",
         state="pending",
         aid=aid,
-        new_video_path=str(new_video_path),
+        new_video_path=str(new_video),
+        new_video_size=new_video_stat.st_size if new_video_stat else None,
+        new_video_mtime_ns=new_video_stat.st_mtime_ns if new_video_stat else None,
     )
 
     context = uploader._load_replace_video_context(aid)
@@ -546,7 +550,7 @@ def replace_video_with_recovery(
         state="archive_loaded",
     )
 
-    new_filename = uploader._upload_replacement_file(new_video_path, context["old_videos"][0])
+    new_filename = uploader._upload_replacement_file(new_video, context["old_videos"][0])
     if not new_filename:
         _update_bilibili_op_state(
             db,
@@ -879,4 +883,3 @@ def fix_violation_with_recovery(
         upload_duration=upload_duration,
     )
     return result
-
