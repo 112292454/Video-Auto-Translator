@@ -33,6 +33,8 @@ pydub>=0.25.0
 
 # 视频处理
 # ffmpeg-python>=0.2.0  # 可选：Python封装
+Pillow>=10.0.0          # 字幕预览、封面处理、字体渲染辅助
+fonttools>=4.0.0        # 读取内置字体 family/metrics，用于 ASS 字幕样式
 
 # B站上传
 biliup>=0.4.0

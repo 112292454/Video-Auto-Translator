@@ -11,7 +11,7 @@ from vat.config import Config
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_REPO_URL = "https://github.com/" "ZeyuanGuo/Video-Auto-Translator"
 CANONICAL_REPO_CLONE_URL = f"{CANONICAL_REPO_URL}.git"
-CANONICAL_REPO_CLONE_COMMAND = f"git clone {CANONICAL_REPO_CLONE_URL} && cd vat"
+CANONICAL_REPO_CLONE_COMMAND = f"git clone {CANONICAL_REPO_CLONE_URL} vat && cd vat"
 
 
 def _extract_between(text: str, start: str, end: str) -> str:
@@ -181,7 +181,7 @@ class TestRepoUrlConstantDefinitions:
         source = Path(__file__).read_text(encoding="utf-8")
         canonical_assignment = 'CANONICAL_REPO_URL = ' + '"https://github.com/" "ZeyuanGuo/Video-Auto-Translator"'
         clone_url_assignment = 'CANONICAL_REPO_CLONE_URL = f"{' + 'CANONICAL_REPO_URL' + '}.git"'
-        clone_command_assignment = 'CANONICAL_REPO_CLONE_COMMAND = f"git clone {' + 'CANONICAL_REPO_CLONE_URL' + '} && cd vat"'
+        clone_command_assignment = 'CANONICAL_REPO_CLONE_COMMAND = f"git clone {' + 'CANONICAL_REPO_CLONE_URL' + '} vat && cd vat"'
         setup_assertion = 'assert match.group(1) == ' + 'CANONICAL_REPO_URL'
         readme_assertion = 'assert ' + 'CANONICAL_REPO_CLONE_COMMAND' + ' in readme\n'
         readme_en_assertion = 'assert ' + 'CANONICAL_REPO_CLONE_COMMAND' + ' in readme_en\n'
@@ -201,13 +201,34 @@ class TestReadmeCloneUrlConsistency:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
         assert "git clone <repo-url> && cd vat" not in readme
+        assert f"git clone {CANONICAL_REPO_CLONE_URL} && cd vat" not in readme
         assert CANONICAL_REPO_CLONE_COMMAND in readme
 
     def test_readme_en_clone_example_uses_canonical_repo_url(self):
         readme_en = (REPO_ROOT / "README_EN.md").read_text(encoding="utf-8")
 
         assert "git clone <repo-url> && cd vat" not in readme_en
+        assert f"git clone {CANONICAL_REPO_CLONE_URL} && cd vat" not in readme_en
         assert CANONICAL_REPO_CLONE_COMMAND in readme_en
+
+    def test_from_scratch_quickstart_uses_canonical_clone_command(self):
+        quickstart = (REPO_ROOT / "docs" / "from_scratch_quickstart.md").read_text(encoding="utf-8")
+
+        assert f"git clone {CANONICAL_REPO_CLONE_URL} && cd vat" not in quickstart
+        assert CANONICAL_REPO_CLONE_COMMAND in quickstart
+        assert "vat init" in quickstart
+        assert 'vat pipeline --url "$(realpath ./demo.mp4)" --title "demo"' in quickstart
+        assert "vat tools test-center --kind ffmpeg" in quickstart
+        assert "video_codec: libx265" in quickstart
+        assert "video_codec: h264_nvenc" in quickstart
+
+
+class TestRuntimeDependencyConsistency:
+    def test_requirements_include_subtitle_font_runtime_dependencies(self):
+        requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+
+        assert re.search(r"^Pillow[>=<~=!]", requirements, re.MULTILINE)
+        assert re.search(r"^fonttools[>=<~=!]", requirements, re.MULTILINE)
 
 
 class TestLicenseConsistency:

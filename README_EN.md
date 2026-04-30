@@ -17,7 +17,7 @@ Supports both **CLI** and **Web UI**. The CLI is the core capability layer; the 
 If this is your first time using VAT, do not start with playlists, watch mode, upload, or WebUI. First make sure one local video can run through the minimum path:
 
 ```bash
-git clone https://github.com/ZeyuanGuo/Video-Auto-Translator.git && cd vat
+git clone https://github.com/ZeyuanGuo/Video-Auto-Translator.git vat && cd vat
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -38,6 +38,7 @@ Notes:
 - Recommended environment: Linux + Python 3.10+ + CUDA GPU + system-level `ffmpeg`
 - For the first run, prefer a local video so download / playlist / upload / WebUI are not mixed into the same debugging session
 - On the first ASR run, the Whisper model is downloaded into `storage.models_dir/asr.models_subdir` (default: `./models/whisper`); this requires working network access to HuggingFace, or a pre-populated local model cache in that directory
+- For a full clone-to-running deployment flow, see [From-Scratch VAT Quickstart](docs/from_scratch_quickstart.md)
 - For fuller details, see [Quick Start](#quick-start) and [CLI Usage](#cli-usage)
 
 ---
@@ -196,7 +197,7 @@ Core principles:
 ### Installation
 
 ```bash
-git clone https://github.com/ZeyuanGuo/Video-Auto-Translator.git && cd vat
+git clone https://github.com/ZeyuanGuo/Video-Auto-Translator.git vat && cd vat
 pip install -r requirements.txt
 pip install -e .
 ```
@@ -248,6 +249,8 @@ Each stage (split, translate, optimize) supports independent `api_key` / `base_u
 Proxy also supports per-stage overrides: `proxy.http_proxy` is the global default; use `proxy.llm`, `proxy.translate`, `proxy.downloader`, etc. to specify independent proxies per component. LLM stage fallback chain: stage-specific → `proxy.llm` → `proxy.http_proxy`.
 
 For day-to-day edits, use [`config/config.yaml`](config/config.yaml) first; [`config/default.yaml`](config/default.yaml) is only a full field/comment reference.
+
+If you are deploying on a new machine or from an empty directory, follow [From-Scratch VAT Quickstart](docs/from_scratch_quickstart.md) first.
 
 ---
 
@@ -558,6 +561,7 @@ See the archived reference [GPU Allocation Spec (Archived)](docs/archive/gpu_all
 
 | Document | Content |
 |----------|---------|
+| [From-Scratch VAT Quickstart](docs/from_scratch_quickstart.md) | Clone, install, configure, self-check, local video smoke run, and optional upload path |
 | [ASR Evaluation Report](docs/ASR_EVALUATION_REPORT.md) | Whisper parameter evaluation across 350 VTuber videos |
 | [Translation & ASR Evaluation](docs/TRANSLATION_AND_ASR_EVALUATION.md) | Domestic/overseas LLM translation comparison, ASR enhancement experiments |
 | [Qwen3-Omni Captioner Evaluation](docs/qwen3_omni_caption.md) | Reproduction, expanded testing, conclusions, and future usage guidance for the audio summary model |
